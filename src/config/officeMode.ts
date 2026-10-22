@@ -11,6 +11,17 @@ const dispatchRaw = import.meta.env.VITE_OFFICE_DISPATCH_MODE
 export const OFFICE_HTTP_ACTIONS_URL =
   import.meta.env.VITE_OFFICE_HTTP_ACTIONS_URL ?? 'http://localhost:8765/actions'
 
+/** LangGraph 后端 WebSocket 地址（实时动作事件） */
+export const OFFICE_WS_URL =
+  import.meta.env.VITE_OFFICE_WS_URL ?? 'ws://localhost:8000/ws/office'
+
+/** LangGraph 后端 REST 地址（发起 Sprint 等） */
+export const OFFICE_API_BASE =
+  import.meta.env.VITE_OFFICE_API_BASE ?? 'http://localhost:8000'
+
+/** 是否开启场景内置的假演示工作流（接入真实后端后应保持关闭） */
+export const OFFICE_AUTO_DEMO = import.meta.env.VITE_OFFICE_AUTO_DEMO === 'true'
+
 export const OFFICE_DISPATCH_MODE: OfficeDispatchMode =
   dispatchRaw === 'skip' || dispatchRaw === 'hybrid'
     ? dispatchRaw

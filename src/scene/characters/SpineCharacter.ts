@@ -11,7 +11,7 @@ import {
   type ChibiFacing,
   resolveChibiPresetAnim,
 } from '@/scene/characters/chibiAgentPresets'
-import { getChibiSkinName } from '@/scene/characters/chibiStickerSkins'
+import { resolveChibiSkin } from '@/scene/characters/chibiStickerSkins'
 
 type AnimMap = Record<AgentState, string>
 
@@ -80,6 +80,7 @@ export class SpineCharacter extends Container {
   private pack: SpineCharacterPack | null = null
   private agentState: AgentState = 'idle'
   private customAnimation: string | undefined
+  private customSkin = ''
   private facing: 1 | -1 = 1
   private viewFacing: ChibiFacing = 'front'
 
@@ -100,6 +101,20 @@ export class SpineCharacter extends Container {
     if (!this.spine) return
     void color
     this.spine.skeleton.color.set(1, 1, 1, 1)
+  }
+
+  /** 运行时切换人物形象皮肤：空串恢复名册默认分配 */
+  setSkin(customSkin: string) {
+    if (!this.spine || this.pack !== 'chibi-stickers') return
+    if (this.customSkin === customSkin) return
+    this.customSkin = customSkin
+    const skinName = resolveChibiSkin(this.agentId, customSkin)
+    if (!this.spine.skeleton.data.findSkin(skinName)) return
+    this.spine.skeleton.setSkinByName(skinName)
+    this.spine.skeleton.setSlotsToSetupPose()
+    // 强制重放当前动画，让新皮肤附件立即按姿态刷新
+    this.currentAnim = ''
+    this.applyAnimation()
   }
 
   setFacing(dir: 1 | -1) {
@@ -254,7 +269,7 @@ export class SpineCharacter extends Container {
       })
 
       if (pack === 'chibi-stickers') {
-        const skinName = getChibiSkinName(this.agentId)
+        const skinName = resolveChibiSkin(this.agentId, this.customSkin)
         if (spine.skeleton.data.findSkin(skinName)) {
           spine.skeleton.setSkinByName(skinName)
           spine.skeleton.setSlotsToSetupPose()

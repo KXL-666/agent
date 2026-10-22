@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "start": "node scripts/start-all.mjs",
     "dev": "node scripts/dev.mjs",
     "dev:vite": "vite",
     "action-gateway": "node scripts/action-gateway.mjs",

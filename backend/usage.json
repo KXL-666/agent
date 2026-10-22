@@ -1,0 +1,38 @@
+{
+  "2": {
+    "model": "deepseek-flash",
+    "calls": 19,
+    "prompt_tokens": 2489,
+    "completion_tokens": 38132
+  },
+  "3": {
+    "model": "kimi-k2.6",
+    "calls": 3,
+    "prompt_tokens": 222,
+    "completion_tokens": 480
+  },
+  "5": {
+    "model": "glm-4.5-air",
+    "calls": 14,
+    "prompt_tokens": 6443,
+    "completion_tokens": 13492
+  },
+  "6": {
+    "model": "glm-4.5-air",
+    "calls": 12,
+    "prompt_tokens": 10182,
+    "completion_tokens": 36766
+  },
+  "1": {
+    "model": "deepseek-flash",
+    "calls": 10,
+    "prompt_tokens": 4311,
+    "completion_tokens": 30277
+  },
+  "4": {
+    "model": "kimi-k2.6",
+    "calls": 4,
+    "prompt_tokens": 931,
+    "completion_tokens": 8749
+  }
+}

@@ -52,6 +52,8 @@ export function OfficeCanvas() {
   const sceneRef = useRef<OfficeScene | null>(null)
   const readyRef = useRef(false)
   const [menu, setMenu] = useState<AgentMenuState | null>(null)
+  const [zoom, setZoom] = useState(1)
+  const [sceneReady, setSceneReady] = useState(false)
 
   useEffect(() => {
     const host = hostRef.current
@@ -73,6 +75,12 @@ export function OfficeCanvas() {
 
     const scene = new OfficeScene({ onAgentClick: handleAgentClick })
     sceneRef.current = scene
+    // 滚轮缩放时同步滑杆位置
+    scene.setZoomListener(setZoom)
+    // 开发环境暴露场景句柄，便于控制台调试与自动化验证
+    if (import.meta.env.DEV) {
+      ;(window as unknown as Record<string, unknown>).__officeScene = scene
+    }
 
     const ro = new ResizeObserver((entries) => {
       const { width, height } = entries[0].contentRect
@@ -80,7 +88,7 @@ export function OfficeCanvas() {
 
       if (!readyRef.current) {
         readyRef.current = true
-        void scene.init(host, width, height)
+        void scene.init(host, width, height).then(() => setSceneReady(true))
         return
       }
 
@@ -92,6 +100,7 @@ export function OfficeCanvas() {
     return () => {
       ro.disconnect()
       readyRef.current = false
+      setSceneReady(false)
       scene.destroy()
       sceneRef.current = null
     }
@@ -141,6 +150,51 @@ export function OfficeCanvas() {
 
   return (
     <div ref={hostRef} className="office-canvas">
+      {sceneReady ? (
+        <div className="office-zoom-controls">
+          <button
+            type="button"
+            aria-label="缩小"
+            disabled={zoom <= 1.001}
+            onClick={() =>
+              sceneRef.current?.setUserZoom(Math.max(1, zoom - 0.2))
+            }
+          >
+            −
+          </button>
+          <input
+            type="range"
+            min={1}
+            max={2}
+            step={0.05}
+            value={zoom}
+            aria-label="场景缩放"
+            onChange={(event) =>
+              sceneRef.current?.setUserZoom(Number(event.target.value))
+            }
+          />
+          <button
+            type="button"
+            aria-label="放大"
+            disabled={zoom >= 1.999}
+            onClick={() =>
+              sceneRef.current?.setUserZoom(Math.min(2, zoom + 0.2))
+            }
+          >
+            ＋
+          </button>
+          <span className="office-zoom-value">{Math.round(zoom * 100)}%</span>
+          {zoom > 1.001 ? (
+            <button
+              type="button"
+              className="office-zoom-reset"
+              onClick={() => sceneRef.current?.setUserZoom(1)}
+            >
+              复位
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {menu && (
         <div
           className="agent-action-menu"

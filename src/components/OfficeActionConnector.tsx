@@ -1,15 +1,15 @@
 import { useEffect, useRef } from 'react'
-import { OFFICE_HTTP_ACTIONS_URL } from '@/config/officeMode'
-import { OfficeActionHttpClient } from '@/services/officeActionHttp'
+import { OFFICE_WS_URL } from '@/config/officeMode'
+import { OfficeWsClient } from '@/services/officeWsClient'
 
-/** 轮询 HTTP 动作源，将外部动作同步到办公室场景 */
+/** 连接 LangGraph 后端 WebSocket，将真实协作事件同步到办公室场景 */
 export function OfficeActionConnector() {
-  const clientRef = useRef<OfficeActionHttpClient | null>(null)
+  const clientRef = useRef<OfficeWsClient | null>(null)
 
   useEffect(() => {
-    const client = new OfficeActionHttpClient()
+    const client = new OfficeWsClient()
     clientRef.current = client
-    client.connect(OFFICE_HTTP_ACTIONS_URL)
+    client.connect(OFFICE_WS_URL)
 
     return () => {
       client.disconnect()

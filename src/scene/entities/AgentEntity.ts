@@ -64,7 +64,14 @@ export class AgentEntity extends Container {
     const prevViewFacing = this.agent.viewFacing
     const prevColor = this.agent.color
     const prevCustomAnimation = this.agent.customAnimation
+    const prevName = this.agent.name
     this.agent = { ...this.agent, ...patch }
+
+    // 改名同步名牌：Spine 分支不走 syncVisual，需在这里单独刷新
+    if (patch.name != null && patch.name !== prevName) {
+      this.statusLabel.setName(this.agent.name)
+      this.updateOverlayPositions()
+    }
 
     if (this.useSpine && this.spineChar) {
       if (patch.viewFacing != null && patch.viewFacing !== prevViewFacing) {
@@ -85,6 +92,19 @@ export class AgentEntity extends Container {
       this.updateOverlayPositions()
     } else {
       this.syncVisual()
+    }
+  }
+
+  setAvatar(avatar: string) {
+    this.statusLabel.setAvatar(avatar)
+    this.updateOverlayPositions()
+  }
+
+  /** 切换人物形象皮肤：仅 Spine 分支生效，程序绘制兜底无皮肤概念 */
+  setSkin(skin: string) {
+    if (this.useSpine && this.spineChar) {
+      this.spineChar.setSkin(skin)
+      this.updateOverlayPositions()
     }
   }
 

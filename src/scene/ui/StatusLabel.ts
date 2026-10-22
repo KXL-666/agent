@@ -33,9 +33,12 @@ export class StatusLabel extends Container {
   private stateDot: Graphics
   private taskBg: Graphics
   private currentState = 'idle'
+  private baseName: string
+  private avatar = ''
 
   constructor(name: string) {
     super()
+    this.baseName = name
     this.nameText = new Text({ text: name, style: NAME_STYLE })
     this.nameText.anchor.set(0.5, 1)
     this.nameText.position.set(0, 0)
@@ -51,7 +54,19 @@ export class StatusLabel extends Container {
   }
 
   setName(name: string) {
-    this.nameText.text = name
+    this.baseName = name
+    this.renderName()
+  }
+
+  /** 自定义头像 emoji：非空时叠在名牌名字前，空串恢复纯名字 */
+  setAvatar(avatar: string) {
+    if (avatar === this.avatar) return
+    this.avatar = avatar
+    this.renderName()
+  }
+
+  private renderName() {
+    this.nameText.text = this.avatar ? `${this.avatar} ${this.baseName}` : this.baseName
     this.paintStateDot()
   }
 

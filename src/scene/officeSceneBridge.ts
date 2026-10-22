@@ -1,9 +1,33 @@
 import type { OfficeScene } from '@/scene/OfficeScene'
 import { submitVisitAction } from '@/services/officeActionDispatcher'
 import type { VisitActionMessage } from '@/services/officeActionDispatcher'
+import { getOfficeAgents, setOfficeAgents } from '@/store/officeStore'
 import type { AgentState } from '@/types/agent'
 
 let scene: OfficeScene | null = null
+let officePaused = false
+/** 夜晚模式（暗色主题联动）：场景重建后依然保持，与暂停锁同模式 */
+let nightMode = false
+
+/** 切换办公室夜晚灯光：场景未就绪时只记旗标，绑定后自动应用 */
+export function setNightMode(on: boolean) {
+  nightMode = on
+  scene?.setNightMode(on)
+}
+
+export function isNightMode() {
+  return nightMode
+}
+
+/** 全局暂停状态：场景重建后依然保持，WS 动作指令据此拦截 */
+export function setOfficePaused(paused: boolean) {
+  officePaused = paused
+  scene?.setPaused(paused)
+}
+
+export function isOfficePaused() {
+  return officePaused
+}
 
 type PendingDeskVisit = {
   kind: 'desk_visit'
@@ -26,7 +50,32 @@ type PendingSetState = {
   task?: string
 }
 
-type PendingAction = PendingDeskVisit | PendingDeskVisitTour | PendingSetState
+type PendingPlayEmote = {
+  kind: 'play_emote'
+  agentId: string
+  animation: string
+  task?: string
+}
+
+type PendingRename = {
+  kind: 'rename'
+  agentId: string
+  name: string
+}
+
+type PendingSetAvatar = {
+  kind: 'set_avatar'
+  agentId: string
+  avatar: string
+}
+
+type PendingSetSkin = {
+  kind: 'set_skin'
+  agentId: string
+  skin: string
+}
+
+type PendingAction = PendingDeskVisit | PendingDeskVisitTour | PendingSetState | PendingPlayEmote | PendingRename | PendingSetAvatar | PendingSetSkin
 
 const pendingActions: PendingAction[] = []
 
@@ -52,6 +101,14 @@ function flushPendingActions() {
         },
         { messageFn: action.messageFn },
       )
+    } else if (action.kind === 'play_emote') {
+      scene.playAgentAnimation(action.agentId, action.animation, action.task)
+    } else if (action.kind === 'rename') {
+      scene.setAgentName(action.agentId, action.name)
+    } else if (action.kind === 'set_avatar') {
+      scene.setAgentAvatar(action.agentId, action.avatar)
+    } else if (action.kind === 'set_skin') {
+      scene.setAgentSkin(action.agentId, action.skin)
     } else {
       scene.setAgentState(action.agentId, action.state, action.task)
     }
@@ -60,7 +117,11 @@ function flushPendingActions() {
 
 export function bindOfficeScene(instance: OfficeScene | null) {
   scene = instance
-  if (instance) flushPendingActions()
+  if (instance) {
+    flushPendingActions()
+    instance.setPaused(officePaused)
+    instance.setNightMode(nightMode)
+  }
 }
 
 /** 名册序号从 1 开始，例如 1 号去找 5 号 */
@@ -111,6 +172,63 @@ export function isOfficeSceneReady() {
   return scene != null
 }
 
+/** 自定义成员姓名：场景就绪直接改名牌，否则先改 officeStore 并排队等场景绑定 */
+export function renameAgent(agentId: string, name: string) {
+  if (!name) return
+  if (!scene) {
+    setOfficeAgents(
+      getOfficeAgents().map((a) => (a.id === agentId ? { ...a, name } : a)),
+    )
+    // 队列里只保留该成员最新一次改名
+    for (let i = pendingActions.length - 1; i >= 0; i--) {
+      const action = pendingActions[i]!
+      if (action.kind === 'rename' && action.agentId === agentId) {
+        pendingActions.splice(i, 1)
+      }
+    }
+    pendingActions.push({ kind: 'rename', agentId, name })
+    return
+  }
+  scene.setAgentName(agentId, name)
+}
+
+/** 自定义成员头像 emoji：场景就绪直接改名牌，否则排队等场景绑定（无需写入 officeStore） */
+export function setAgentAvatar(agentId: string, avatar: string) {
+  if (!scene) {
+    // 队列里只保留该成员最新一次头像设置
+    for (let i = pendingActions.length - 1; i >= 0; i--) {
+      const action = pendingActions[i]!
+      if (action.kind === 'set_avatar' && action.agentId === agentId) {
+        pendingActions.splice(i, 1)
+      }
+    }
+    pendingActions.push({ kind: 'set_avatar', agentId, avatar })
+    return
+  }
+  scene.setAgentAvatar(agentId, avatar)
+}
+
+/** 自定义成员人物形象皮肤：场景就绪直接换肤，否则排队等场景绑定 */
+export function setAgentSkin(agentId: string, skin: string) {
+  if (!scene) {
+    // 队列里只保留该成员最新一次皮肤设置
+    for (let i = pendingActions.length - 1; i >= 0; i--) {
+      const action = pendingActions[i]!
+      if (action.kind === 'set_skin' && action.agentId === agentId) {
+        pendingActions.splice(i, 1)
+      }
+    }
+    pendingActions.push({ kind: 'set_skin', agentId, skin })
+    return
+  }
+  scene.setAgentSkin(agentId, skin)
+}
+
+/** 导出当前办公室画布为 PNG dataURL；场景未就绪时返回 null */
+export function captureOfficeScreenshot(): string | null {
+  return scene?.captureScreenshot() ?? null
+}
+
 export function setAgentState(agentId: string, state: AgentState, task?: string) {
   if (!scene) {
     pendingActions.push({
@@ -126,6 +244,24 @@ export function setAgentState(agentId: string, state: AgentState, task?: string)
     return
   }
   scene.setAgentState(agentId, state, task)
+}
+
+/** 播放表情动画，例如 emotes/idea */
+export function playAgentEmote(agentId: string, animation: string, task?: string) {
+  if (!scene) {
+    pendingActions.push({
+      kind: 'play_emote',
+      agentId,
+      animation,
+      task,
+    })
+    console.info('[OfficeHTTP] scene not ready, pending play_emote', {
+      agentId,
+      animation,
+    })
+    return
+  }
+  scene.playAgentAnimation(agentId, animation, task)
 }
 
 export type { VisitActionMessage }

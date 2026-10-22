@@ -50,47 +50,61 @@ export const DESKS: Desk[] = buildDesks()
 export type AgentRosterEntry = {
   id: string
   name: string
+  role: string
+  skills: string[]
   color: number
   task: string
 }
 
-/** 6 位市场部员工（名册序号 1–6） */
+/** 6 位敏捷团队员工（名册序号 1–6，与后端 roles.py 一一对应） */
 export const AGENT_ROSTER: AgentRosterEntry[] = [
   {
     id: 'marvis',
     name: '王明',
+    role: '产品经理',
+    skills: ['需求拆解', '用户故事', '优先级排序'],
     color: 0xe85d4a,
-    task: '主管：等待交付物',
+    task: '产品：整理需求池',
   },
   {
     id: 'code-agent',
     name: '李研',
+    role: '后端工程师',
+    skills: ['接口设计', '数据库', '服务编排'],
     color: 0x4a90d9,
-    task: '检索：扫描信息源',
+    task: '后端：维护接口服务',
   },
   {
     id: 'file-agent',
     name: '周理',
+    role: '前端工程师',
+    skills: ['页面还原', '交互动效', '组件沉淀'],
     color: 0x9b6dd7,
-    task: '整理：归类情报',
+    task: '前端：打磨页面细节',
   },
   {
     id: 'app-agent',
     name: '陈书',
+    role: '测试工程师',
+    skills: ['用例设计', '回归测试', '缺陷跟踪'],
     color: 0xf5c542,
-    task: '撰写：起草标书',
+    task: '测试：维护用例库',
   },
   {
     id: 'review-agent',
     name: '刘市',
+    role: '技术主管',
+    skills: ['代码评审', '架构把关', '技术选型'],
     color: 0xf97316,
-    task: '市场：打包情报简报',
+    task: '主管：巡查代码质量',
   },
   {
     id: 'data-agent',
     name: '赵审',
+    role: '敏捷教练',
+    skills: ['流程保障', '站会组织', '阻塞排除'],
     color: 0x4ecdc4,
-    task: '审核：合规待审队列',
+    task: '教练：保障流程运转',
   },
 ]
 
