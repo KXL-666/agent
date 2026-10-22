@@ -15,4 +15,6 @@ backend/office.db-*
 backend/deliverables/
 backend/uploads/
 backend/_server*.log
+backend/artifacts_data.json
+backend/usage.json
 __pycache__/
