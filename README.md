@@ -1,5 +1,7 @@
 # AI 敏捷开发办公室
 
+> 本项目基于开源项目 [PixOffice](https://github.com/teejoo/PixOffice)（作者 teejoo，MIT 许可证）二次开发，在此感谢原作者。
+
 一个把「多成员 AI 团队协作开发」可视化的网页项目：办公室场景里 6 名 AI 员工（产品、前端、后端、测试、技术主管、敏捷教练）围绕同一需求跑完 Sprint，并把最终产物落成真实文件（Word / PPT / Excel / 代码包）。
 
 ## 快速开始
