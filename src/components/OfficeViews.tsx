@@ -1,24 +1,27 @@
-import { useEffect, useState, useSyncExternalStore, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { OfficeChatView } from '@/components/OfficeChatView'
+import { ArtifactQualityPanel } from '@/components/ArtifactQualityPanel'
+import { UploadedKnowledge } from '@/components/UploadedKnowledge'
+import { SkillsManager } from '@/components/SkillsManager'
 import { OFFICE_API_BASE } from '@/config/officeMode'
 import { captureOfficeScreenshot } from '@/scene/officeSceneBridge'
 import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
 import { setSelectedRoster } from '@/store/officeChatStore'
 import {
   getArtifactsSnapshot,
-  isRealArtifact,
   removeArtifact,
   setArtifacts,
   subscribeArtifacts,
   upsertArtifact,
   type OfficeArtifact,
 } from '@/store/officeArtifactStore'
-import type { OfficeUpload } from '@/store/officeUploadStore'
-import { AttachmentPicker } from './AttachmentPicker'
 import { AgentConfigDialog } from './AgentConfigDialog'
+import { AgentProfileDialog } from './AgentProfileDialog'
+import { AGENT_PROFILES } from '@/data/agentProfiles'
 import {
   ensureAgentConfigsLoaded,
+  fetchAgentConfigs,
   getAgentConfigsSnapshot,
   subscribeAgentConfigs,
 } from '@/store/officeAgentConfigStore'
@@ -31,11 +34,11 @@ import {
 import { getOfficeAgents } from '@/store/officeStore'
 import {
   assigneeName,
-  getActivitiesSnapshot,
   getSprintMetaSnapshot,
   getTasksSnapshot,
   isSprintRunning,
   statusMeta,
+  displayTaskMeta,
   subscribeSprintData,
   type SprintTask,
 } from '@/store/officeTaskStore'
@@ -44,8 +47,10 @@ import {
   WORKSPACES,
   getActiveWorkspace,
   getViewedSprint,
+  getSprintHistory,
   openSprintDialog,
   setActiveView,
+  setActiveWorkspace,
   setViewedSprint,
   subscribeView,
   workspaceMatches,
@@ -72,10 +77,11 @@ function timeLabel(ts: number): string {
 
 /* ------------------------------- 任务中心 ------------------------------- */
 
-const STATUS_ORDER = ['待分派', '待开发', '待测试', '打回', '通过']
+const STATUS_ORDER = ['待分派', '待开发', '待测试', '待评审', '打回', '通过']
 
 function WideTaskCard({ task, onOpen }: { task: SprintTask; onOpen?: () => void }) {
-  const meta = statusMeta(task.status)
+  const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
+  const meta = displayTaskMeta(task.status, running)
   const cancelled = task.status === '已取消'
   return (
     <article
@@ -90,6 +96,7 @@ function WideTaskCard({ task, onOpen }: { task: SprintTask; onOpen?: () => void 
           </strong>
           <em>
             {assigneeName(task.assignee_roster)} · {task.id}
+            {task.priority ? ` · ${task.priority} · ${task.story_points ?? 3} 点` : ''}
           </em>
         </div>
         <span
@@ -114,21 +121,29 @@ function WideTaskCard({ task, onOpen }: { task: SprintTask; onOpen?: () => void 
 
 function TaskCenterView() {
   const tasks = useSyncExternalStore(subscribeSprintData, getTasksSnapshot)
+  const sprint = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
   const workspaceIndex = useSyncExternalStore(subscribeView, getActiveWorkspace)
   const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
+  const history = useSyncExternalStore(subscribeView, getSprintHistory)
   const [detailTask, setDetailTask] = useState<SprintTask | null>(null)
   const workspace = WORKSPACES[workspaceIndex]
   const filtered = tasks.filter((task) =>
     workspaceMatches(task.assignee_roster),
   )
+  const active = filtered.filter((task) => task.status !== '已取消')
+  const totalPoints = active.reduce((sum, task) => sum + (task.story_points ?? 0), 0)
+  const donePoints = active.filter((task) => task.status === '通过').reduce((sum, task) => sum + (task.story_points ?? 0), 0)
+  const estimated = active.length > 0 && active.every((task) => Number.isFinite(task.story_points) && (task.story_points ?? 0) > 0)
+  const doneCount = active.filter((task) => task.status === '通过').length
+  const columns = [...STATUS_ORDER, ...(filtered.some((task) => task.status === '已取消') ? ['已取消'] : [])]
 
   return (
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>任务中心</h1>
+          <h1>任务</h1>
           <p>
-            LangGraph 编排的实时任务看板
+            迭代计划 · 用户故事 · 测试验收 · 复盘改进
             {workspaceIndex > 0 ? ` · ${workspace.label}` : ''}
           </p>
         </div>
@@ -150,11 +165,44 @@ function TaskCenterView() {
         </div>
       ) : null}
 
+      <div className="task-filter" role="group" aria-label="按负责人筛选任务">
+        <span>负责人</span>
+        {WORKSPACES.map((option, index) => (
+          <button key={option.label} type="button" className={workspaceIndex === index ? 'active' : ''} aria-pressed={workspaceIndex === index} onClick={() => setActiveWorkspace(index)}>
+            {option.label}
+          </button>
+        ))}
+      </div>
+
+      <section className="view-card agile-overview" aria-label="迭代目标与进度">
+        <h2>本轮迭代目标</h2>
+        <p>{(viewedSprint ? history.find((item) => item.id === viewedSprint)?.requirement : sprint.requirement) || '创建 Sprint 后，将需求转成有优先级、工作量与验收条件的迭代计划。'}</p>
+        <div className="view-chips">
+          {estimated ? (
+            <>
+              <span className="view-chip">计划工作量 <strong>{totalPoints} 点</strong></span>
+              <span className="view-chip">已通过 <strong>{donePoints} 点</strong></span>
+              <span className="view-chip">剩余工作量 <strong>{totalPoints - donePoints} 点</strong></span>
+            </>
+          ) : (
+            <>
+              <span className="view-chip">本轮任务 <strong>{active.length} 项</strong></span>
+              <span className="view-chip">已通过 <strong>{doneCount} 项</strong></span>
+              <span className="view-chip">剩余 <strong>{active.length - doneCount} 项</strong></span>
+            </>
+          )}
+          <span className="view-chip">待修复 <strong>{active.filter((task) => task.status === '打回').length}</strong></span>
+          {!estimated && active.length > 0 ? <span className="view-chip">未完整估点 <strong>{active.filter((task) => !task.story_points).length} 项</strong></span> : null}
+        </div>
+        <progress aria-label={estimated ? '已通过故事点比例' : '已通过任务比例'} max={estimated ? totalPoints : active.length || 1} value={estimated ? donePoints : doneCount} />
+        <p className="view-card-meta">{estimated ? '故事点表示相对工作量；' : '任务未完整估点，当前按任务数量显示进度；'}仅通过测试与评审的任务计入完成。点击任务查看用户故事和验收条件。最终文件另有成品质检。</p>
+      </section>
+
       <div className="view-chips">
         {STATUS_ORDER.map((status) => (
           <span key={status} className="view-chip">
             {status}
-            <strong>{tasks.filter((t) => t.status === status).length}</strong>
+            <strong>{filtered.filter((t) => t.status === status).length}</strong>
           </span>
         ))}
       </div>
@@ -163,16 +211,18 @@ function TaskCenterView() {
         <div className="view-empty">
           {tasks.length === 0
             ? '还没有任务。点击「新建 Sprint」描述需求，产品经理会自动拆解。'
-            : '当前工作空间没有相关任务，可切回「我的空间」查看全部。'}
+            : '当前筛选条件下没有任务，可切换到「全部」查看。'}
         </div>
       ) : (
-        <div className="view-task-grid">
-          {filtered.map((task) => (
-            <WideTaskCard
-              key={task.id}
-              task={task}
-              onOpen={() => setDetailTask(task)}
-            />
+        <div className="agile-board">
+          {columns.map((status) => (
+            <section className="agile-column" key={status} aria-label={status}>
+              <h2>{status} <small>{filtered.filter((task) => task.status === status).length}</small></h2>
+              {filtered.filter((task) => task.status === status).map((task) => (
+                <WideTaskCard key={task.id} task={task} onOpen={() => setDetailTask(task)} />
+              ))}
+              {!filtered.some((task) => task.status === status) ? <p className="view-card-meta">暂无任务</p> : null}
+            </section>
           ))}
         </div>
       )}
@@ -188,6 +238,7 @@ function TaskCenterView() {
 function AgentsView() {
   const [, forceTick] = useState(0)
   const [configFor, setConfigFor] = useState<number | null>(null)
+  const [profileFor, setProfileFor] = useState<number | null>(null)
   const agentConfigs = useSyncExternalStore(
     subscribeAgentConfigs,
     getAgentConfigsSnapshot,
@@ -195,7 +246,11 @@ function AgentsView() {
   useEffect(() => {
     ensureAgentConfigsLoaded()
     const timer = setInterval(() => forceTick((n) => n + 1), 800)
-    return () => clearInterval(timer)
+    const healthTimer = setInterval(() => void fetchAgentConfigs(), 15000)
+    return () => {
+      clearInterval(timer)
+      clearInterval(healthTimer)
+    }
   }, [])
 
   function openChat(index: number) {
@@ -208,7 +263,7 @@ function AgentsView() {
       <header className="view-head">
         <div>
           <h1>智能体</h1>
-          <p>6 名敏捷团队成员的实时状态（每 0.8 秒同步场景数据）</p>
+          <p>了解 6 名成员的职责、协作方式与交付内容，点击「详细介绍」查看更多</p>
         </div>
       </header>
       <div className="agent-grid">
@@ -218,6 +273,7 @@ function AgentsView() {
           const cfg = agentConfigs[rosterNo]
           const displayName = cfg?.name || entry.name
           const avatarEmoji = cfg?.avatar || ''
+          const availability = cfg?.availability ?? (cfg ? cfg.has_custom_key ? 'configured' : 'unconfigured' : undefined)
           return (
             <article key={entry.id} className="agent-card">
               <header>
@@ -239,6 +295,7 @@ function AgentsView() {
                   {AGENT_STATE_LABELS[agent?.state ?? 'idle'] ?? '空闲'}
                 </span>
               </header>
+              <p className="agent-profile-card-summary">{AGENT_PROFILES[index].summary}</p>
               <p className="agent-task">{agent?.currentTask || '暂无任务'}</p>
               <div className="agent-skill-row">
                 {entry.skills.map((skill) => (
@@ -247,6 +304,15 @@ function AgentsView() {
                 {cfg?.has_custom_key ? (
                   <span className="view-chip small agent-custom-api">专属 API</span>
                 ) : null}
+                <span
+                  className={`agent-availability-badge is-${availability ?? 'checking'}`}
+                  title={cfg?.availability_reason || '状态每 15 秒更新；配置完成不代表刚刚通过连接测试'}
+                >
+                  {availability === 'unconfigured' ? '不可用 · 未配置' :
+                    availability === 'error' ? '不可用 · 调用异常' :
+                      availability === 'backup' ? '备用通道运行' :
+                        availability === 'configured' ? '已配置' : '状态检查中'}
+                </span>
                 {cfg?.backup_in_use ? (
                   <span
                     className="view-chip small agent-backup-active"
@@ -259,6 +325,9 @@ function AgentsView() {
                 ) : null}
               </div>
               <footer>
+                <button type="button" aria-label={`查看${displayName}的详细介绍`} onClick={() => setProfileFor(rosterNo)}>
+                  详细介绍
+                </button>
                 <button type="button" onClick={() => openChat(index)}>
                   找 TA 聊聊
                 </button>
@@ -274,6 +343,16 @@ function AgentsView() {
           )
         })}
       </div>
+      {profileFor !== null ? (
+        <AgentProfileDialog roster={profileFor}
+          name={agentConfigs[profileFor]?.name || AGENT_ROSTER[profileFor - 1].name}
+          avatar={agentConfigs[profileFor]?.avatar || ''}
+          status={AGENT_STATE_LABELS[getOfficeAgents()[profileFor - 1]?.state ?? 'idle'] ?? '空闲'}
+          task={getOfficeAgents()[profileFor - 1]?.currentTask || ''}
+          onClose={() => setProfileFor(null)} onChangeMember={setProfileFor}
+          onChat={() => { setProfileFor(null); openChat(profileFor - 1) }}
+          onSkills={() => { setProfileFor(null); setActiveView('skills') }} />
+      ) : null}
       {configFor !== null ? (
         <AgentConfigDialog
           config={
@@ -318,7 +397,7 @@ function downloadArtifact(artifact: OfficeArtifact) {
   if (artifact.file_name) {
     const anchor = document.createElement('a')
     anchor.href = `${OFFICE_API_BASE}/api/artifacts/${artifact.id}/download`
-    anchor.download = artifact.file_name
+    anchor.download = artifact.file_name.split(/[\\/]/).pop() || artifact.title
     anchor.click()
     showToast('真实文件已开始下载')
     return
@@ -340,6 +419,30 @@ function fileExt(artifact: OfficeArtifact): string | null {
   if (!artifact.file_name) return null
   const dot = artifact.file_name.lastIndexOf('.')
   return dot >= 0 ? artifact.file_name.slice(dot) : null
+}
+
+function sourceLabel(artifact: OfficeArtifact, legacyDemo: boolean): string {
+  const source = (!artifact.source || artifact.source === 'unknown') && legacyDemo ? 'demo' : artifact.source
+  switch (source) {
+    case 'demo': return '脚本演示'
+    case 'model': return '真实模型'
+    case 'fallback': return '兜底模板'
+    case 'local': return '本地处理'
+    default: return '来源未记录'
+  }
+}
+
+function qualityLabel(artifact: OfficeArtifact): string {
+  switch (artifact.quality_status) {
+    case 'passed': return '自动验收通过'
+    case 'failed': return '存在验收问题'
+    case 'unchecked': return '部分项目待验证'
+    default: return '暂无验收记录'
+  }
+}
+
+function canPreviewFile(artifact: OfficeArtifact): boolean {
+  return /\.(docx|pptx|xlsx|pdf)$/i.test(artifact.file_name ?? '')
 }
 
 function ArtifactCard({ artifact }: { artifact: OfficeArtifact }) {
@@ -379,7 +482,7 @@ function FilesView() {
     getArtifactsSnapshot,
   )
 
-  async function load() {
+  const load = useCallback(async () => {
     setLoading(true)
     try {
       if (!viewedSprint) {
@@ -413,11 +516,11 @@ function FilesView() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [viewedSprint])
 
   useEffect(() => {
-    load()
-  }, [viewedSprint])
+    void load()
+  }, [load])
 
   function downloadReport() {
     if (!data?.report_md) return
@@ -437,7 +540,7 @@ function FilesView() {
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>文件中心</h1>
+          <h1>过程文件</h1>
           <p>Sprint 产物（PRD / 开发说明 / 测试报告 / 评审记录 / 总结）、任务清单与日报</p>
         </div>
         <div className="view-head-actions">
@@ -487,7 +590,6 @@ function FilesView() {
                   <p className="view-card-meta">
                     <a
                       href={`${OFFICE_API_BASE}/api/artifacts/code.zip`}
-                      download="sprint-code.zip"
                     >
                       下载本次 Sprint 全部代码（zip）
                     </a>
@@ -528,6 +630,20 @@ function FilesView() {
           </div>
         )
       ) : null}
+    </div>
+  )
+}
+
+function KnowledgeView() {
+  return (
+    <div className="view-page">
+      <header className="view-head">
+        <div>
+          <h1>参考资料</h1>
+          <p>管理上传的资料，供团队在任务中查阅。</p>
+        </div>
+      </header>
+      <UploadedKnowledge />
     </div>
   )
 }
@@ -592,10 +708,12 @@ function SkillsView() {
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>技能中心</h1>
-          <p>团队角色分工与系统能力总览</p>
+          <h1>技能配置</h1>
+          <p>配置工作技能，让成员在执行任务时使用专业方法与规范</p>
         </div>
       </header>
+
+      <SkillsManager names={AGENT_ROSTER.map((entry, index) => agentConfigs[index + 1]?.name || entry.name)} />
 
       <section className="view-card">
         <h2>系统引擎</h2>
@@ -620,7 +738,7 @@ function SkillsView() {
             <li>
               <span>未配置成员</span>
               <strong className="warn">
-                {unconfigured.map((a) => a.name).join('、')}（可在「智能体」页配置）
+                {unconfigured.map((a) => a.name).join('、')}（可在「团队 → 成员」配置）
               </strong>
             </li>
           ) : null}
@@ -759,7 +877,7 @@ function CalendarView() {
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>日程日历</h1>
+          <h1>里程碑与动态</h1>
           <p>Sprint 里程碑与团队动态时间线</p>
         </div>
       </header>
@@ -816,6 +934,13 @@ const KIND_LABELS: Record<string, string> = {
   task_update: '任务',
   artifact_new: '产物',
   instruction_added: '指示',
+  prd: '需求',
+  dev: '开发',
+  test: '测试',
+  review: '评审',
+  summary: '复盘',
+  final: '成品',
+  custom: '成品',
 }
 
 function NotificationsView() {
@@ -832,7 +957,7 @@ function NotificationsView() {
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>通知中心</h1>
+          <h1>通知</h1>
           <p>后端实时推送的团队事件（WebSocket）</p>
         </div>
         <button
@@ -857,6 +982,15 @@ function NotificationsView() {
                 {KIND_LABELS[item.kind] ?? '事件'}
               </span>
               <p>{item.text}</p>
+              {item.detail ? (
+                <details className="notification-record">
+                  <p className="notification-detail-preview">
+                    <strong>{item.title || '详细信息'}：</strong>{item.detail.split('\n').slice(0, 4).join(' · ')}
+                  </p>
+                  <summary>展开完整详情</summary>
+                  <pre>{item.detail}</pre>
+                </details>
+              ) : null}
               <time>{item.time}</time>
             </li>
           ))}
@@ -895,6 +1029,9 @@ type PriceRow = { model: string; input: string; output: string; reset: boolean }
 
 function UsagePanel() {
   const [usage, setUsage] = useState<UsageReport | null>(null)
+  const sprint = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
+  const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
+  const history = useSyncExternalStore(subscribeView, getSprintHistory)
   const [priceRows, setPriceRows] = useState<PriceRow[]>([])
   const [pricingLoaded, setPricingLoaded] = useState(false)
   const [pricingSaving, setPricingSaving] = useState(false)
@@ -985,6 +1122,9 @@ function UsagePanel() {
     }),
     { calls: 0, prompt: 0, completion: 0 },
   )
+  const viewedCost = viewedSprint
+    ? history.find((item) => item.id === viewedSprint)?.usage_cost
+    : sprint.id ? sprint.cost : undefined
 
   return (
     <details
@@ -994,11 +1134,11 @@ function UsagePanel() {
       }}
     >
       <summary>
-        <span>用量统计（估算）</span>
+        <span>费用统计（估算）</span>
         <span className="usage-total">
-          {usage
-            ? `累计花费 ¥${usage.total_cost.toFixed(4)} · 点击展开明细`
-            : '点击展开'}
+          {viewedCost == null ? '本次费用暂无记录' : `${viewedSprint ? '所选历史' : '当前'} Sprint ¥${viewedCost.toFixed(4)}`}
+          {' · '}
+          {usage ? `所有历史累计 ¥${usage.total_cost.toFixed(4)}` : '历史累计加载中'}
         </span>
       </summary>
       {usage && usage.members.length > 0 && totals ? (
@@ -1026,7 +1166,7 @@ function UsagePanel() {
                 </tr>
               ))}
               <tr className="usage-total-row">
-                <td>合计</td>
+                <td>所有历史合计</td>
                 <td>—</td>
                 <td>{totals.calls}</td>
                 <td>{totals.prompt}</td>
@@ -1036,7 +1176,7 @@ function UsagePanel() {
             </tbody>
           </table>
           <div className="usage-note">
-            费用按各服务商公开刊例约值估算，仅供演示参考，以实际账单为准。
+            上表为所有历史模型调用的累计用量；本次 Sprint 花费见标题。费用按各服务商公开刊例约值估算，以实际账单为准。
             <a
               className="usage-export-link"
               href={`${OFFICE_API_BASE}/api/usage/export.csv`}
@@ -1403,7 +1543,7 @@ function ArtifactEditModal({
     }
   }
 
-  const isDocx = Boolean(artifact.file_name?.endsWith('.docx'))
+  const isDocx = Boolean(artifact.file_name?.toLowerCase().match(/\.(docx|pdf)$/))
 
   return createPortal(
     <div className="sprint-backdrop" onClick={onClose}>
@@ -1429,7 +1569,7 @@ function ArtifactEditModal({
         ) : null}
         {isDocx ? (
           <p className="sprint-dialog-tip">
-            保存后将自动重新生成 Word 文件（Markdown 语法：# 标题、- 列表）
+            保存后将按原格式重新生成 Word 或 PDF 文件（支持 Markdown 标题和列表）
           </p>
         ) : null}
         {loading ? (
@@ -1499,82 +1639,67 @@ function ArtifactSandboxModal({
 
 function ArtifactsView() {
   const [error, setError] = useState<string | null>(null)
+  const [loadingAll, setLoadingAll] = useState(true)
+  const [allArtifacts, setAllArtifacts] = useState<OfficeArtifact[]>([])
+  const [artifactQuery, setArtifactQuery] = useState('')
   const [openId, setOpenId] = useState<string | null>(null)
+  const [qualityFor, setQualityFor] = useState<string | null>(null)
   const [editFor, setEditFor] = useState<OfficeArtifact | null>(null)
   const [sandboxFor, setSandboxFor] = useState<OfficeArtifact | null>(null)
-  const [prompt, setPrompt] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [attachments, setAttachments] = useState<OfficeUpload[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [deletingGroup, setDeletingGroup] = useState<string | null>(null)
   const [reviseFor, setReviseFor] = useState<string | null>(null)
   const [reviseText, setReviseText] = useState('')
   const [versionsFor, setVersionsFor] = useState<string | null>(null)
-  const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
-  const sprintMeta = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
-  const artifacts = useSyncExternalStore(
-    subscribeArtifacts,
-    getArtifactsSnapshot,
-  )
-  const activities = useSyncExternalStore(subscribeSprintData, getActivitiesSnapshot)
-  // 直接生成的最新进度（后端 generate_progress 事件已写入实时动态）
-  const genProgress = activities.find((item) => item.text.startsWith('直接生成：'))
+  const currentArtifacts = useSyncExternalStore(subscribeArtifacts, getArtifactsSnapshot)
+
+  async function refreshDeliverables() {
+    try {
+      const res = await fetch(`${OFFICE_API_BASE}/api/artifacts/deliverables`)
+      if (!res.ok) throw new Error(String(res.status))
+      const payload = (await res.json()) as {
+        artifacts?: Array<OfficeArtifact & { sprint_requirement?: string; sprint_started_at?: number }>
+      }
+      setAllArtifacts(payload.artifacts ?? [])
+      setError(null)
+      return true
+    } catch {
+      setError('无法加载历史产物，请确认后端已启动')
+      return false
+    } finally {
+      setLoadingAll(false)
+    }
+  }
 
   useEffect(() => {
-    // 历史/当前数据由全局切换器写入 store，这里只负责拉一次当前数据兜底
-    if (viewedSprint) return
-    async function load() {
-      try {
-        const res = await fetch(`${OFFICE_API_BASE}/api/files`)
-        if (!res.ok) throw new Error(String(res.status))
-        const payload = (await res.json()) as FilesPayload
-        setArtifacts(payload.artifacts ?? [])
-        setError(null)
-      } catch {
-        setError('无法连接后端，请确认服务已启动')
-      }
-    }
-    load()
-  }, [viewedSprint])
+    void refreshDeliverables()
+    // 首次挂载读取跨 Sprint 的最终交付物。
+  }, [])
 
-  // 只留真产物：最终交付物置顶，其余按时间倒序；过程文档请见文件中心
-  const mine = artifacts.filter(isRealArtifact).sort((a, b) => {
-    const fa = a.kind === 'final' ? 1 : 0
-    const fb = b.kind === 'final' ? 1 : 0
-    if (fa !== fb) return fb - fa
-    return b.created_at - a.created_at
-  })
+  useEffect(() => {
+    if (currentArtifacts.length > 0) void refreshDeliverables()
+    // WebSocket updates the current Sprint artifact store when a final file is generated.
+  }, [currentArtifacts])
 
-  // 打包下载：查看历史 Sprint 用其 id，否则用当前 Sprint id
-  const zipSprintId = viewedSprint || sprintMeta.id
-  const hasFileArtifacts = artifacts.some((a) => Boolean(a.file_name))
-
-  async function submitGenerate(event: FormEvent) {
-    event.preventDefault()
-    const text = prompt.trim()
-    if (!text || submitting) return
-    setSubmitting(true)
-    try {
-      const res = await fetch(`${OFFICE_API_BASE}/api/artifacts/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: text,
-          upload_ids: attachments.map((item) => item.id),
-        }),
-      })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => null)
-        showToast(typeof detail?.detail === 'string' ? detail.detail : '提交失败')
-        return
-      }
-      setPrompt('')
-      setAttachments([])
-      showToast('已提交，生成约需 10-60 秒，完成后自动出现在列表')
-    } catch {
-      showToast('提交失败，请确认后端已启动')
-    } finally {
-      setSubmitting(false)
-    }
+  const mine = allArtifacts.filter((artifact) => artifact.kind === 'final' || artifact.kind === 'custom')
+  const grouped = new Map<string, { id: string; date: string; requirement: string; items: OfficeArtifact[] }>()
+  for (const artifact of mine) {
+    const item = artifact as OfficeArtifact & { sprint_requirement?: string; sprint_started_at?: number }
+    const timestamp = item.sprint_started_at || artifact.created_at
+    const date = timestamp ? new Date(timestamp * 1000).toLocaleDateString('zh-CN') : '日期未知'
+    const requirement = item.sprint_requirement?.trim() || '独立生成'
+    const key = artifact.sprint_id || artifact.id
+    const group = grouped.get(key) ?? { id: key, date, requirement, items: [] }
+    group.items.push(artifact)
+    grouped.set(key, group)
+  }
+  const query = artifactQuery.trim().toLocaleLowerCase()
+  const groups = [...grouped.values()].filter((group) =>
+    !query || group.requirement.toLocaleLowerCase().includes(query) ||
+    group.items.some((artifact) => artifact.title.toLocaleLowerCase().includes(query)),
+  )
+  for (const group of groups) {
+    group.items.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN') || b.created_at - a.created_at)
   }
 
   function download(artifact: OfficeArtifact) {
@@ -1606,6 +1731,7 @@ function ArtifactsView() {
         return
       }
       if (payload?.artifact) upsertArtifact(payload.artifact)
+      await refreshDeliverables()
       showToast('已重新生成')
     } catch {
       showToast('重新生成失败，请确认后端已启动')
@@ -1636,6 +1762,7 @@ function ArtifactsView() {
       }
       if (payload?.artifact) {
         upsertArtifact(payload.artifact)
+        setAllArtifacts((items) => [...items.filter((item) => item.id !== payload.artifact!.id), payload.artifact!])
         setOpenId(payload.artifact.id)
       }
       setReviseFor(null)
@@ -1690,9 +1817,32 @@ function ArtifactsView() {
         return
       }
       removeArtifact(artifact.id)
+      setAllArtifacts((items) => items.filter((item) => item.id !== artifact.id))
       showToast('产物已删除')
     } catch {
       showToast('删除失败，请确认后端已启动')
+    }
+  }
+
+  async function removeGroup(group: { id: string; requirement: string; items: OfficeArtifact[] }) {
+    if (deletingGroup) return
+    if (!window.confirm(`确定删除任务「${group.requirement}」的所有交付产物？对应磁盘文件也会删除，且不可恢复。`)) return
+    setDeletingGroup(group.id)
+    const deletedIds = new Set<string>()
+    let failed = false
+    try {
+      for (const artifact of group.items) {
+        const res = await fetch(`${OFFICE_API_BASE}/api/artifacts/${artifact.id}`, { method: 'DELETE' })
+        if (!res.ok) { failed = true; break }
+        removeArtifact(artifact.id)
+        deletedIds.add(artifact.id)
+      }
+    } catch {
+      failed = true
+    } finally {
+      setAllArtifacts((items) => items.filter((item) => !deletedIds.has(item.id)))
+      setDeletingGroup(null)
+      showToast(failed ? '部分交付删除失败，未删除的仍保留在该任务下' : '该任务的交付产物已删除')
     }
   }
 
@@ -1700,93 +1850,90 @@ function ArtifactsView() {
     <div className="view-page">
       <header className="view-head">
         <div>
-          <h1>产物中心</h1>
-          <p>最终交付物与真实文件（Word/PPT/Excel/代码），过程文档见文件中心</p>
+          <h1>最终交付</h1>
+          <p>按日期和需求名称归档成品；开发、测试、评审及复盘记录可在「过程文件」查看。</p>
         </div>
-        <form className="artifact-gen-form" onSubmit={submitGenerate}>
-          <input
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            placeholder="直接下指令：写份周报 / 做个 PPT / 基于附件改写…"
-            disabled={submitting}
-          />
-          <button type="submit" disabled={submitting || !prompt.trim()}>
-            {submitting ? '提交中…' : '生成'}
-          </button>
-        </form>
-        {zipSprintId ? (
-          <a
-            className="view-ghost-btn artifact-zip-btn"
-            href={`${OFFICE_API_BASE}/api/sprints/${zipSprintId}/artifacts.zip`}
-            target="_blank"
-            rel="noreferrer"
-            title={hasFileArtifacts ? '打包下载该 Sprint 全部文件产物' : '该 Sprint 暂无文件产物'}
-            onClick={(event) => {
-              if (!hasFileArtifacts) {
-                event.preventDefault()
-                showToast('该 Sprint 暂无可下载的文件产物')
-              }
-            }}
-          >
-            📦 打包下载全部
-          </a>
-        ) : null}
       </header>
 
-      <div className="artifact-gen-attach">
-        <AttachmentPicker value={attachments} onChange={setAttachments} />
-      </div>
-
-      {genProgress ? (
-        <p className="artifact-gen-progress">
-          {genProgress.time} · {genProgress.text}（进度详见右侧实时动态）
-        </p>
-      ) : null}
+      <label className="artifact-history-search">
+        <span>搜索产物</span>
+        <input
+          value={artifactQuery}
+          onChange={(event) => setArtifactQuery(event.target.value)}
+          placeholder="按产物名称或需求名称搜索"
+        />
+      </label>
 
       <UsagePanel />
 
       {error ? <div className="view-empty">{error}</div> : null}
 
       {!error ? (
-        mine.length === 0 ? (
+        loadingAll ? (
+          <div className="view-empty">正在加载历史产物…</div>
+        ) : groups.length === 0 ? (
           <div className="view-empty">
-            暂无产物。发起 Sprint，或在上方输入需求直接生成 Word / PPT / Excel
+            {artifactQuery ? '没有匹配的最终产物。' : '暂无最终产物。完成 Sprint 后，成品会归档在这里。'}
           </div>
         ) : (
-          <div className="artifact-doc-list">
-            {mine.map((artifact) => {
+          <div className="artifact-history-groups">
+            {groups.map((group) => (
+              <div className="artifact-history-group" key={group.id}>
+              <details className="artifact-history-entry">
+                <summary>
+                  <time>{group.date}</time>
+                  <h2>{group.requirement}</h2>
+                  <span className="artifact-history-chevron" aria-hidden="true" />
+                </summary>
+                <div className="artifact-doc-list">
+            {group.items.map((artifact) => {
               const open = openId === artifact.id
               const degraded = Boolean(artifact.degraded)
+              const previewable = canPreviewFile(artifact)
+              const legacyDemo = (artifact as OfficeArtifact & { sprint_requirement?: string }).sprint_requirement?.startsWith('【演示模式】') ?? false
               return (
                 <article
                   key={artifact.id}
                   className={`artifact-doc ${degraded ? 'artifact-degraded' : ''}`}
                 >
-                  <header
-                    role="presentation"
-                    onClick={() => setOpenId(open ? null : artifact.id)}
-                  >
-                    <strong>{artifact.title}</strong>
-                    {degraded ? (
-                      <span className="artifact-degraded-badge">兜底生成</span>
-                    ) : null}
-                    {artifact.version && artifact.version > 1 ? (
-                      <span className="artifact-file-badge">
-                        v{artifact.version}
+                  <div className="artifact-doc-head">
+                    <button
+                      type="button"
+                      className="artifact-doc-toggle"
+                      aria-expanded={open}
+                      onClick={() => setOpenId(open ? null : artifact.id)}
+                    >
+                      <strong>{artifact.title}</strong>
+                      <span className="artifact-doc-badges">
+                        <span className="artifact-source-badge">{sourceLabel(artifact, legacyDemo)}</span>
+                        <span className={`artifact-quality-badge ${artifact.quality_status === 'failed' ? 'is-failed' : ''}`}>{qualityLabel(artifact)}</span>
+                        <span className="artifact-file-badge">{artifact.file_name ? `文件可下载 ${fileExt(artifact) ?? ''}` : '仅文字摘要'}</span>
+                        {artifact.version && artifact.version > 1 ? <span className="artifact-file-badge">v{artifact.version}</span> : null}
                       </span>
-                    ) : null}
-                    {fileExt(artifact) ? (
-                      <span className="artifact-file-badge">
-                        {fileExt(artifact)}
-                      </span>
-                    ) : null}
-                    <em>{timeLabel(artifact.created_at)}</em>
-                  </header>
+                      <em>{timeLabel(artifact.created_at)}</em>
+                    </button>
+                    <div className="artifact-doc-quick-actions">
+                      {artifact.file_name || artifact.kind === 'final' ? <button type="button" aria-expanded={qualityFor === artifact.id} onClick={() => setQualityFor(qualityFor === artifact.id ? null : artifact.id)}>验收详情</button> : null}
+                      {previewable ? (
+                        artifact.file_name?.toLowerCase().endsWith('.html') ? (
+                          <button type="button" onClick={() => setSandboxFor(artifact)}>预览</button>
+                        ) : (
+                          <button type="button" onClick={() => preview(artifact)}>预览</button>
+                        )
+                      ) : null}
+                      {!artifact.file_name ? <button type="button" onClick={() => setOpenId(open ? null : artifact.id)}>查看摘要</button> : null}
+                      <button type="button" className="artifact-quick-download" onClick={() => download(artifact)}>{artifact.file_name ? '下载文件' : '下载摘要'}</button>
+                      {artifact.file_name ? <button type="button" onClick={() => void reveal(artifact)}>打开所在文件夹</button> : null}
+                      <button type="button" className="artifact-revise-btn" onClick={() => { setOpenId(artifact.id); setReviseFor(artifact.id); setReviseText('') }}>继续修改</button>
+                      <button type="button" className="artifact-delete-btn" onClick={() => void removeOne(artifact)}>删除</button>
+                    </div>
+                  </div>
+                  {qualityFor === artifact.id ? <ArtifactQualityPanel artifactId={artifact.id} /> : null}
                   {open ? (
                     <>
                       {degraded && artifact.degraded_reason ? (
                         <p className="artifact-degraded-tip">
-                          ⚠ 本次为兜底内容：{artifact.degraded_reason}
+                          ⚠ 内容或文件存在问题：{artifact.degraded_reason}
                         </p>
                       ) : null}
                       <pre className="view-md artifact-doc-body">
@@ -1838,38 +1985,6 @@ function ArtifactsView() {
                         >
                           ✏️ 编辑
                         </button>
-                        {artifact.file_name?.endsWith('.html') ? (
-                          <button
-                            type="button"
-                            onClick={() => setSandboxFor(artifact)}
-                          >
-                            🧪 沙箱预览
-                          </button>
-                        ) : null}
-                        {artifact.file_name ? (
-                          <button
-                            type="button"
-                            onClick={() => preview(artifact)}
-                          >
-                            预览
-                          </button>
-                        ) : null}
-                        <button
-                          type="button"
-                          onClick={() => download(artifact)}
-                        >
-                          {artifact.file_name
-                            ? `下载 ${fileExt(artifact)}`
-                            : '下载 .md'}
-                        </button>
-                        {artifact.file_name ? (
-                          <button
-                            type="button"
-                            onClick={() => void reveal(artifact)}
-                          >
-                            打开所在文件夹
-                          </button>
-                        ) : null}
                         <button
                           type="button"
                           onClick={() =>
@@ -1913,11 +2028,16 @@ function ArtifactsView() {
                 </article>
               )
             })}
+                </div>
+              </details>
+              <button type="button" className="artifact-history-delete artifact-delete-btn" disabled={deletingGroup !== null} aria-label={`删除任务「${group.requirement}」的所有交付产物`} onClick={() => void removeGroup(group)}>{deletingGroup === group.id ? '删除中…' : '删除'}</button>
+              </div>
+            ))}
           </div>
         )
       ) : null}
       {editFor ? (
-        <ArtifactEditModal artifact={editFor} onClose={() => setEditFor(null)} />
+        <ArtifactEditModal artifact={editFor} onClose={() => { setEditFor(null); void refreshDeliverables() }} />
       ) : null}
       {sandboxFor ? (
         <ArtifactSandboxModal
@@ -1932,26 +2052,56 @@ function ArtifactsView() {
 /* ------------------------------ 视图切换器 ------------------------------ */
 
 export function OfficeViewPanel({ view }: { view: OfficeView }) {
+  const tabs: { label: string; view: OfficeView }[] =
+    view === 'tasks' || view === 'calendar'
+      ? [{ label: '任务列表', view: 'tasks' }, { label: '里程碑与动态', view: 'calendar' }]
+      : view === 'artifacts' || view === 'files' || view === 'knowledge'
+        ? [{ label: '最终交付', view: 'artifacts' }, { label: '过程文件', view: 'files' }, { label: '参考资料', view: 'knowledge' }]
+        : view === 'agents' || view === 'skills'
+          ? [{ label: '成员', view: 'agents' }, { label: '技能', view: 'skills' }]
+          : []
+  let content: ReactNode
   switch (view) {
     case 'tasks':
-      return <TaskCenterView />
+      content = <TaskCenterView />
+      break
     case 'agents':
-      return <AgentsView />
+      content = <AgentsView />
+      break
     case 'files':
-      return <FilesView />
+      content = <FilesView />
+      break
+    case 'knowledge':
+      content = <KnowledgeView />
+      break
     case 'artifacts':
-      return <ArtifactsView />
+      content = <ArtifactsView />
+      break
     case 'skills':
-      return <SkillsView />
+      content = <SkillsView />
+      break
     case 'browser':
       return <BrowserView />
     case 'chat':
       return <OfficeChatView />
     case 'calendar':
-      return <CalendarView />
+      content = <CalendarView />
+      break
     case 'notifications':
       return <NotificationsView />
     default:
       return null
   }
+  return (
+    <div className="view-with-tabs">
+      <nav className="section-tabs" aria-label="页面内容">
+        {tabs.map((tab) => (
+          <button key={tab.view} type="button" className={view === tab.view ? 'active' : ''} aria-current={view === tab.view ? 'page' : undefined} onClick={() => setActiveView(tab.view)}>
+            {tab.label}
+          </button>
+        ))}
+      </nav>
+      {content}
+    </div>
+  )
 }

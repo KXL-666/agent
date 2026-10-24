@@ -21,6 +21,8 @@ export type OfficeActionSetState = {
   /** 名册序号，从 1 开始 */
   rosterNo?: number
   agentId?: string
+  /** 非 Sprint 的文件生成状态，可在上一轮结束后独立更新负责成员。 */
+  source?: 'artifact_generation'
 }
 
 export type OfficeActionEmote = {

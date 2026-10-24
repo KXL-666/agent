@@ -16,12 +16,14 @@
 
 import asyncio
 import io
+import json
 import os
 import shutil
 import threading
 import time
 import zipfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import psutil
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -30,16 +32,22 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 import agent_config
+from chat_context import build_chat_system, clock_reply, unavailable_reply
 import artifacts as artifact_store
 import demo
 import events as bus
 import forge
 import llm
 import storage
+import skills
 import uploads
+import file_knowledge
+from requirement_contract import build_contract
+from urllib.parse import urlsplit
 from artifacts import add_artifact, artifacts_store
 from events import clients, sprint_meta, tasks_store
 from graph import BudgetExceeded, add_instruction, build_sprint_graph
+import graph as workflow_graph
 from llm import chat_json, chat_text, llm_available, stream_chat
 from roles import ROSTER, roster_name
 
@@ -73,12 +81,20 @@ if _last:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    import archive_layout
+    await asyncio.to_thread(archive_layout.migrate)
+    await asyncio.to_thread(file_knowledge.index_existing)
+    if sprint_meta.get("id"):
+        artifact_store.set_sprint(sprint_meta["id"])
     yield
     if sprint_task and not sprint_task.done():
         sprint_task.cancel()
 
 
 app = FastAPI(title="AI 敏捷开发办公室", lifespan=lifespan)
+
+from skills_api import router as skills_router
+app.include_router(skills_router)
 
 # 仅允许本机开发/预览前端跨域访问，避免任意站点调用本机 API
 app.add_middleware(
@@ -96,6 +112,62 @@ class SprintRequest(BaseModel):
     fast: bool = False
     save_dir: str = ""  # 界面「保存位置」显式选择；为空则继续从需求文本解析
     budget: float = 0.0  # 单轮花费上限（元），0 = 不限；超限自动收尾停止继续调用模型
+    task_kind: str = "auto"
+    execution_mode: str = "cloud"
+    execution_style: str = "collaborative"
+
+
+def _local_model_ready() -> bool:
+    """Local mode is allowed only when every configured model route stays on loopback."""
+    configured = 0
+    for roster in ROSTER:
+        for config in (agent_config.resolve_llm(roster), agent_config.resolve_llm_backup(roster)):
+            if not config.get("api_key"):
+                continue
+            configured += 1
+            host = urlsplit(config.get("base_url") or llm.DEFAULT_BASE_URL).hostname
+            if host not in ("localhost", "127.0.0.1", "::1"):
+                return False
+    return configured > 0
+
+
+@app.get("/api/privacy/capabilities")
+async def privacy_capabilities():
+    return {"local_model_ready": _local_model_ready(), "message": "本地模式要求所有已配置的主、备用模型 API 位于本机回环地址。"}
+
+
+@app.post("/api/sprint/plan")
+async def preview_sprint_plan(req: SprintRequest):
+    requirement = req.requirement.strip()
+    if not requirement:
+        raise HTTPException(400, "请先描述需求")
+    if req.task_kind not in ("auto", "file", "software"):
+        raise HTTPException(400, "任务类型无效")
+    if req.execution_mode not in ("cloud", "local"):
+        raise HTTPException(400, "执行模式无效")
+    if req.execution_style not in ("collaborative", "quick"):
+        raise HTTPException(400, "协作模式无效")
+    if req.execution_style == "quick" and (req.task_kind == "software" or _detect_file_kind(requirement) == "code"):
+        raise HTTPException(400, "快速生成仅支持文件任务")
+    direct = req.execution_style == "quick"
+    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf"):
+        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel 或 PDF")
+    if req.execution_mode == "local" and not _local_model_ready():
+        raise HTTPException(400, "本地模式需要先把所有已配置的主、备用模型 API 改为本机地址")
+    uploads_by_id = {item["id"]: item for item in uploads.list_uploads()}
+    if any(uid not in uploads_by_id for uid in req.upload_ids):
+        raise HTTPException(400, "部分附件已不存在，请移除后重试")
+    attachments = [uploads_by_id[uid] for uid in req.upload_ids if uid in uploads_by_id]
+    return {
+        "route": "直接生成并验收文件" if direct else "需求拆解 → 分工开发 → 测试评审 → 交付",
+        "output": {"docx": "Word 文档", "pptx": "PPT 演示文稿", "xlsx": "Excel 表格", "pdf": "PDF 文档"}.get(_detect_file_kind(requirement), "文件") if direct else "代码包及过程文档",
+        "attachments": attachments,
+        "save_dir": req.save_dir or "默认交付目录",
+        "budget": req.budget,
+        "execution_mode": req.execution_mode,
+        "execution_style": req.execution_style,
+        "data_notice": "附件内容将发送到已配置的模型 API" if req.execution_mode == "cloud" else "仅调用本机回环地址的模型 API；请确认该服务自身不会转发数据",
+    }
 
 
 async def run_sprint(
@@ -103,21 +175,43 @@ async def run_sprint(
     uploads_text: str = "",
     fast: bool = False,
     uploads_images: list | None = None,
+    direct_artifact: bool = False,
+    upload_ids: list[str] | None = None,
+    task_kind: str = "auto",
 ) -> None:
     global running, sprint_task
     sprint_id = sprint_meta["id"]
+    stop_calls = threading.Event()
+    budget = float(sprint_meta.get("budget") or 0)
+    baseline = float(sprint_meta.get("usage_baseline") or 0)
+
+    def guard_call():
+        while True:
+            if sprint_meta.get("execution_mode") == "local" and not _local_model_ready():
+                raise RuntimeError("本地模式的模型配置已变更，已阻止后续模型调用")
+            if stop_calls.is_set():
+                raise RuntimeError("本轮迭代已结束，停止后续模型调用")
+            if budget and llm.usage_total_cost() - baseline >= budget:
+                raise BudgetExceeded("已达到本轮预算，停止后续模型调用")
+            if not bus.is_paused():
+                return
+            time.sleep(.2)
+
+    call_token = llm.set_call_guard(guard_call)
 
     async def cost_ticker() -> None:
         """运行期间每 8 秒推送一次增量花费，让用户随时看到成本"""
         try:
             while True:
                 await asyncio.sleep(8)
+                cur_cost = round(
+                    llm.usage_total_cost() - sprint_meta["usage_baseline"], 4
+                )
+                sprint_meta["cost"] = cur_cost
                 bus.emit(
                     {
                         "type": "sprint_usage",
-                        "cost": round(
-                            llm.usage_total_cost() - sprint_meta["usage_baseline"], 4
-                        ),
+                        "cost": cur_cost,
                         "tokens": llm.usage_total_tokens(),
                     }
                 )
@@ -129,32 +223,58 @@ async def run_sprint(
         llm.SCENE_PACE = FAST_SCENE_PACE if fast else BASE_SCENE_PACE
         bus.emit({"type": "sprint_start", "requirement": requirement, "sprint_id": sprint_id})
         ticker_task = asyncio.create_task(cost_ticker())
+        if direct_artifact:
+            # Spend calls on the requested file and its real QA, not simulated
+            # multi-round testing and rework for a single-file request.
+            deliver_kind = _detect_file_kind(requirement)
+            sprint_meta["deliver_kind"] = deliver_kind or ""
+            sprint_meta["stage"] = "直接生成成品"
+            storage.update_sprint(sprint_id, stage="直接生成成品", deliver_kind=deliver_kind or "")
+            bus.emit({"type": "stage", "stage": "直接生成成品", "started_at": sprint_meta["started_at"], "stage_started": time.time()})
+            await _generate_document(requirement, upload_ids, sprint_id)
+            items = storage.list_artifacts(sprint_id)
+            failed = not items or any(a.get("degraded") or a.get("quality_status") == "failed" for a in items)
+            pending_checks = not failed and any(a.get("quality_status") != "passed" for a in items)
+            accepted = not failed and not pending_checks
+            completion_stage = "已完成" if accepted else "交付待验证" if pending_checks else "交付待修正"
+            sprint_meta.update(status="completed" if accepted or pending_checks else "failed", stage=completion_stage)
+            storage.update_sprint(sprint_id, status=sprint_meta["status"], stage=completion_stage,
+                                  deliver_kind=deliver_kind or "", finished_at=time.time())
+            bus.emit({"type": "sprint_done", "tasks": [], "accepted": accepted, "pending_checks": pending_checks})
+            bus.emit({"type": "stage", "stage": completion_stage, "started_at": sprint_meta["started_at"], "stage_started": time.time()})
+            return
         result = await graph.ainvoke(
             {
                 "requirement": requirement,
+                "requirement_contract": storage.get_sprint(sprint_id).get("contract", {}),
                 "tasks": [],
                 "rework_count": 0,
                 "review_note": "",
                 "deliver_kind": "",
+                "task_kind": task_kind,
                 "uploads_text": uploads_text,
                 "uploads_images": uploads_images or [],
             }
         )
         deliver_kind = result.get("deliver_kind", "") if isinstance(result, dict) else ""
         sprint_meta["deliver_kind"] = deliver_kind or sprint_meta.get("deliver_kind", "")
-        sprint_meta["status"] = "completed"
-        sprint_meta["stage"] = "已完成"
+        final_items = [a for a in artifacts_store if a.get("kind") == "final"]
+        accepted = bool(final_items) and all(not a.get("degraded") and a.get("quality_status") == "passed" for a in final_items)
+        pending_checks = bool(final_items) and not any(a.get("degraded") or a.get("quality_status") == "failed" for a in final_items) and not accepted
+        completion_stage = "已完成" if accepted else "交付待验证" if pending_checks else "交付待修正"
+        sprint_meta["status"] = "completed" if accepted or pending_checks else "failed"
+        sprint_meta["stage"] = completion_stage
         storage.update_sprint(
             sprint_id,
-            status="completed",
-            stage="已完成",
+            status=sprint_meta["status"],
+            stage=completion_stage,
             deliver_kind=sprint_meta["deliver_kind"],
             finished_at=time.time(),
         )
         bus.emit(
             {
                 "type": "stage",
-                "stage": "已完成",
+                "stage": completion_stage,
                 "started_at": sprint_meta["started_at"],
                 "stage_started": time.time(),
             }
@@ -191,6 +311,8 @@ async def run_sprint(
         storage.update_sprint(sprint_id, status="failed", finished_at=time.time())
         bus.emit({"type": "sprint_error", "message": str(error)})
     finally:
+        stop_calls.set()
+        llm.reset_call_guard(call_token)
         if ticker_task:
             ticker_task.cancel()
         running = False
@@ -201,6 +323,7 @@ async def run_sprint(
         sprint_calls = max(0, llm.usage_total_calls() - sprint_meta.get("usage_baseline_calls", 0))
         sprint_tokens = max(0, llm.usage_total_tokens() - sprint_meta.get("usage_baseline_tokens", 0))
         sprint_cost = round(llm.usage_total_cost() - sprint_meta["usage_baseline"], 4)
+        sprint_meta["cost"] = max(0.0, sprint_cost)
         storage.update_sprint(
             sprint_id,
             usage_calls=sprint_calls,
@@ -224,6 +347,14 @@ async def start_sprint(req: SprintRequest):
         raise HTTPException(status_code=400, detail="requirement 不能为空")
     if running:
         raise HTTPException(status_code=409, detail="Sprint 正在进行中")
+    if req.task_kind not in ("auto", "file", "software"):
+        raise HTTPException(400, "任务类型无效")
+    if req.execution_mode not in ("cloud", "local"):
+        raise HTTPException(400, "执行模式无效")
+    if req.execution_style not in ("collaborative", "quick"):
+        raise HTTPException(400, "协作模式无效")
+    if req.execution_mode == "local" and not _local_model_ready():
+        raise HTTPException(400, "本地模式需要先把所有已配置的主、备用模型 API 改为本机地址")
     budget = max(0.0, float(req.budget or 0))
     if budget and budget < 0.01:
         raise HTTPException(status_code=400, detail="预算上限至少 0.01 元，或留 0 表示不限")
@@ -233,8 +364,16 @@ async def start_sprint(req: SprintRequest):
             detail="尚未配置任何成员的专属 API，AI 无法开工：请先在「智能体 → ⚙ 设置」中为成员填入 API Key",
         )
 
+    if req.execution_style == "quick" and (req.task_kind == "software" or _detect_file_kind(requirement) == "code"):
+        raise HTTPException(400, "快速生成仅支持文件任务")
+    direct_artifact = req.execution_style == "quick"
+    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf"):
+        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel 或 PDF")
+
     # 每轮 Sprint 独立入库，历史产物与代码不再被覆盖
-    sprint_id = storage.create_sprint(requirement)
+    sprint_id = storage.create_sprint(requirement, budget=budget)
+    storage.update_sprint(sprint_id, execution_style=req.execution_style,
+                          execution_mode=req.execution_mode, budget=budget)
     # 界面显式选择的保存位置：归一化为绝对路径，优先级高于需求文本解析
     save_dir = os.path.expandvars(os.path.expanduser(req.save_dir.strip()))
     if save_dir:
@@ -250,7 +389,7 @@ async def start_sprint(req: SprintRequest):
             "started_at": time.time(),
             "finished_at": 0.0,
             "status": "running",
-            "stage": "准备开工",
+            "stage": "直接生成成品" if direct_artifact else "准备开工",
             "stage_started": time.time(),
             "deliver_kind": "",
             "usage_baseline": llm.usage_total_cost(),
@@ -258,6 +397,8 @@ async def start_sprint(req: SprintRequest):
             "usage_baseline_tokens": llm.usage_total_tokens(),
             "fast": bool(req.fast),
             "budget": budget,
+            "execution_mode": req.execution_mode,
+            "execution_style": req.execution_style,
         }
     )
     tasks_store.clear()
@@ -267,10 +408,15 @@ async def start_sprint(req: SprintRequest):
     forge.begin_sprint(sprint_id)
 
     running = True
-    uploads_text = uploads.extract_many(req.upload_ids)
+    uploads_text = file_knowledge.context_for_task(requirement, req.upload_ids)
+    preliminary_contract = build_contract(
+        requirement, uploads_text,
+        deliver_kind=_detect_file_kind(requirement) if direct_artifact else "",
+    )
+    storage.save_contract(sprint_id, preliminary_contract)
     uploads_images = uploads.extract_images(req.upload_ids)
     sprint_task = asyncio.create_task(
-        run_sprint(requirement, uploads_text, req.fast, uploads_images)
+        run_sprint(requirement, uploads_text, req.fast, uploads_images, direct_artifact, req.upload_ids, req.task_kind)
     )
     return {"ok": True, "sprint_id": sprint_id, "requirement": requirement, "uploads": len(req.upload_ids)}
 
@@ -408,6 +554,8 @@ async def upload_files(files: list[UploadFile]):
     for f in files:
         data = await f.read()
         item = uploads.save_upload(f.filename or "unnamed", data)
+        if item:
+            await asyncio.to_thread(file_knowledge.index_upload, item["id"], item["name"])
         (saved if item else skipped).append(item or (f.filename or "unnamed"))
     return {"uploads": saved, "skipped_too_large": skipped}
 
@@ -417,10 +565,17 @@ async def get_uploads():
     return {"uploads": uploads.list_uploads()}
 
 
+@app.get("/api/uploads/search")
+async def search_uploads(q: str = "", ids: str = ""):
+    selected = [value for value in ids.split(",") if value] if ids else None
+    return file_knowledge.answer(q, selected)
+
+
 @app.delete("/api/uploads/{upload_id}")
 async def remove_upload(upload_id: str):
     if not uploads.delete_upload(upload_id):
         raise HTTPException(status_code=404, detail="附件不存在")
+    file_knowledge.remove_upload(upload_id)
     return {"ok": True}
 
 
@@ -441,6 +596,8 @@ async def get_state():
         "tasks": tasks_store,
         "artifacts": artifacts_store,
         "sprint": sprint_meta,
+        "requirement_contract": (_sprint_view(sprint_id) or {}).get("contract", {}),
+        "handoffs": storage.list_handoffs(sprint_id) if sprint_id else [],
         "cost": round(llm.usage_total_cost() - baseline, 4) if running else 0,
         "history": storage.list_sprints(20),
     }
@@ -448,7 +605,8 @@ async def get_state():
 
 @app.get("/api/sprints")
 async def list_sprints():
-    return {"sprints": storage.list_sprints(50)}
+    # Keep the fixed quality-baseline runs reachable from the UI history selector.
+    return {"sprints": storage.list_sprints(100)}
 
 
 @app.get("/api/sprints/{sprint_id}")
@@ -459,9 +617,16 @@ async def get_sprint_detail(sprint_id: str):
     return {
         "sprint": sprint,
         "tasks": storage.list_tasks(sprint_id),
+        "handoffs": storage.list_handoffs(sprint_id),
         "artifacts": storage.list_artifacts(sprint_id),
         "events": storage.list_events(sprint_id, 200),
     }
+
+
+@app.get("/api/artifacts/deliverables")
+async def list_deliverables():
+    """产物中心使用的跨 Sprint 最终交付物列表。"""
+    return {"artifacts": storage.list_deliverables()}
 
 
 @app.get("/api/sprints/{sprint_id}/artifacts.zip")
@@ -482,17 +647,18 @@ async def download_sprint_artifacts_zip(sprint_id: str):
             files.append(path)
     if not files:
         raise HTTPException(status_code=404, detail="该 Sprint 没有可下载的真实文件产物")
-    zip_name = await asyncio.to_thread(_zip_files, files, f"sprint-{sprint_id}-产物.zip")
+    download_name = forge.semantic_filename(sprint["requirement"], "zip", "本轮产物")
+    zip_name = await asyncio.to_thread(_zip_files, files, download_name)
     return FileResponse(
-        os.path.join(forge.DELIVERABLES_DIR, zip_name),
-        filename=f"sprint-{sprint_id}-artifacts.zip",
+        forge.output_path(zip_name),
+        filename=download_name,
     )
 
 
 def _zip_files(paths: list[str], zip_name_hint: str) -> str:
     """把若干真实文件打成 zip（文件名维度去重），返回 zip 文件名"""
     zip_name = forge._unique_name(zip_name_hint)
-    zip_path = os.path.join(forge.DELIVERABLES_DIR, zip_name)
+    zip_path = forge.output_path(zip_name)
     used: set[str] = set()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in paths:
@@ -601,8 +767,8 @@ def _fallback_document(prompt: str) -> dict:
             f"# {title}\n\n"
             f"> 需求描述：{prompt}\n\n"
             "## 说明\n\n"
-            "当前没有成员配置专属 API，这是模板兜底文档。"
-            "在「智能体 → ⚙ 设置」中为成员填入 API Key 后，这里将生成真实详实的交付物内容。\n\n"
+            "本次没有获得可用的模型响应，因此保存了模板说明。"
+            "请在「智能体 → ⚙ 设置」中检查执行成员的 API 地址、密钥和模型，然后重试。\n\n"
             "## 建议结构\n\n"
             "1. 背景与目标\n"
             "2. 方案设计\n"
@@ -624,6 +790,12 @@ def _extract_title(content: str, prompt: str) -> str:
 def _detect_file_kind(prompt: str) -> str | None:
     """根据老板指令判断要生成的真实文件类型；返回 None 表示保持 Markdown"""
     text = prompt.lower()
+    if any(word in text for word in ("代码包", "代码项目", "源代码", "编程", "写一个程序", "开发一个", "python脚本", "python 脚本")):
+        return "code"
+    if "pdf" in text and any(word in text for word in ("word", "docx")):
+        return "docx"
+    if "pdf" in text:
+        return "pdf"
     if any(w in text for w in ("ppt", "幻灯", "演示文稿", "slides")):
         return "pptx"
     if any(w in text for w in ("excel", "表格", "xlsx", "预算表", "统计表")):
@@ -636,7 +808,32 @@ def _detect_file_kind(prompt: str) -> str | None:
     return "docx"
 
 
-_KIND_DEFAULT_NAME = {"docx": "文档.docx", "pptx": "演示文稿.pptx", "xlsx": "表格.xlsx"}
+def _select_artifact_roster(kind: str | None) -> int | None:
+    """将直生成品交给有 API 的团队成员，确保调用归属可追踪。"""
+    preferred = 5 if kind == "code" else 1
+    configured = [roster for roster in sorted(ROSTER) if llm_available(roster)]
+    healthy = [roster for roster in configured if not llm.agent_failure(roster)]
+    if preferred in healthy:
+        return preferred
+    return next(iter(healthy or configured), None)
+
+
+def _should_direct_artifact_sprint(requirement: str) -> bool:
+    """Route a clear single-file request straight to generation and real QA."""
+    text = requirement.lower()
+    explicit_file = any(word in text for word in (
+        "ppt", "幻灯", "演示文稿", "slides", "excel", "xlsx", "表格",
+        "word", "docx", "文档", "pdf",
+    ))
+    collaborative = any(word in text for word in (
+        "敏捷", "sprint", "团队协作", "任务拆解", "任务分工", "多人协作",
+        "完整项目", "代码项目", "源代码", "编程", "写一个程序", "开发一个系统",
+        "开发网站", "开发应用", "软件系统", "接口开发",
+    ))
+    return explicit_file and not collaborative and _detect_file_kind(requirement) in ("docx", "pptx", "xlsx", "pdf")
+
+
+_KIND_DEFAULT_NAME = {"docx": "文档.docx", "pptx": "演示文稿.pptx", "xlsx": "表格.xlsx", "pdf": "文档.pdf", "code": "项目.zip"}
 
 
 def _saved_note(dest: str | None, target_dir: str | None = None) -> str:
@@ -651,15 +848,21 @@ def _current_sprint_id() -> str:
     return sprint_meta.get("id") or ""
 
 
-async def _generate_document_safe(prompt: str, upload_ids: list[str] | None = None) -> None:
+async def _generate_document_safe(prompt: str, upload_ids: list[str] | None = None, sprint_id: str | None = None) -> None:
     """兜住生成过程中的任何异常：失败也落一条带警示的产物，不让用户空等"""
+    sid = sprint_id or _current_sprint_id()
+    initial = storage.get_sprint(sid) if sid else None
+    direct = initial and str(initial.get("stage", "")).startswith("直接生成成品")
     try:
-        await _generate_document(prompt, upload_ids)
+        await _generate_document(prompt, upload_ids, sprint_id)
     except Exception as error:  # noqa: BLE001
         print(f"[Generate] 生成失败：{error}")
         add_artifact(
             kind="custom",
             title="生成失败",
+            sprint_id=sprint_id,
+            source="fallback",
+            quality_status="failed",
             author_roster=None,
             content=(
                 f"# 生成失败\n\n需求：{prompt}\n\n错误：{error}\n\n"
@@ -669,14 +872,53 @@ async def _generate_document_safe(prompt: str, upload_ids: list[str] | None = No
             degraded_reason=str(error)[:160],
             regen={"mode": "custom", "prompt": prompt, "upload_ids": upload_ids or []},
         )
+    finally:
+        if direct:
+            items = storage.list_artifacts(sid)
+            failed = not items or any(item.get("degraded") or item.get("quality_status") == "failed" for item in items)
+            unchecked = any(item.get("quality_status") != "passed" for item in items)
+            status = "failed" if failed else "completed"
+            stage = "生成失败或验收未通过" if failed else "文件已生成，部分验收待完成" if unchecked else "成品验收完成"
+            storage.update_sprint(sid, status=status, stage=stage, finished_at=time.time())
+            if sprint_meta.get("id") == sid and not running:
+                sprint_meta.update(status=status, stage=stage, finished_at=time.time())
+            bus.emit({"type": "generate_progress", "stage": stage, "prompt": prompt[:40], "sprint_id": sid})
 
 
-async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -> None:
+async def _generate_document(prompt: str, upload_ids: list[str] | None = None, sprint_id: str | None = None) -> None:
+    """生成期间只将实际负责的成员标记为工作中，完成后恢复空闲。"""
+    kind = _detect_file_kind(prompt)
+    roster = _select_artifact_roster(kind) or (5 if kind == "code" else 1)
+    bus.emit({
+        "type": "set_state",
+        "rosterNo": roster,
+        "state": "working",
+        "task": f"直接生成：{prompt[:36]}",
+        "source": "artifact_generation",
+    })
+    try:
+        await _generate_document_impl(prompt, upload_ids, sprint_id, roster)
+    finally:
+        bus.emit({
+            "type": "set_state",
+            "rosterNo": roster,
+            "state": "idle",
+            "task": "等待新任务",
+            "source": "artifact_generation",
+        })
+
+
+async def _generate_document_impl(
+    prompt: str,
+    upload_ids: list[str] | None = None,
+    sprint_id: str | None = None,
+    assigned_roster: int | None = None,
+) -> None:
     """后台生成真实交付物文件并入库（自动经 WebSocket 推送 artifact_new）"""
     # 极简需求直通：「生成空文件」类指令无需 LLM，直接落盘并复制到目标位置
     if "空文件" in prompt:
         file_name = forge._unique_name("空文件.txt")
-        with open(os.path.join(forge.DELIVERABLES_DIR, file_name), "w", encoding="utf-8") as f:
+        with open(forge.output_path(file_name), "w", encoding="utf-8") as f:
             f.write("")
         target_dir = forge.extract_target_dir(prompt)
         dest = (
@@ -686,7 +928,9 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
         )
         add_artifact(
             kind="custom",
+            sprint_id=sprint_id,
             title="空文件.txt",
+            source="local",
             author_roster=None,
             content=f"已生成空文件：{file_name}" + _saved_note(dest, target_dir),
             file_name=file_name,
@@ -695,17 +939,34 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
         return
 
     kind = _detect_file_kind(prompt)
-    attachments = uploads.extract_many(upload_ids or [])
+    roster = assigned_roster if assigned_roster is not None else _select_artifact_roster(kind)
+    attachments = file_knowledge.context_for_task(prompt, upload_ids or [])
     spec = (
         f"以下附件内容作为素材，请基于它们加工改造：\n\n{attachments}\n\n需求：{prompt}"
         if attachments else prompt
     )
 
+    if kind == "code":
+        sid = sprint_id or _current_sprint_id()
+        code_dir = forge.sprint_code_dir(sid)
+        bus.emit({"type": "generate_progress", "stage": "规划并整合完整项目", "prompt": prompt[:40]})
+        report = await asyncio.to_thread(forge.create_project, spec, code_dir, roster, prompt)
+        filename = await asyncio.to_thread(_zip_code_for, sid, prompt)
+        target_dir = forge.extract_target_dir(prompt)
+        saved = await asyncio.to_thread(forge.copy_to_target, filename, target_dir) if filename and target_dir else None
+        add_artifact(kind="custom", title=prompt[:30] + "（代码项目）", author_roster=roster,
+                     sprint_id=sid, content=forge.self_check_note(report) + _saved_note(saved, target_dir), file_name=filename,
+                     quality_status=report["status"], degraded=not filename or report["status"] == "failed",
+                     degraded_reason="项目检查未通过" if report["status"] == "failed" else "",
+                     regen={"mode": "code", "prompt": prompt, "spec": spec, "target_dir": forge.extract_target_dir(prompt) or ""})
+        return
+
     if kind:
-        title = prompt[:18] or _KIND_DEFAULT_NAME[kind]
-        bus.emit({"type": "generate_progress", "stage": "正在编写生成脚本", "prompt": prompt[:40]})
+        title = forge.semantic_stem(prompt, _KIND_DEFAULT_NAME[kind].rpartition('.')[0])
+        filename = forge.semantic_filename(prompt, kind, _KIND_DEFAULT_NAME[kind].rpartition('.')[0])
+        bus.emit({"type": "generate_progress", "stage": "正在撰写成品内容", "prompt": prompt[:40]})
         file_name = await asyncio.to_thread(
-            forge.forge_file, kind, spec, _KIND_DEFAULT_NAME[kind]
+            forge.forge_file, kind, spec, filename, roster
         )
         if file_name:
             bus.emit({"type": "generate_progress", "stage": "正在校验与自检成品", "prompt": prompt[:40]})
@@ -718,11 +979,14 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
             )
             check = await asyncio.to_thread(forge.self_check, file_name, kind)
             check_note = forge.self_check_note(check)
-            check_failed = not check.get("ok", False)
+            check_failed = check.get("status", "passed" if check.get("ok") else "failed") == "failed"
             add_artifact(
                 kind="custom",
+                sprint_id=sprint_id,
                 title=f"{title}（{_KIND_DEFAULT_NAME[kind].rpartition('.')[2]}）",
-                author_roster=None,
+                source="model",
+                quality_status=check.get("status", "passed" if check.get("ok") else "failed"),
+                author_roster=roster,
                 content=(
                     preview
                     or f"已生成真实 {kind} 文件：{file_name}\n\n> 需求描述：{prompt}"
@@ -734,8 +998,8 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
                     "mode": "forge",
                     "file_kind": kind,
                     "spec": spec,
-                    "filename": _KIND_DEFAULT_NAME[kind],
-                    "roster": None,
+                    "filename": filename,
+                    "roster": roster,
                     "target_dir": target_dir or "",
                 },
             )
@@ -753,6 +1017,7 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
         temperature=0.7,
         max_tokens=4000,
         timeout=300,
+        roster=roster,
         meta=meta,
     )
     if not content or not content.strip():
@@ -764,8 +1029,11 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
     )
     add_artifact(
         kind="custom",
+        sprint_id=sprint_id,
         title=_extract_title(content, prompt),
-        author_roster=None,
+        source="fallback" if reason else "model",
+        quality_status="failed" if kind else "unchecked",
+        author_roster=roster,
         content=content,
         degraded=bool(reason),
         degraded_reason=reason,
@@ -774,26 +1042,30 @@ async def _generate_document(prompt: str, upload_ids: list[str] | None = None) -
             "file_kind": kind,
             "spec": spec,
             "prompt": prompt,
-            "filename": _KIND_DEFAULT_NAME.get(kind or "", ""),
+            "filename": forge.semantic_filename(prompt, kind, _KIND_DEFAULT_NAME[kind].rpartition('.')[0]) if kind else "",
             "upload_ids": upload_ids or [],
-            "roster": None,
+            "roster": roster,
         },
     )
 
 
-def _zip_code_for(sprint_id: str) -> str | None:
+def _zip_code_for(sprint_id: str, requirement: str = "") -> str | None:
     """把指定 Sprint 的代码目录打成 zip，返回文件名；无代码时返回 None"""
-    code_dir = os.path.realpath(forge.sprint_code_dir(sprint_id))
+    code_dir = forge.selected_project(forge.sprint_code_dir(sprint_id))
     if not os.path.isdir(code_dir):
         return None
     files = [os.path.join(root, f) for root, _, fs in os.walk(code_dir) for f in fs]
     if not files:
         return None
-    zip_name = f"code-{sprint_id}.zip"
-    zip_path = os.path.join(forge.DELIVERABLES_DIR, zip_name)
+    if not requirement:
+        requirement = (storage.get_sprint(sprint_id) or {}).get("requirement", "")
+    zip_name = forge._unique_name(forge.semantic_filename(requirement, "zip", "代码项目"))
+    zip_path = forge.output_path(zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for full in files:
             zf.write(full, os.path.relpath(full, code_dir))
+    import artifact_quality
+    artifact_quality.save_report(zip_path, forge.WORKSPACE_DIR, forge.project_report(forge.sprint_code_dir(sprint_id)))
     return zip_name
 
 
@@ -805,7 +1077,7 @@ async def download_code_zip(sprint: str | None = None):
     if not zip_name:
         raise HTTPException(status_code=404, detail="该 Sprint 尚未产出代码")
     return FileResponse(
-        os.path.join(forge.DELIVERABLES_DIR, zip_name), filename="sprint-code.zip"
+        forge.output_path(zip_name), filename=os.path.basename(zip_name)
     )
 
 
@@ -850,6 +1122,13 @@ async def preview_artifact(artifact_id: str):
     artifact = _find_artifact(artifact_id)
     file_name = artifact.get("file_name") or ""
     body = forge.preview_html(file_name) if file_name else ""
+    if file_name:
+        path = forge.safe_deliverable_path(file_name)
+        if path:
+            import artifact_quality
+            report = await asyncio.to_thread(forge.self_check, file_name)
+            if report and report.get("pages"):
+                body = "".join(f'<section><img alt="第 {i + 1} 页" style="width:100%;max-width:1000px;display:block;margin:16px auto;border:1px solid #ddd" src="/api/artifacts/{artifact_id}/quality/pages/{i + 1}" /></section>' for i in range(len(report["pages"])))
     if not body:
         body = "<p>该产物没有可预览的真实文件（可能为纯文本产物或文件已被清理）。</p>"
     return (
@@ -861,6 +1140,107 @@ async def preview_artifact(artifact_id: str):
         ".preview-slide{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0;}"
         "</style></head><body>" + body + "</body></html>"
     )
+
+
+@app.get("/api/artifact-capabilities")
+async def artifact_capabilities():
+    import office_runtime
+    import project_agent
+    return {**office_runtime.capabilities(), "code_sandbox": await asyncio.to_thread(project_agent.docker_available)}
+
+
+@app.get("/api/artifacts/{artifact_id}/provenance")
+async def artifact_provenance(artifact_id: str):
+    """Trace PO→SM→BE/FE→candidate→QA→LEAD for one saved artifact."""
+    import artifact_quality
+    import contributions
+
+    artifact = _find_artifact(artifact_id)
+    sprint_id = artifact.get("sprint_id") or ""
+    sprint = storage.get_sprint(sprint_id) or {}
+    is_manual_version = (artifact.get("regen") or {}).get("mode") == "manual_revision"
+    candidate_id = (artifact.get("parent_id") if artifact.get("kind") == "final" and not is_manual_version
+                    else artifact_id)
+    if artifact.get("kind") == "final" and not candidate_id and not artifact.get("file_name"):
+        candidates = [entry for entry in storage.list_artifacts(sprint_id) if entry.get("kind") == "candidate"]
+        if candidates:
+            candidate_id = candidates[-1]["id"]
+    candidate = storage.get_artifact(candidate_id) or artifact
+    if (candidate.get("regen") or {}).get("source_candidate_id"):
+        lead_candidate = storage.get_artifact(candidate["regen"]["source_candidate_id"]) or candidate
+    else:
+        lead_candidate = candidate
+
+    def saved_report(item: dict, filename: str):
+        path = forge.safe_deliverable_path(item.get("file_name") or "")
+        if not path:
+            return None
+        report_file = artifact_quality.report_directory(path, forge.WORKSPACE_DIR) / filename
+        try:
+            return json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    tasks = storage.list_tasks(sprint_id) if sprint_id else []
+    actual_contributions = []
+    for task in tasks:
+        if not task.get("contribution_ref"):
+            continue
+        try:
+            valid, reason, manifest = contributions.inspect(sprint_id, task["id"])
+        except ValueError:
+            continue
+        preview = ""
+        if manifest.get("kind") == "text" and manifest.get("files"):
+            try:
+                preview = Path(manifest["files"][0]["path"]).read_text(encoding="utf-8")[:1800]
+            except OSError:
+                pass
+        actual_contributions.append({"task_id": task["id"], "roster": manifest.get("roster"),
+                                     "role_scope": manifest.get("role_scope"), "valid": valid,
+                                     "reason": reason, "files": manifest.get("files", []),
+                                     "requirement_ids": manifest.get("requirement_ids", []),
+                                     "preview": preview})
+    return {
+        "execution_style": sprint.get("execution_style", "legacy_unknown"),
+        "overall_status": artifact.get("quality_status", "unchecked"),
+        "failure_reason": artifact.get("degraded_reason", ""),
+        "contract": sprint.get("contract", {}), "tasks": tasks,
+        "handoffs": storage.list_handoffs(sprint_id) if sprint_id else [],
+        "contributions": actual_contributions,
+        "candidate": {"id": candidate.get("id"), "version": candidate.get("version"),
+                      "parent_id": candidate.get("parent_id"), "file_name": candidate.get("file_name"),
+                      "sha256": (candidate.get("regen") or {}).get("sha256")},
+        "qa": saved_report(candidate, "qa-report.json"),
+        "lead": saved_report(lead_candidate, "lead-decision.json"),
+        "usage": {key: sprint.get(key, 0) for key in ("usage_calls", "usage_tokens", "usage_cost")},
+    }
+
+
+@app.get("/api/artifacts/{artifact_id}/quality")
+async def artifact_quality_report(artifact_id: str):
+    artifact = _find_artifact(artifact_id)
+    file_name = artifact.get("file_name")
+    if not file_name:
+        raise HTTPException(status_code=404, detail="该产物没有真实文件")
+    result = await asyncio.to_thread(forge.self_check, file_name)
+    return {key: result.get(key) for key in ("kind", "status", "ok", "checks", "metrics", "review", "attempts", "pages")}
+
+
+@app.get("/api/artifacts/{artifact_id}/quality/pages/{page}")
+async def artifact_quality_page(artifact_id: str, page: int):
+    import artifact_quality
+    artifact = _find_artifact(artifact_id)
+    path = forge.safe_deliverable_path(artifact.get("file_name") or "")
+    if not path:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    report = artifact_quality.load_report(path, forge.WORKSPACE_DIR)
+    if not report or page < 1 or page > len(report.get("pages", [])):
+        raise HTTPException(status_code=404, detail="该页尚未渲染")
+    image = artifact_quality.report_directory(path, forge.WORKSPACE_DIR) / f"page-{page}.png"
+    if not image.is_file():
+        raise HTTPException(status_code=404, detail="预览图片不存在")
+    return FileResponse(image, media_type="image/png")
 
 
 @app.get("/api/artifacts/{artifact_id}/versions")
@@ -916,6 +1296,21 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
 
     if mode == "code":
         sprint_id = artifact.get("sprint_id") or _current_sprint_id()
+        code_dir = forge.sprint_code_dir(sprint_id)
+        if instruction:
+            report = await asyncio.to_thread(
+                forge.create_project,
+                (regen.get("spec") or regen.get("prompt") or artifact.get("content", "")) + suffix,
+                code_dir,
+                None,
+                regen.get("prompt") or (storage.get_sprint(sprint_id) or {}).get("requirement", ""),
+            )
+        else:
+            import project_agent
+            previous = forge.project_report(code_dir)
+            report = await asyncio.to_thread(project_agent.evaluate, Path(forge.selected_project(code_dir)), previous.get("planned_files", []), previous.get("runtime", "python"))
+            (Path(code_dir) / ".project-quality.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        failures = [check["detail"] for check in report["checks"] if check["ok"] is False]
         zip_name = await asyncio.to_thread(_zip_code_for, sprint_id)
         if not zip_name:
             raise HTTPException(status_code=502, detail="当前 Sprint 没有可打包的代码文件")
@@ -926,14 +1321,22 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
             )
             saved = _saved_note(dest, regen["target_dir"])
         return {
-            "content": f"# 最终交付物\n\n- 代码包已重新打包：{zip_name}" + saved,
+            "content": f"# 最终交付物\n\n- 代码包：{zip_name}" + forge.self_check_note(report) + saved,
             "file_name": zip_name,
-            "degraded": False,
-            "degraded_reason": "",
+            "degraded": bool(failures),
+            "degraded_reason": "；".join(failures[:4]),
+            "quality_status": report["status"],
         }
 
     if mode == "forge" and regen.get("file_kind"):
         spec = f"{regen.get('spec', '')}{suffix}"
+        previous_path = forge.safe_deliverable_path(artifact.get("file_name") or "")
+        if previous_path:
+            import artifact_quality
+            directory = artifact_quality.report_directory(previous_path, forge.WORKSPACE_DIR)
+            previous = next((path for path in (directory / "source.md", directory / "source.json") if path.is_file()), None)
+            if previous:
+                spec += "\n\n已有成品（保留正确内容与结构，仅按修订要求修改）：\n" + previous.read_text(encoding="utf-8")[:40000]
         file_name = await asyncio.to_thread(
             forge.forge_file,
             regen["file_kind"],
@@ -953,11 +1356,14 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
                 forge.copy_to_target, file_name, regen["target_dir"]
             )
             saved = _saved_note(dest, regen["target_dir"])
+        check = await asyncio.to_thread(forge.self_check, file_name, regen["file_kind"])
         return {
-            "content": (preview or f"已重新生成真实文件：{file_name}") + saved,
+            "content": (preview or f"已重新生成真实文件：{file_name}") + saved + forge.self_check_note(check),
             "file_name": file_name,
-            "degraded": False,
-            "degraded_reason": "",
+            "degraded": check.get("status", "passed" if check["ok"] else "failed") == "failed",
+            "degraded_reason": "重新生成的成品仍未通过质检" if check.get("status", "passed" if check["ok"] else "failed") == "failed" else "",
+            "source": "model",
+            "quality_status": check.get("status", "passed" if check["ok"] else "failed"),
         }
 
     prompt = (regen.get("prompt") or artifact.get("content", "")) + suffix
@@ -979,6 +1385,8 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
         "content": content,
         "degraded": bool(meta.get("fallback_reason")),
         "degraded_reason": meta.get("fallback_reason", ""),
+        "source": "fallback" if meta.get("fallback_reason") else "model",
+        "quality_status": "unchecked",
     }
 
 
@@ -986,9 +1394,135 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
 async def retry_artifact(artifact_id: str):
     """重新生成单个产物（保留同一条记录并刷新内容）"""
     artifact = _find_artifact(artifact_id)
+    if artifact.get("kind") == "final" and (storage.get_sprint(artifact.get("sprint_id") or "") or {}).get("execution_style") == "collaborative":
+        raise HTTPException(status_code=409, detail="协作成品不能原地重试；请创建新修订版本并重新验收")
     fields = await _rebuild(artifact)
     updated = artifact_store.update_artifact(artifact_id, **fields)
     return {"ok": True, "artifact": updated}
+
+
+def _manual_contribution_refs(sprint_id: str, artifact: dict) -> list[str]:
+    regen = artifact.get("regen") or {}
+    if regen.get("contribution_refs"):
+        return list(regen["contribution_refs"])
+    candidate = storage.get_artifact(regen.get("candidate_id") or "") or {}
+    return list((candidate.get("regen") or {}).get("contribution_refs", []))
+
+
+def _manual_call_guard(sprint_id: str):
+    sprint = storage.get_sprint(sprint_id) or {}
+    budget = max(0.0, float(sprint.get("budget") or 0))
+    spent = max(0.0, float(sprint.get("usage_cost") or 0))
+    baseline_cost = llm.usage_total_cost()
+    remaining_budget = max(0.0, budget - spent) if budget else 0.0
+
+    def guard():
+        if sprint.get("execution_mode") == "local" and not _local_model_ready():
+            raise RuntimeError("本地模式模型配置已变更，已阻止修订调用")
+        current_delta = max(0.0, llm.usage_total_cost() - baseline_cost)
+        if budget and (spent >= budget or current_delta >= remaining_budget):
+            raise BudgetExceeded("修订操作已达到 Sprint 剩余预算")
+
+    return llm.set_call_guard(guard)
+
+
+def _usage_snapshot() -> tuple[int, int, float]:
+    return llm.usage_total_calls(), llm.usage_total_tokens(), llm.usage_total_cost()
+
+
+def _persist_manual_usage_delta(sprint_id: str, before: tuple[int, int, float]) -> None:
+    current = _usage_snapshot()
+    sprint = storage.get_sprint(sprint_id) or {}
+    storage.update_sprint(
+        sprint_id,
+        usage_calls=int(sprint.get("usage_calls") or 0) + max(0, current[0] - before[0]),
+        usage_tokens=int(sprint.get("usage_tokens") or 0) + max(0, current[1] - before[1]),
+        usage_cost=round(float(sprint.get("usage_cost") or 0) + max(0.0, current[2] - before[2]), 4),
+    )
+
+
+async def _revalidate_manual_collaborative_version(artifact: dict, sprint_id: str) -> dict:
+    """Run a manual collaborative revision through the same QA→LEAD hash gate."""
+    import hashlib
+    import handoffs
+    import review_decision
+    import verification
+
+    sprint = storage.get_sprint(sprint_id) or {}
+    path = forge.safe_deliverable_path(artifact.get("file_name") or "")
+    regen = artifact.get("regen") or {}
+    if not path:
+        return artifact_store.update_artifact(
+            artifact["id"], quality_status="unchecked", degraded_reason="修订版本缺少真实文件，QA/LEAD 未运行"
+        )
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    if digest != regen.get("sha256"):
+        return artifact_store.update_artifact(
+            artifact["id"], quality_status="failed", degraded_reason="修订文件哈希与版本记录不一致"
+        )
+    if sprint.get("budget") and float(sprint.get("usage_cost") or 0) >= float(sprint.get("budget") or 0):
+        return artifact_store.update_artifact(
+            artifact["id"], quality_status="unchecked", degraded_reason="Sprint 预算已用完，修订版本等待 QA/LEAD"
+        )
+    before_usage = _usage_snapshot()
+    token = _manual_call_guard(sprint_id)
+    try:
+        contract = sprint.get("contract") or {}
+        refs = [f"requirement:{item['requirement_id']}" for item in contract.get("requirements", [])]
+        refs += list(regen.get("contribution_refs") or [])
+        offered = handoffs.offer(
+            sprint_id, task_id="", from_roster=6, to_roster=4,
+            input_refs=refs or [f"contract:{sprint_id}"], output_refs=[f"artifact:{artifact['id']}"],
+            claims=[f"手动修订版本 SHA-256 {digest}，请重新逐条验收"],
+            acceptance_criteria=["QA 对修订后的真实文件及同一哈希重新核验"],
+        )
+        if offered.get("status") == "ready":
+            handoffs.receive(offered["id"], accepted=True)
+        evidence = workflow_graph._workflow_evidence(
+            sprint_id, storage.list_tasks(sprint_id), contract, digest,
+        )
+        report = await asyncio.to_thread(verification.verify, artifact, contract, digest, evidence)
+        qa_artifact = add_artifact(
+            kind="test", title="手动修订版 QA 逐条验证", author_roster=4,
+            content=json.dumps(report, ensure_ascii=False, indent=2),
+            quality_status=report.get("status", "unchecked"),
+            source="model" if report.get("status") != "unchecked" else "fallback",
+            degraded=report.get("status") == "failed", degraded_reason=report.get("reason", ""),
+            regen={"mode": "manual_revision_qa", "candidate_id": artifact["id"],
+                   "candidate_sha256": digest}, sprint_id=sprint_id,
+        )
+        lead_offer = handoffs.offer(
+            sprint_id, task_id="", from_roster=4, to_roster=5,
+            input_refs=[f"contract:{sprint_id}", f"artifact:{artifact['id']}", f"artifact:{qa_artifact['id']}"],
+            output_refs=[f"artifact:{qa_artifact['id']}"],
+            claims=[f"QA 对修订哈希 {digest} 的结论为 {report.get('status', 'unchecked')}"],
+            acceptance_criteria=["LEAD 独立复核相同修订 SHA-256"],
+        )
+        if lead_offer.get("status") == "ready":
+            handoffs.receive(lead_offer["id"], accepted=True)
+        records = storage.list_handoffs(sprint_id)
+        lead = await asyncio.to_thread(
+            review_decision.decide, artifact, contract, report, records, digest, None, evidence,
+        )
+        add_artifact(
+            kind="review", title="手动修订版 LEAD 独立复核", author_roster=5,
+            content=json.dumps(lead, ensure_ascii=False, indent=2),
+            quality_status=lead.get("status", "unchecked"),
+            source="model" if lead.get("status") != "unchecked" else "fallback",
+            degraded=lead.get("status") == "failed", degraded_reason=lead.get("reason", ""),
+            regen={"mode": "manual_revision_lead", "candidate_id": artifact["id"],
+                   "candidate_sha256": digest}, sprint_id=sprint_id,
+        )
+        verified = (contract.get("status") == "ready" and report.get("status") == "passed"
+                    and lead.get("status") == "passed" and lead.get("candidate_sha256") == digest)
+        failed = report.get("status") == "failed" or lead.get("status") == "failed"
+        status = "passed" if verified else "failed" if failed else "unchecked"
+        reason = "" if verified else report.get("reason") or lead.get("reason") or "修订版 QA/LEAD 未全部通过"
+        return artifact_store.update_artifact(artifact["id"], quality_status=status,
+                                               degraded_reason=reason)
+    finally:
+        llm.reset_call_guard(token)
+        _persist_manual_usage_delta(sprint_id, before_usage)
 
 
 @app.post("/api/artifacts/{artifact_id}/revise")
@@ -998,8 +1532,57 @@ async def revise_artifact(artifact_id: str, req: RevisionRequest):
     if not instruction:
         raise HTTPException(status_code=400, detail="修改要求不能为空")
     artifact = _find_artifact(artifact_id)
-    fields = await _rebuild(artifact, instruction)
     sprint_id = artifact.get("sprint_id") or _current_sprint_id()
+    collaborative_final = (artifact.get("kind") == "final" and
+                           (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
+    if collaborative_final and running:
+        raise HTTPException(status_code=409, detail="当前协作 Sprint 仍在运行，结束后再修订")
+    if collaborative_final and artifact.get("file_name"):
+        import candidate_revision
+        import hashlib
+        kind = Path(artifact["file_name"]).suffix.lower().lstrip(".")
+        if kind == "zip":
+            kind = "code"
+        base_candidate = storage.get_artifact((artifact.get("regen") or {}).get("candidate_id") or "") or {}
+        contribution_refs = (base_candidate.get("regen") or {}).get("contribution_refs", [])
+        project_dir = ((artifact.get("regen") or {}).get("project_dir") or
+                       (base_candidate.get("regen") or {}).get("project_dir", ""))
+        actual = await asyncio.to_thread(forge.extract_preview, artifact["file_name"], 14000)
+        if kind == "code" and project_dir:
+            import project_agent
+            actual = project_agent.snapshot(Path(project_dir), limit=20000)
+        meta: dict = {}
+        before_usage = _usage_snapshot()
+        call_token = _manual_call_guard(sprint_id)
+        try:
+            patch_data = await asyncio.to_thread(
+                chat_json,
+                "按用户要求只修改一个明确位置，输出 JSON："
+                '{"location":"第N页/第N段/工作表!A1/文件路径",'
+                '"old_text":"需要替换的精确旧文本","replacement":"完整替换文本或公式或代码文件内容",'
+                '"path":"代码相对路径"}。找不到唯一位置时返回空对象。不得删除测试。',
+                json.dumps({"instruction": instruction, "kind": kind, "actual_content": actual}, ensure_ascii=False),
+                fallback={}, roster=2 if kind == "code" else 3, meta=meta, max_tokens=6500, timeout=180,
+            )
+        finally:
+            llm.reset_call_guard(call_token)
+            _persist_manual_usage_delta(sprint_id, before_usage)
+        if meta.get("fallback_reason") or not isinstance(patch_data, dict) or not patch_data:
+            raise HTTPException(status_code=502, detail="未能定位安全的定点修订位置，原成品未改动")
+        file_name, reason, detail = await asyncio.to_thread(
+            candidate_revision.apply, sprint_id, kind, artifact["file_name"], patch_data, project_dir
+        )
+        if not file_name:
+            raise HTTPException(status_code=422, detail=reason or "定点修订失败，原成品未改动")
+        path = forge.safe_deliverable_path(file_name)
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
+        fields = {"content": artifact.get("content", "") + f"\n\n修订要求：{instruction}\n修订位置：{detail}",
+                  "file_name": file_name, "quality_status": "unchecked", "source": "model",
+                  "regen": {"mode": "manual_revision", "file_kind": kind, "sha256": digest,
+                            "project_dir": detail.get("project_dir", project_dir),
+                            "contribution_refs": contribution_refs}}
+    else:
+        fields = await _rebuild(artifact, instruction)
     root_id = storage.artifact_root(sprint_id, artifact_id)
     version = storage.latest_artifact_version(sprint_id, root_id) + 1
     created = add_artifact(
@@ -1011,11 +1594,15 @@ async def revise_artifact(artifact_id: str, req: RevisionRequest):
         file_name=fields.get("file_name") or artifact.get("file_name"),
         degraded=fields.get("degraded", False),
         degraded_reason=fields.get("degraded_reason", ""),
-        regen=artifact.get("regen"),
+        source=fields.get("source", artifact.get("source", "unknown")),
+        quality_status="unchecked" if collaborative_final else fields.get("quality_status", "unchecked"),
+        regen=fields.get("regen", artifact.get("regen")),
         parent_id=artifact_id,
         version=version,
         sprint_id=sprint_id,
     )
+    if collaborative_final and not created.get("degraded"):
+        created = await _revalidate_manual_collaborative_version(created, sprint_id)
     return {"ok": True, "artifact": created}
 
 
@@ -1040,6 +1627,18 @@ async def rollback_artifact(artifact_id: str, req: RollbackRequest):
         if not file_name:
             degraded = True
             degraded_reason = "旧版文件已丢失，仅恢复文字内容"
+    collaborative_final = (artifact.get("kind") == "final" and
+                           (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
+    if collaborative_final and running:
+        raise HTTPException(status_code=409, detail="当前协作 Sprint 仍在运行，结束后再回滚")
+    rollback_regen = artifact.get("regen")
+    if collaborative_final:
+        import hashlib
+        path = forge.safe_deliverable_path(file_name or "")
+        file_kind = Path(file_name).suffix.lstrip(".").lower() if file_name else ""
+        rollback_regen = {"mode": "manual_revision", "file_kind": "code" if file_kind == "zip" else file_kind,
+                          "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else "",
+                          "contribution_refs": _manual_contribution_refs(sprint_id, artifact)}
     created = add_artifact(
         kind=target.get("kind") or artifact.get("kind", "custom"),
         title=f"{artifact.get('title', '产物')}（回滚 v{version}）",
@@ -1049,11 +1648,15 @@ async def rollback_artifact(artifact_id: str, req: RollbackRequest):
         file_name=file_name,
         degraded=degraded,
         degraded_reason=degraded_reason,
-        regen=artifact.get("regen"),
+        source=target.get("source", "unknown"),
+        quality_status="failed" if degraded else "unchecked" if collaborative_final else target.get("quality_status", "unchecked"),
+        regen=rollback_regen,
         parent_id=root_id,
         version=version,
         sprint_id=sprint_id,
     )
+    if collaborative_final and not created.get("degraded"):
+        created = await _revalidate_manual_collaborative_version(created, sprint_id)
     return {"ok": True, "artifact": created}
 
 
@@ -1062,6 +1665,12 @@ async def artifact_raw(artifact_id: str):
     """返回产物的文字内容供站内编辑器加载，上限 200KB"""
     artifact = _find_artifact(artifact_id)
     content = artifact.get("content") or ""
+    path = forge.safe_deliverable_path(artifact.get("file_name") or "")
+    if path and Path(path).suffix.lower() in (".docx", ".pdf"):
+        import artifact_quality
+        source = artifact_quality.report_directory(path, forge.WORKSPACE_DIR) / "source.md"
+        if source.is_file():
+            content = source.read_text(encoding="utf-8")
     return {
         "id": artifact_id,
         "title": artifact.get("title", ""),
@@ -1088,6 +1697,10 @@ async def edit_artifact(artifact_id: str, req: EditRequest):
         raise HTTPException(status_code=400, detail="内容超过 200KB，无法保存")
     artifact = _find_artifact(artifact_id)
     sprint_id = artifact.get("sprint_id") or _current_sprint_id()
+    collaborative_final = (artifact.get("kind") == "final" and
+                           (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
+    if collaborative_final and running:
+        raise HTTPException(status_code=409, detail="当前协作 Sprint 仍在运行，结束后再编辑")
     root_id = storage.artifact_root(sprint_id, artifact_id)
     version = storage.latest_artifact_version(sprint_id, root_id) + 1
 
@@ -1095,14 +1708,21 @@ async def edit_artifact(artifact_id: str, req: EditRequest):
     degraded = False
     degraded_reason = ""
     old_file = (artifact.get("file_name") or "").lower()
-    if old_file.endswith(".docx"):
-        base = os.path.splitext(os.path.basename(artifact["file_name"]))[0]
+    if old_file.endswith((".docx", ".pdf")):
+        requirement = (storage.get_sprint(sprint_id) or {}).get("requirement", "")
+        base = forge.semantic_stem(requirement or artifact.get("title", ""), "文档")
         file_name = await asyncio.to_thread(
-            forge.render_docx_from_markdown, content, f"{base}-编辑v{version}.docx"
+            forge.render_document_from_markdown, content, f"{base}（编辑v{version}）{Path(old_file).suffix}"
         )
         if not file_name:
             degraded = True
             degraded_reason = "Word 文件渲染失败，本次仅保存了文字内容"
+    import hashlib
+    source_path = forge.safe_deliverable_path(file_name or "")
+    file_kind = Path(file_name).suffix.lstrip(".").lower() if file_name else ""
+    edit_regen = {"mode": "manual_revision", "file_kind": "code" if file_kind == "zip" else file_kind,
+                  "sha256": hashlib.sha256(Path(source_path).read_bytes()).hexdigest() if source_path else "",
+                  "contribution_refs": _manual_contribution_refs(sprint_id, artifact)}
     created = add_artifact(
         kind=artifact.get("kind", "custom"),
         title=f"{artifact.get('title', '产物')}（编辑 v{version}）",
@@ -1112,11 +1732,15 @@ async def edit_artifact(artifact_id: str, req: EditRequest):
         file_name=file_name,
         degraded=degraded,
         degraded_reason=degraded_reason,
-        regen=artifact.get("regen"),
+        source="local",
+        quality_status="failed" if degraded else "unchecked",
+        regen=edit_regen,
         parent_id=artifact_id,
         version=version,
         sprint_id=sprint_id,
     )
+    if collaborative_final and not created.get("degraded"):
+        created = await _revalidate_manual_collaborative_version(created, sprint_id)
     return {"ok": True, "artifact": created}
 
 
@@ -1152,21 +1776,24 @@ async def generate_artifact(req: GenerateRequest):
                 "requirement": prompt[:200],
                 "started_at": time.time(),
                 "finished_at": time.time(),
-                "status": "completed",
+                "status": "running",
                 "stage": "直接生成成品",
                 "deliver_kind": _detect_file_kind(prompt) or "docx",
             }
         )
         artifact_store.set_sprint(sprint_id)
+        tasks_store.clear()
+        bus.event_log.clear()
         storage.update_sprint(
             sprint_id,
-            status="completed",
+            status="running",
             stage="直接生成成品",
             deliver_kind=sprint_meta["deliver_kind"],
             finished_at=time.time(),
         )
-    asyncio.create_task(_generate_document_safe(prompt, req.upload_ids))
-    return {"ok": True, "message": "生成任务已提交，完成后会实时出现在产物中心"}
+        bus.emit({"type": "hello", **(await get_state())})
+    asyncio.create_task(_generate_document_safe(prompt, req.upload_ids, _current_sprint_id()))
+    return {"ok": True, "sprint_id": _current_sprint_id(), "message": "生成任务已提交，完成后会实时出现在产物中心"}
 
 
 # ---------------------------------------------------------------------------
@@ -1184,16 +1811,6 @@ class ChatRequest(BaseModel):
     upload_ids: list[str] = []  # 可附带图片附件，走视觉模型识别
 
 
-CHAT_FALLBACK: dict[int, list[str]] = {
-    1: ["我先记到需求池，稍后拆解成任务。", "这个想法不错，我评估下优先级再排期。"],
-    2: ["接口设计我来看下，稍后给你方案。", "这段逻辑后端来实现，问题不大。"],
-    3: ["页面交互我来处理，先出个原型。", "样式细节我会盯住的，放心。"],
-    4: ["我先补几条用例，把这个场景覆盖上。", "测出来问题我会第一时间打回。"],
-    5: ["技术上可行，注意别引入过度设计。", "代码评审我来把关。"],
-    6: ["流程没问题，保持当前节奏就好。", "我盯着看板，有阻塞随时喊我。"],
-}
-
-
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     entry = ROSTER.get(req.roster)
@@ -1203,18 +1820,10 @@ async def chat(req: ChatRequest):
     if not text:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
-    system = (
-        f"你是「AI 敏捷开发办公室」网页系统里的员工「{entry['role']}·{entry['name']}」（工位编号 {req.roster}）。"
-        "团队正在通过 Sprint 协作交付软件：产品经理拆解需求，前后端工程师开发，测试工程师把关，"
-        "技术主管评审代码，敏捷教练保障流程。请以该角色的身份和口吻回答老板的提问，"
-        "口语化、简洁、自然，不超过 80 字。\n"
-        "严格遵守以下事实边界，违反即为错误：\n"
-        "1. 你和老板只在这个网页聊天窗口里对话。系统里不存在企业微信、微信、邮件、电话等任何外部渠道，"
-        "绝不能说「已发你微信/邮箱/企业微信」或承诺通过任何外部渠道发送东西。\n"
-        "2. 不要承诺发链接或发文件。老板要找需求、任务、产物、报告时，直接告诉他在本页面哪个模块查看："
-        "任务进展在「任务中心」，需求与日报在「文件中心」，团队动态在「通知中心」，办公室实时画面在「首页」。\n"
-        "3. 只谈论这个系统和当前 Sprint 里真实存在的事物，不确定的细节就坦率说稍后确认，不要编造。"
-    )
+    system = _chat_system(req.roster)
+    local_reply = clock_reply(text)
+    if local_reply:
+        return {"reply": local_reply, "llm": False, "model": "系统时钟", "roster": req.roster, "degraded": False}
     history = [
         {"role": m.role, "content": m.content}
         for m in req.history[-12:]
@@ -1222,14 +1831,13 @@ async def chat(req: ChatRequest):
     ]
     history.append({"role": "user", "content": text})
 
-    pool = CHAT_FALLBACK.get(req.roster, ["收到，我来跟进。"])
     meta: dict = {}
     images = uploads.extract_images(req.upload_ids)
     reply = await asyncio.to_thread(
         chat_text,
         system,
         history,
-        lambda: pool[len(history) % len(pool)],
+        lambda: unavailable_reply(text),
         roster=req.roster,
         meta=meta,
         images=images or None,
@@ -1247,19 +1855,9 @@ async def chat(req: ChatRequest):
 
 
 def _chat_system(roster: int) -> str:
-    entry = ROSTER[roster]
-    return (
-        f"你是「AI 敏捷开发办公室」网页系统里的员工「{entry['role']}·{entry['name']}」（工位编号 {roster}）。"
-        "团队正在通过 Sprint 协作交付软件：产品经理拆解需求，前后端工程师开发，测试工程师把关，"
-        "技术主管评审代码，敏捷教练保障流程。请以该角色的身份和口吻回答老板的提问，"
-        "口语化、简洁、自然，不超过 80 字。\n"
-        "严格遵守以下事实边界，违反即为错误：\n"
-        "1. 你和老板只在这个网页聊天窗口里对话。系统里不存在企业微信、微信、邮件、电话等任何外部渠道，"
-        "绝不能说「已发你微信/邮箱/企业微信」或承诺通过任何外部渠道发送东西。\n"
-        "2. 不要承诺发链接或发文件。老板要找需求、任务、产物、报告时，直接告诉他在本页面哪个模块查看："
-        "任务进展在「任务中心」，需求与日报在「文件中心」，团队动态在「通知中心」，办公室实时画面在「首页」。\n"
-        "3. 只谈论这个系统和当前 Sprint 里真实存在的事物，不确定的细节就坦率说稍后确认，不要编造。"
-    )
+    cfg = agent_config.get_agent_config(roster)
+    entry = {**ROSTER[roster], "name": cfg.get("name") or ROSTER[roster]["name"]}
+    return build_chat_system(entry, roster, sprint_meta, tasks_store, artifacts_store)
 
 
 @app.post("/api/chat/stream")
@@ -1276,10 +1874,10 @@ async def chat_stream(req: ChatRequest):
         if m.role in ("user", "assistant")
     ]
     history.append({"role": "user", "content": text})
-    pool = CHAT_FALLBACK.get(req.roster, ["收到，我来跟进。"])
-    fallback = pool[len(history) % len(pool)]
+    fallback = unavailable_reply(text)
     meta: dict = {}
     system = _chat_system(req.roster)
+    local_reply = clock_reply(text)
     # 图片附件：把最后一条 user 消息升级为多模态内容（模型不支持时整段回退兜底文案）
     images = uploads.extract_images(req.upload_ids)
     if images:
@@ -1288,6 +1886,10 @@ async def chat_stream(req: ChatRequest):
     async def event_source():
         import json as _json
 
+        if local_reply:
+            for payload in ({"start": True, "model": "系统时钟"}, {"delta": local_reply}, {"done": True, "degraded": False}):
+                yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+            return
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
@@ -1305,7 +1907,7 @@ async def chat_stream(req: ChatRequest):
             if chunk is None:
                 break
             yield f"data: {_json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
-        yield f"data: {_json.dumps({'done': True, 'degraded': bool(meta.get('fallback_reason'))}, ensure_ascii=False)}\n\n"
+        yield f"data: {_json.dumps({'done': True, 'degraded': bool(meta.get('fallback_reason')), 'images_dropped': bool(meta.get('images_dropped')), 'backup_used': bool(meta.get('backup_used'))}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
@@ -1339,6 +1941,10 @@ def _agent_view(roster: int) -> dict:
     llm_cfg = cfg["llm"]
     backup_cfg = cfg["llm_backup"]
     has_key = bool(llm_cfg["api_key"])
+    has_backup_key = bool(backup_cfg["api_key"])
+    backup_in_use = llm.backup_in_use(roster)
+    failure = llm.agent_failure(roster)
+    availability = "unconfigured" if not has_key else "backup" if backup_in_use else "error" if failure else "configured"
     return {
         "roster": roster,
         "name": entry.get("name", f"#{roster}"),
@@ -1359,8 +1965,11 @@ def _agent_view(roster: int) -> dict:
             "model": backup_cfg["model"],
         },
         "has_custom_key": has_key,
-        "has_backup_key": bool(backup_cfg["api_key"]),
-        "backup_in_use": llm.backup_in_use(roster),
+        "has_backup_key": has_backup_key,
+        "backup_in_use": backup_in_use,
+        "availability": availability,
+        "availability_reason": failure["reason"] if failure else ("未配置主 API Key" if not has_key else ""),
+        "availability_updated_at": failure["ts"] if failure else None,
     }
 
 
@@ -1423,7 +2032,7 @@ async def put_pricing(req: PricingRequest):
 # ---------------------------------------------------------------------------
 # 数据备份：数据库/用量/配置/产物一键导出导入，换机或重装不再丢历史
 # ---------------------------------------------------------------------------
-BACKUP_DB_ITEMS = ("usage.json", "agent_config.json", "pricing.json")
+BACKUP_DB_ITEMS = ("usage.json", "agent_config.json", "pricing.json", "skills_data.json")
 
 
 @app.get("/api/backup/export")
@@ -1431,7 +2040,7 @@ async def backup_export():
     """导出全部数据：office.db + 用量/成员配置/单价 + deliverables 产物目录"""
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     zip_name = forge._unique_name("office-backup.zip")
-    zip_path = os.path.join(forge.DELIVERABLES_DIR, zip_name)
+    zip_path = forge.output_path(zip_name)
 
     def _pack() -> None:
         # 持锁拷贝数据库，避免导到一半的写入事务
@@ -1443,15 +2052,19 @@ async def backup_export():
                     path = os.path.join(backend_dir, name)
                     if os.path.isfile(path):
                         zf.write(path, name)
-                for root, _dirs, files in os.walk(forge.DELIVERABLES_DIR):
-                    for filename in files:
-                        full = os.path.join(root, filename)
-                        if os.path.abspath(full) == os.path.abspath(zip_path):
-                            continue
-                        zf.write(full, os.path.relpath(full, backend_dir))
+                for base in (forge.DELIVERABLES_DIR, forge.WORKSPACE_DIR):
+                    for root, _dirs, files in os.walk(base):
+                        _dirs[:] = [name for name in _dirs if name not in (".venv", "node_modules", "__pycache__")]
+                        if os.path.realpath(root) == os.path.realpath(forge.WORKSPACE_DIR):
+                            _dirs[:] = [name for name in _dirs if name not in ("tools", "benchmarks")]
+                        for filename in files:
+                            full = os.path.join(root, filename)
+                            if os.path.abspath(full) == os.path.abspath(zip_path) or filename == "office-backup.zip":
+                                continue
+                            zf.write(full, os.path.relpath(full, backend_dir))
 
     await asyncio.to_thread(_pack)
-    return FileResponse(zip_path, filename=zip_name, media_type="application/zip")
+    return FileResponse(zip_path, filename="office-backup.zip", media_type="application/zip")
 
 
 @app.post("/api/backup/import")
@@ -1486,10 +2099,14 @@ async def backup_import(file: UploadFile):
                             shutil.copyfileobj(src, dst)
                         restored.append(name)
                 for info in archive.infolist():
-                    if info.is_dir() or not info.filename.startswith("deliverables/"):
+                    if info.is_dir() or not info.filename.startswith(("deliverables/", "workspace/")):
+                        continue
+                    if info.filename.startswith(("workspace/tools/", "workspace/benchmarks/")):
+                        continue
+                    if any(part in (".venv", "node_modules", "__pycache__") for part in info.filename.replace("\\", "/").split("/")):
                         continue
                     rel = os.path.normpath(info.filename)
-                    if ".." in rel.split(os.sep):
+                    if ".." in info.filename.replace("\\", "/").split("/") or os.path.commonpath([os.path.realpath(backend_dir), os.path.realpath(os.path.join(backend_dir, rel))]) != os.path.realpath(backend_dir):
                         continue
                     target = os.path.join(backend_dir, rel)
                     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -1500,10 +2117,15 @@ async def backup_import(file: UploadFile):
         await asyncio.to_thread(_restore)
     if not restored:
         raise HTTPException(status_code=400, detail="备份包内没有可恢复的数据文件")
+    if "skills_data.json" in restored:
+        for item in skills.list_skills():
+            if item.get("package_id"):
+                skills.update_package_status(item["id"], item.get("tools", []),
+                                             ["备份恢复后请重新安装依赖"])
     return {
         "ok": True,
         "restored": restored,
-        "note": "导入完成。建议重启后端并刷新页面，以加载全新的历史数据",
+        "note": "导入完成。请重启后端并刷新页面；完整技能包的依赖需在技能中心点击重试安装。",
     }
 
 
@@ -1529,8 +2151,12 @@ async def test_agent(roster: int, req: AgentTestRequest):
     start = time.time()
     try:
         reply = await asyncio.to_thread(llm.ping, base_url, api_key, model, 60)
+        if api_key == saved.get("api_key", ""):
+            llm._mark_success(roster, api_key)
         return {"ok": True, "reply": reply.strip(), "latency": round(time.time() - start, 2)}
     except Exception as error:  # noqa: BLE001 —— 把真实错误透传给前端展示
+        if api_key == saved.get("api_key", ""):
+            llm._mark_fallback(roster, str(error))
         return {"ok": False, "error": str(error)[:200]}
 
 

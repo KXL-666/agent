@@ -9,6 +9,10 @@ export type SprintTask = {
   assignee_roster?: number | null
   status: string
   summary?: string
+  user_story?: string
+  priority?: 'P0' | 'P1' | 'P2'
+  story_points?: number
+  acceptance_criteria?: string[]
 }
 
 export type SprintActivity = {
@@ -24,6 +28,7 @@ const STATUS_META: Record<
   待分派: { label: '等待开始', tone: 'purple', progress: 0, done: false },
   待开发: { label: '进行中', tone: 'blue', progress: 25, done: false },
   待测试: { label: '进行中', tone: 'blue', progress: 60, done: false },
+  待评审: { label: '待评审', tone: 'purple', progress: 80, done: false },
   打回: { label: '打回修复', tone: 'orange', progress: 50, done: false },
   通过: { label: '已完成', tone: 'green', progress: 100, done: true },
   已取消: { label: '已取消', tone: 'gray', progress: 0, done: true },
@@ -35,9 +40,31 @@ export function statusMeta(status: string) {
   )
 }
 
+/** 已结束的 Sprint 保留原任务阶段供复盘，但不再显示为正在执行。 */
+export function displayTaskMeta(status: string, running: boolean) {
+  const meta = statusMeta(status)
+  if (running || meta.done) return meta
+  return { ...meta, label: '未完成', tone: 'gray', progress: 0, done: true }
+}
+
 export function assigneeName(rosterNo: number | null | undefined) {
   if (!rosterNo) return '未分配'
   return AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
+}
+
+/** 任务完成度只统计真正通过的任务；已取消任务不计入分母。 */
+export function computeSprintProgress(tasks: SprintTask[]): {
+  percent: number
+  done: number
+  total: number
+  hasTasks: boolean
+} {
+  const active = tasks.filter((t) => t.status !== '已取消')
+  const total = active.length
+  if (total === 0) return { percent: 0, done: 0, total: 0, hasTasks: false }
+  const done = active.filter((t) => t.status === '通过').length
+  const percent = Math.round((done / total) * 100)
+  return { percent, done, total, hasTasks: true }
 }
 
 const ACTIVITY_LIMIT = 8

@@ -7,6 +7,7 @@
 import json
 import os
 import time
+from uuid import uuid4
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -47,7 +48,7 @@ def save_upload(filename: str, data: bytes) -> dict | None:
     if len(data) > MAX_FILE_SIZE:
         return None
     name = _sanitize_name(filename)
-    upload_id = f"U{int(time.time() * 1000)}"
+    upload_id = f"U{uuid4().hex}"
     disk_name = f"{upload_id}_{name}"
     with open(os.path.join(UPLOADS_DIR, disk_name), "wb") as f:
         f.write(data)

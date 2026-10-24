@@ -19,6 +19,10 @@ import {
   subscribeChat,
   updateLastAssistantMessage,
   useRestoreChat,
+  beginChat,
+  finishChat,
+  abortChat,
+  getPendingRosters,
   type ChatMessage,
 } from '@/store/officeChatStore'
 import {
@@ -48,12 +52,17 @@ export function OfficeChatView() {
   const thread = useSyncExternalStore(subscribeChat, () =>
     getThreadSnapshot(roster),
   )
-  const [input, setInput] = useState('')
-  const [pending, setPending] = useState(false)
-  const [images, setImages] = useState<OfficeUpload[]>([])
+  const [drafts, setDrafts] = useState<Record<number, string>>({})
+  const input = drafts[roster] ?? ''
+  const setInput = (value: string) => setDrafts((prev) => ({ ...prev, [roster]: value }))
+  const pendingRosters = useSyncExternalStore(subscribeChat, getPendingRosters)
+  const pending = pendingRosters.includes(roster)
+  const [imageThreads, setImageThreads] = useState<Record<number, OfficeUpload[]>>({})
+  const images = imageThreads[roster] ?? []
+  const setImages = (value: OfficeUpload[] | ((previous: OfficeUpload[]) => OfficeUpload[])) =>
+    setImageThreads((prev) => ({ ...prev, [roster]: typeof value === 'function' ? value(prev[roster] ?? []) : value }))
   const [uploading, setUploading] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
 
   useRestoreChat()
@@ -75,7 +84,7 @@ export function OfficeChatView() {
   useEffect(() => {
     const el = listRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [thread.length, roster])
+  }, [thread, roster])
 
   /** 选择图片：>2MB 直接提示并跳过（后端视觉输入上限），合计最多 4 张 */
   async function handlePickImages(event: ChangeEvent<HTMLInputElement>) {
@@ -124,8 +133,10 @@ export function OfficeChatView() {
   async function handleSend() {
     const text = input.trim()
     if (!text || pending) return
+    const controller = beginChat(roster)
+    if (!controller) return
 
-    const history = getThreadSnapshot(roster).map((m) => ({
+    const history = getThreadSnapshot(roster).filter((m) => !m.hint).map((m) => ({
       role: m.role,
       content: m.content,
     }))
@@ -133,7 +144,6 @@ export function OfficeChatView() {
     appendUserMessage(roster, text)
     setInput('')
     setImages([])
-    setPending(true)
 
     // 场景联动：该员工走到话筒前"回复老板"，4 秒后回到原状态
     const agent = getOfficeAgents()[roster - 1]
@@ -142,8 +152,6 @@ export function OfficeChatView() {
     if (agent) setAgentState(agent.id, 'talking', '正在回复老板消息…')
 
     // 流式回复：SSE 逐帧增量渲染，可随时中断
-    const controller = new AbortController()
-    abortRef.current = controller
     let acc = ''
     let model: string | undefined
     let degraded = false
@@ -222,10 +230,11 @@ export function OfficeChatView() {
       } else if (!acc) {
         appendAssistantMessage(roster, '（连接失败，请确认后端已启动）', 'mock')
         showToast('发送失败：无法连接后端，请确认服务已启动')
+      } else {
+        appendHintMessage(roster, '连接已断开，以上为部分回复，可继续追问。')
       }
     } finally {
-      setPending(false)
-      abortRef.current = null
+      finishChat(roster)
       if (agent) {
         setTimeout(
           () => setAgentState(agent.id, prevState, prevTask),
@@ -247,8 +256,8 @@ export function OfficeChatView() {
     <div className="view-page chat-page">
       <header className="view-head">
         <div>
-          <h1>对话中心</h1>
-          <p>选择任意员工，以 TA 的角色身份与你对话（各成员使用自己配置的模型）</p>
+          <h1>对话</h1>
+          <p>各成员独立对话，可在回复期间切换并向其他成员发送消息</p>
         </div>
       </header>
 
@@ -273,7 +282,7 @@ export function OfficeChatView() {
               </span>
               <span>
                 <strong>{displayNameOf(index + 1)}</strong>
-                <em>{item.role}</em>
+                <em>{pendingRosters.includes(index + 1) ? '正在回复…' : item.role}</em>
               </span>
             </button>
           ))}
@@ -298,6 +307,7 @@ export function OfficeChatView() {
             <button
               type="button"
               className="view-ghost-btn"
+              disabled={pending}
               onClick={() => {
                 clearThread(roster)
                 showToast('聊天记录已清空')
@@ -386,7 +396,7 @@ export function OfficeChatView() {
               <button
                 type="button"
                 className="view-ghost-btn"
-                onClick={() => abortRef.current?.abort()}
+                onClick={() => abortChat(roster)}
               >
                 中断
               </button>

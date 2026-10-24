@@ -9,6 +9,8 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
+from agile import PLAN_FIELDS
 
 DB_PATH = os.getenv("OFFICE_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "office.db"
@@ -27,7 +29,11 @@ CREATE TABLE IF NOT EXISTS sprints (
   finished_at REAL NOT NULL DEFAULT 0,
   usage_calls INTEGER NOT NULL DEFAULT 0,
   usage_tokens INTEGER NOT NULL DEFAULT 0,
-  usage_cost REAL NOT NULL DEFAULT 0
+  usage_cost REAL NOT NULL DEFAULT 0,
+  contract_json TEXT NOT NULL DEFAULT '{}',
+  execution_style TEXT NOT NULL DEFAULT 'legacy_unknown',
+  budget REAL NOT NULL DEFAULT 0,
+  execution_mode TEXT NOT NULL DEFAULT 'cloud'
 );
 CREATE TABLE IF NOT EXISTS tasks (
   sprint_id TEXT NOT NULL,
@@ -52,6 +58,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at REAL NOT NULL DEFAULT 0,
   degraded INTEGER NOT NULL DEFAULT 0,
   degraded_reason TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'unknown',
+  quality_status TEXT NOT NULL DEFAULT 'unknown',
   regen TEXT NOT NULL DEFAULT '',
   parent_id TEXT,
   version INTEGER NOT NULL DEFAULT 1
@@ -65,14 +73,37 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_events_sprint ON events(sprint_id, ts);
+CREATE TABLE IF NOT EXISTS handoffs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sprint_id TEXT NOT NULL,
+  task_id TEXT NOT NULL DEFAULT '',
+  from_roster INTEGER NOT NULL,
+  to_roster INTEGER NOT NULL,
+  input_refs TEXT NOT NULL DEFAULT '[]',
+  output_refs TEXT NOT NULL DEFAULT '[]',
+  claims TEXT NOT NULL DEFAULT '[]',
+  open_questions TEXT NOT NULL DEFAULT '[]',
+  acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'unchecked',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_sprint ON handoffs(sprint_id, task_id, id);
 """
 
 
-def _conn() -> sqlite3.Connection:
+@contextmanager
+def _conn():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init() -> None:
@@ -83,15 +114,29 @@ def init() -> None:
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """老库平滑升级：sprints 缺少的用量列逐个补齐"""
+    """老库平滑升级。"""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(sprints)")}
     for name, decl in (
         ("usage_calls", "INTEGER NOT NULL DEFAULT 0"),
         ("usage_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("usage_cost", "REAL NOT NULL DEFAULT 0"),
+        ("contract_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("execution_style", "TEXT NOT NULL DEFAULT 'legacy_unknown'"),
+        ("budget", "REAL NOT NULL DEFAULT 0"),
+        ("execution_mode", "TEXT NOT NULL DEFAULT 'cloud'"),
     ):
         if name not in existing:
             conn.execute(f"ALTER TABLE sprints ADD COLUMN {name} {decl}")
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "agile" not in task_columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN agile TEXT NOT NULL DEFAULT '{}'")
+    artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")}
+    for name, decl in (
+        ("source", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("quality_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ):
+        if name not in artifact_columns:
+            conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {decl}")
 
 
 init()
@@ -101,6 +146,17 @@ def _row(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
     data = dict(row)
+    if "contract_json" in data:
+        try:
+            data["contract"] = json.loads(data.pop("contract_json") or "{}")
+        except (ValueError, TypeError):
+            data["contract"] = {}
+    if "agile" in data:
+        try:
+            values = json.loads(data.pop("agile") or "{}")
+            data.update({k: values[k] for k in PLAN_FIELDS if k in values})
+        except (ValueError, TypeError):
+            pass
     if "code_files" in data:
         try:
             data["code_files"] = json.loads(data["code_files"] or "[]")
@@ -119,12 +175,12 @@ def _row(row: sqlite3.Row | None) -> dict | None:
 # ------------------------------ Sprint ------------------------------
 
 
-def create_sprint(requirement: str) -> str:
+def create_sprint(requirement: str, budget: float = 0) -> str:
     sprint_id = f"S{int(time.time() * 1000)}"
     with _lock, _conn() as conn:
         conn.execute(
-            "INSERT INTO sprints(id, requirement, status, started_at) VALUES(?,?,?,?)",
-            (sprint_id, requirement, "running", time.time()),
+            "INSERT INTO sprints(id, requirement, status, started_at, budget) VALUES(?,?,?,?,?)",
+            (sprint_id, requirement, "running", time.time(), max(0.0, float(budget or 0))),
         )
     return sprint_id
 
@@ -135,6 +191,10 @@ def update_sprint(sprint_id: str, **fields) -> None:
     allowed = {
         "requirement", "status", "stage", "deliver_kind", "started_at", "finished_at",
         "usage_calls", "usage_tokens", "usage_cost",
+        "contract_json",
+        "execution_style",
+        "budget",
+        "execution_mode",
     }
     pairs = [(k, v) for k, v in fields.items() if k in allowed]
     if not pairs:
@@ -148,6 +208,10 @@ def get_sprint(sprint_id: str) -> dict | None:
     with _lock, _conn() as conn:
         row = conn.execute("SELECT * FROM sprints WHERE id=?", (sprint_id,)).fetchone()
     return _row(row)
+
+
+def save_contract(sprint_id: str, contract: dict) -> None:
+    update_sprint(sprint_id, contract_json=json.dumps(contract, ensure_ascii=False))
 
 
 def latest_sprint() -> dict | None:
@@ -186,12 +250,12 @@ def upsert_task(sprint_id: str, task: dict) -> None:
         return
     with _lock, _conn() as conn:
         conn.execute(
-            """INSERT INTO tasks(sprint_id,id,title,role_hint,assignee_roster,status,summary,code_files)
-               VALUES(?,?,?,?,?,?,?,?)
+            """INSERT INTO tasks(sprint_id,id,title,role_hint,assignee_roster,status,summary,code_files,agile)
+               VALUES(?,?,?,?,?,?,?,?,?)
                ON CONFLICT(sprint_id,id) DO UPDATE SET
                  title=excluded.title, role_hint=excluded.role_hint,
                  assignee_roster=excluded.assignee_roster, status=excluded.status,
-                 summary=excluded.summary, code_files=excluded.code_files""",
+                 summary=excluded.summary, code_files=excluded.code_files, agile=excluded.agile""",
             (
                 sprint_id,
                 str(task.get("id", "")),
@@ -201,6 +265,7 @@ def upsert_task(sprint_id: str, task: dict) -> None:
                 str(task.get("status", "")),
                 str(task.get("summary", "")),
                 json.dumps(task.get("code_files", []), ensure_ascii=False),
+                json.dumps({k: task[k] for k in PLAN_FIELDS if k in task}, ensure_ascii=False),
             ),
         )
 
@@ -211,6 +276,64 @@ def list_tasks(sprint_id: str) -> list[dict]:
             "SELECT * FROM tasks WHERE sprint_id=? ORDER BY id", (sprint_id,)
         ).fetchall()
     return [_row(row) for row in rows]
+
+
+# ------------------------------ 交接 ------------------------------
+
+_HANDOFF_LISTS = ("input_refs", "output_refs", "claims", "open_questions", "acceptance_criteria")
+
+
+def _handoff_row(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    for key in _HANDOFF_LISTS:
+        try:
+            item[key] = json.loads(item[key] or "[]")
+        except (ValueError, TypeError):
+            item[key] = []
+    return item
+
+
+def create_handoff(sprint_id: str, *, task_id: str, from_roster: int, to_roster: int,
+                   input_refs: list[str], output_refs: list[str], claims: list[str],
+                   open_questions: list[str] | None = None,
+                   acceptance_criteria: list[str] | None = None,
+                   version: int = 1, status: str = "unchecked", reason: str = "") -> dict:
+    if status not in ("ready", "accepted", "rejected", "blocked", "unchecked"):
+        raise ValueError("无效交接状态")
+    now = time.time()
+    values = (sprint_id, task_id, from_roster, to_roster,
+              *[json.dumps(x, ensure_ascii=False) for x in
+                (input_refs, output_refs, claims, open_questions or [], acceptance_criteria or [])],
+              status, max(1, int(version)), now, now, reason)
+    with _lock, _conn() as conn:
+        cursor = conn.execute(
+            """INSERT INTO handoffs(sprint_id,task_id,from_roster,to_roster,input_refs,
+               output_refs,claims,open_questions,acceptance_criteria,status,version,created_at,updated_at,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
+        row = conn.execute("SELECT * FROM handoffs WHERE id=?", (cursor.lastrowid,)).fetchone()
+    return _handoff_row(row)
+
+
+def set_handoff_status(handoff_id: int, status: str, reason: str = "") -> dict | None:
+    if status not in ("accepted", "rejected", "blocked", "unchecked"):
+        raise ValueError("无效接收状态")
+    with _lock, _conn() as conn:
+        conn.execute("UPDATE handoffs SET status=?, reason=?, updated_at=? WHERE id=?",
+                     (status, reason, time.time(), handoff_id))
+        row = conn.execute("SELECT * FROM handoffs WHERE id=?", (handoff_id,)).fetchone()
+    return _handoff_row(row) if row else None
+
+
+def get_handoff(handoff_id: int) -> dict | None:
+    with _lock, _conn() as conn:
+        row = conn.execute("SELECT * FROM handoffs WHERE id=?", (handoff_id,)).fetchone()
+    return _handoff_row(row) if row else None
+
+
+def list_handoffs(sprint_id: str) -> list[dict]:
+    with _lock, _conn() as conn:
+        rows = conn.execute("SELECT * FROM handoffs WHERE sprint_id=? ORDER BY id", (sprint_id,)).fetchall()
+    return [_handoff_row(row) for row in rows]
 
 
 # ------------------------------- 产物 -------------------------------
@@ -228,8 +351,8 @@ def add_artifact(sprint_id: str, artifact: dict) -> dict:
     with _lock, _conn() as conn:
         conn.execute(
             """INSERT INTO artifacts(id,sprint_id,kind,title,author_roster,task_id,content,file_name,
-               created_at,degraded,degraded_reason,regen,parent_id,version)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               created_at,degraded,degraded_reason,source,quality_status,regen,parent_id,version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 artifact["id"],
                 sprint_id,
@@ -242,6 +365,8 @@ def add_artifact(sprint_id: str, artifact: dict) -> dict:
                 artifact.get("created_at", time.time()),
                 1 if artifact.get("degraded") else 0,
                 artifact.get("degraded_reason", ""),
+                artifact.get("source", "unknown"),
+                artifact.get("quality_status", "unchecked"),
                 json.dumps(artifact.get("regen"), ensure_ascii=False)
                 if artifact.get("regen")
                 else "",
@@ -259,6 +384,8 @@ def update_artifact(artifact_id: str, **fields) -> dict | None:
         "file_name",
         "degraded",
         "degraded_reason",
+        "source",
+        "quality_status",
         "regen",
     }
     pairs = [(k, v) for k, v in fields.items() if k in allowed]
@@ -290,6 +417,20 @@ def list_artifacts(sprint_id: str) -> list[dict]:
     return [_row(row) for row in rows]
 
 
+def list_deliverables() -> list[dict]:
+    """所有 Sprint 的最终交付物与独立生成成品，附带所属需求和日期。"""
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            """SELECT a.*, s.requirement AS sprint_requirement,
+                      s.started_at AS sprint_started_at
+               FROM artifacts a LEFT JOIN sprints s ON s.id=a.sprint_id
+               WHERE a.kind IN ('final', 'custom')
+               ORDER BY COALESCE(s.started_at, a.created_at) DESC,
+                        a.title COLLATE NOCASE ASC, a.created_at DESC"""
+        ).fetchall()
+    return [_row(row) for row in rows]
+
+
 def latest_artifact_version(sprint_id: str, artifact_id: str) -> int:
     """整条版本链上的最大版本号（修订可能链式挂载，需先溯源再统计）"""
     root_id = artifact_root(sprint_id, artifact_id)
@@ -304,7 +445,7 @@ def latest_artifact_version(sprint_id: str, artifact_id: str) -> int:
 # 只持久化对用户有意义的事件，动画类高频事件不入库
 EVENT_PERSIST_TYPES = {
     "sprint_start", "sprint_done", "sprint_stopped", "sprint_error", "stage",
-    "task_update", "artifact_new", "artifact_update", "plan_fallback",
+    "task_update", "artifact_new", "artifact_update", "plan_fallback", "requirement_contract", "handoff", "integration_issue", "repair_attempt",
     "desk_visit", "budget_exceeded", "sprint_paused", "sprint_resumed",
     "instruction_added",
 }
@@ -354,6 +495,7 @@ def delete_sprint(sprint_id: str) -> list[str]:
         conn.execute("DELETE FROM artifacts WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM tasks WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM events WHERE sprint_id=?", (sprint_id,))
+        conn.execute("DELETE FROM handoffs WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM sprints WHERE id=?", (sprint_id,))
     return files
 

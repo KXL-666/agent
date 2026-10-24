@@ -20,6 +20,9 @@ export type AgentConfig = {
   has_backup_key?: boolean
   /** 当前应答正走备用通道（主通道连续失败触发） */
   backup_in_use?: boolean
+  availability?: 'unconfigured' | 'error' | 'backup' | 'configured'
+  availability_reason?: string
+  availability_updated_at?: number | null
 }
 
 /** 名册默认姓名快照（模块加载时留存，用于无自定义名时还原） */

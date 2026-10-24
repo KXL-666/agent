@@ -15,6 +15,9 @@ export type OfficeArtifact = {
   /** 内容来自兜底/Mock 或真实文件生成失败：前端显示警示徽标 */
   degraded?: boolean
   degraded_reason?: string
+  /** 内容来源与成品质检分别记录，避免把兜底内容误当作质检失败 */
+  source?: 'demo' | 'model' | 'fallback' | 'local' | 'unknown'
+  quality_status?: 'passed' | 'failed' | 'unchecked' | 'unknown'
   /** 修订来源与原版本号（产物版本链） */
   parent_id?: string | null
   version?: number

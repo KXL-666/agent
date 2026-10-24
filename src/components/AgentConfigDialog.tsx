@@ -36,8 +36,8 @@ const PROVIDER_PRESETS = [
   { label: '自定义', base_url: '', model: '' },
   {
     label: 'DeepSeek',
-    base_url: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat',
+    base_url: 'https://api.deepseek.com',
+    model: 'deepseek-flash',
   },
   {
     label: '通义千问（阿里百炼）',
@@ -47,12 +47,12 @@ const PROVIDER_PRESETS = [
   {
     label: 'Kimi（月之暗面）',
     base_url: 'https://api.moonshot.cn/v1',
-    model: 'kimi-k2-0905-preview',
+    model: 'kimi-k2.6',
   },
   {
     label: '智谱 GLM',
     base_url: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-4.5-air',
+    model: 'glm-4.7-flash',
   },
   {
     label: 'OpenAI',

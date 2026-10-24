@@ -79,7 +79,7 @@ const server = createServer(async (req, res) => {
   sendJson(res, 405, { error: 'Method not allowed' })
 })
 
-server.listen(port, () => {
+server.listen(port, '127.0.0.1', () => {
   console.log(`[OfficeActionGateway] listening on http://localhost:${port}`)
   console.log('[OfficeActionGateway] POST /actions to enqueue, GET /actions to drain')
 })

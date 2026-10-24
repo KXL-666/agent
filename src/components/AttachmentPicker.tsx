@@ -12,9 +12,10 @@ import { showToast } from '../store/officeUiStore'
 type Props = {
   value: OfficeUpload[]
   onChange: (items: OfficeUpload[]) => void
+  removeFromStorage?: boolean
 }
 
-export function AttachmentPicker({ value, onChange }: Props) {
+export function AttachmentPicker({ value, onChange, removeFromStorage = true }: Props) {
   const fileRef = useRef<HTMLInputElement>(null)
   const dirRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
@@ -41,7 +42,7 @@ export function AttachmentPicker({ value, onChange }: Props) {
 
   async function handleRemove(id: string) {
     onChange(value.filter((item) => item.id !== id))
-    await removeUpload(id)
+    if (removeFromStorage) await removeUpload(id)
   }
 
   return (

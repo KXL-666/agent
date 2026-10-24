@@ -1,8 +1,7 @@
-"""真实交付物锻造间：LLM 直接编写 Python 生成脚本，后端执行产出真实文件
+"""多格式成品引擎：专用制作、真实文件检查、分页渲染、模型评审和有限修订。
 
-安全说明：本模块会在本机执行 LLM 生成的 Python 脚本（subprocess，cwd 限定在
-deliverables 目录，120 秒超时）。这是用户明确选择的生成策略，请勿在不受信的
-多租户环境开启。任何失败都会返回 None，由调用方回退到 Markdown 兜底产物。
+Office/PDF 使用确定性构建器；项目代码经过规划与整合，运行测试交给隔离执行器。
+工具不可用时记录未验证范围，不能把文件存在或模型自述当成验收完成。
 """
 
 import html as html_lib
@@ -12,40 +11,88 @@ import py_compile
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
+import threading
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
-from llm import chat_text
+from llm import chat_json, chat_text
+from artifact_naming import semantic_filename, semantic_stem
+from artifact_content import meta_leaks, payload_meta_leaks, strip_document_meta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DELIVERABLES_DIR = os.path.join(BASE_DIR, "deliverables")
-CODE_ROOT = os.path.join(DELIVERABLES_DIR, "code")
+WORKSPACE_DIR = os.path.join(BASE_DIR, "workspace")
+CODE_ROOT = os.path.join(WORKSPACE_DIR, "code")
 # 当前 Sprint 的代码目录（每轮独立，避免新任务覆盖历史代码）
 CODE_DIR = CODE_ROOT
 
 os.makedirs(DELIVERABLES_DIR, exist_ok=True)
 os.makedirs(CODE_DIR, exist_ok=True)
 
-MAX_REPAIR = 2  # 脚本执行失败后回喂报错让 LLM 修复的轮数
-SCRIPT_TIMEOUT = 120
+# 统一视觉规范：三类产物共享同一套配色，保证交付物风格一致
+COLOR_PRIMARY = "1F4E79"   # 深蓝：封面/页眉带/表头
+COLOR_ACCENT = "2E75B6"    # 中蓝：二级标题/要点符号
+COLOR_ORANGE = "ED7D31"    # 点缀橙：装饰条
+COLOR_LIGHT = "DEEBF7"     # 浅蓝：副标题/隔行
+COLOR_TEXT = "333333"      # 正文深灰
+COLOR_GRAY = "808080"      # 辅助灰
+FONT_MAIN = "微软雅黑"
 
-_KIND_META = {
-    "docx": {"lib": "python-docx（import docx）", "desc": "Word 文档"},
-    "pptx": {"lib": "python-pptx（import pptx）", "desc": "PPT 演示文稿"},
-    "xlsx": {"lib": "openpyxl（import openpyxl）", "desc": "Excel 表格"},
-}
+# 内容深度门槛：低于该水平自动触发一次「扩写」调用
+_DOCX_MIN_CHARS = 1200   # Word 正文字符数（去 Markdown 符号）
+_PPTX_MIN_SLIDES = 6     # PPT 最少页数
+_PPTX_MIN_CHARS = 400    # PPT 全部要点字符数
+_XLSX_MIN_ROWS = 8       # Excel 全部数据行数
+
+_CONTENT_KINDS = ("docx", "pptx", "xlsx", "pdf")
+_BUILD_ERROR = threading.local()
+_PUBLISH_LOCK = threading.Lock()
 
 
 def _unique_name(filename: str) -> str:
-    """避免同名覆盖：已存在时在文件名后追加时间戳"""
-    path = os.path.join(DELIVERABLES_DIR, filename)
-    if not os.path.exists(path):
-        return filename
-    stem, dot, ext = filename.rpartition(".")
-    return f"{stem}_{int(time.time())}.{ext}" if dot else f"{filename}_{int(time.time())}"
+    """过程文件和下载缓存放在 workspace；UUID 避免并行生成覆盖。"""
+    filename = os.path.basename(filename.replace("\\", "/"))
+    name = f"_process/files/{uuid.uuid4().hex}/{filename}"
+    os.makedirs(os.path.dirname(output_path(name)), exist_ok=True)
+    return name
+
+
+def output_path(name: str) -> str:
+    """解析可下载文件标识；仅允许交付目录或显式的过程目录。"""
+    normalized = name.replace("\\", "/")
+    process = normalized.startswith("_process/")
+    root = os.path.realpath(WORKSPACE_DIR if process else DELIVERABLES_DIR)
+    relative = normalized[len("_process/"):] if process else normalized
+    path = os.path.realpath(os.path.join(root, relative))
+    if os.path.commonpath([root, path]) != root or path == root:
+        raise ValueError("文件路径越界")
+    return path
+
+
+def publish_file(name: str, sprint_id: str = "", created_at: float | None = None, project_name: str = "") -> str:
+    """仅将最终成品复制到 年-月-日/项目；保留源文件供过程记录引用。"""
+    source = safe_deliverable_path(name)
+    if not source:
+        raise ValueError("待归档的文件不存在")
+    day = datetime.fromtimestamp(created_at or time.time(), timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    project = semantic_stem(project_name, "独立生成") if project_name else (re.sub(r"[^\w-]", "", sprint_id) or "独立生成")
+    filename = os.path.basename(source)
+    folder = output_path(f"{day}/{project}/placeholder")
+    with _PUBLISH_LOCK:
+        os.makedirs(os.path.dirname(folder), exist_ok=True)
+        stem, extension = os.path.splitext(filename)
+        target = f"{day}/{project}/{filename}"
+        index = 2
+        while os.path.exists(output_path(target)):
+            target = f"{day}/{project}/{stem} ({index}){extension}"
+            index += 1
+        path = output_path(target)
+        shutil.copy2(source, path)
+    return target
 
 
 # ---------- 目标位置：从需求文本解析「放在/保存到 某某文件夹」 ----------
@@ -246,6 +293,11 @@ def copy_to_target(file_name: str, target_dir: str) -> str | None:
     try:
         os.makedirs(target_dir, exist_ok=True)
         dest = os.path.join(target_dir, os.path.basename(src))
+        base = Path(dest)
+        index = 2
+        while os.path.exists(dest):
+            dest = str(base.with_name(f"{base.stem} ({index}){base.suffix}"))
+            index += 1
         shutil.copy2(src, dest)
         return dest
     except Exception as error:  # noqa: BLE001 —— 复制失败不影响主流程
@@ -263,198 +315,869 @@ def duplicate_deliverable(file_name: str) -> str | None:
         return None
     new_name = _unique_name(file_name)
     try:
-        shutil.copy2(src, os.path.join(DELIVERABLES_DIR, new_name))
+        shutil.copy2(src, output_path(new_name))
         return new_name
     except Exception as error:  # noqa: BLE001
         print(f"[Forge] 复制版本文件失败 {file_name}：{error}")
         return None
 
 
-def extract_code(llm_text: str) -> str:
-    """从 LLM 回复中提取 python 代码块；没有代码块时把全文当代码"""
-    if not llm_text:
-        return ""
-    match = re.search(r"```(?:python)?\s*\n(.*?)```", llm_text, re.DOTALL)
-    return (match.group(1) if match else llm_text).strip()
+# ===========================================================================
+# 内容解析：Markdown / JSON 负载 → 统一中间结构（纯函数，便于测试）
+# ===========================================================================
+
+def _strip_fences(text: str) -> str:
+    """剥掉模型偶发输出的 ```markdown 围栏"""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip()
 
 
-# 脚本安全防护：禁止联网/系统调用/越界文件操作（启发式，非完整沙箱）
-_BLOCKED_SCRIPT_PATTERNS = (
-    (re.compile(r"\b(subprocess|socket|requests|urllib|httpx|http\.client|ftplib|smtplib|telnetlib)\b"), "禁止联网或调用外部进程"),
-    (re.compile(r"\b(ctypes|winreg|win32api|win32con|msvcrt)\b"), "禁止调用系统底层接口"),
-    (re.compile(r"\bos\.(system|popen|remove|unlink|rmdir|rename|replace)\b"), "禁止操作系统文件"),
-    (re.compile(r"\bshutil\.(rmtree|move|copy|copyfile)\b"), "禁止批量操作文件"),
-    (re.compile(r"\b(eval|exec|compile|__import__)\s*\("), "禁止动态执行代码"),
-    (re.compile(r"\bopen\s*\("), "禁止直接读写文件"),
-)
+def _clean_inline(text: str) -> str:
+    """去掉行内 Markdown 标记（加粗/行内代码/链接），返回纯文本"""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    return text.strip()
 
 
-def check_script_safety(code: str) -> str:
-    """返回第一处违规说明；空字符串表示通过"""
-    for pattern, reason in _BLOCKED_SCRIPT_PATTERNS:
-        if pattern.search(code):
-            return reason
-    return ""
+def _bold_segments(text: str) -> list[tuple[str, bool]]:
+    """把含 **加粗** 的文本拆成 [(片段, 是否加粗)]，供渲染器分 run 输出"""
+    parts = re.split(r"\*\*(.+?)\*\*", text)
+    return [
+        (_clean_inline(part), bool(i % 2))
+        for i, part in enumerate(parts)
+        if part
+    ]
 
 
-def _safe_env() -> dict:
-    """只保留运行 Python 所需的最小环境变量，避免 API Key 等泄漏给生成脚本"""
-    keep = {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC", "PYTHONIOENCODING"}
-    return {k: v for k, v in os.environ.items() if k.upper() in keep}
+def _parse_docx_markdown(text: str) -> list[dict]:
+    """把 Markdown 文档解析为块序列：h1/h2/h3/p/bullet/table"""
+    blocks: list[dict] = []
+    table_buf: list[str] = []
+    code_lines: list[str] | None = None
+
+    def flush_table() -> None:
+        nonlocal table_buf
+        if not table_buf:
+            return
+        rows: list[list[str]] = []
+        for row in table_buf:
+            cells = [_clean_inline(c) for c in row.strip().strip("|").split("|")]
+            # 跳过分隔行 | --- | --- |
+            if all(re.fullmatch(r":?-{2,}:?", c or "---") for c in cells):
+                continue
+            rows.append(cells)
+        if rows:
+            blocks.append({"type": "table", "rows": rows})
+        table_buf = []
+
+    for raw in _strip_fences(text).replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if line.startswith("```"):
+            flush_table()
+            if code_lines is None:
+                code_lines = []
+            else:
+                blocks.append({"type": "code", "text": "\n".join(code_lines)})
+                code_lines = None
+            continue
+        if code_lines is not None:
+            code_lines.append(raw)
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            table_buf.append(line)
+            continue
+        flush_table()
+        if not line or line in ("---", "***", "___"):
+            continue
+        if line.startswith("### "):
+            blocks.append({"type": "h3", "text": _clean_inline(line[4:])})
+        elif line.startswith("## "):
+            blocks.append({"type": "h2", "text": _clean_inline(line[3:])})
+        elif line.startswith("# "):
+            blocks.append({"type": "h1", "text": _clean_inline(line[2:])})
+        elif re.match(r"^[-*•]\s+", line):
+            blocks.append({"type": "bullet", "text": re.sub(r"^[-*•]\s+", "", line)})
+        elif re.match(r"^\d+[.、]\s*\S", line):
+            blocks.append({"type": "ordered", "text": re.sub(r"^\d+[.、]\s*", "", line)})
+        else:
+            blocks.append({"type": "p", "text": line})
+    flush_table()
+    if code_lines is not None:
+        blocks.append({"type": "code", "text": "\n".join(code_lines)})
+    seen_major = False
+    for block in blocks:
+        if block["type"] == "h2":
+            seen_major = True
+        elif block["type"] == "h3" and not seen_major:
+            # 不能在一级章节之前出现其子章节，避免正文从三级标题开始。
+            block["type"] = "h2"
+    return blocks
 
 
-def run_script(code: str) -> tuple[bool, str]:
-    """在 deliverables 目录下执行脚本，返回 (是否成功, 错误输出)
+def _plain_len(text: str) -> int:
+    """去掉 Markdown 符号与空白后的正文字符数，用于衡量内容深度"""
+    return len(re.sub(r"\s+", "", _clean_inline(_strip_fences(text))))
 
-    注意：这是启发式防护，不是安全沙箱；项目仅建议在本机自用场景运行。"""
-    violation = check_script_safety(code)
-    if violation:
-        return False, f"脚本包含不安全操作：{violation}"
-    script_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".py", delete=False, encoding="utf-8",
-            dir=DELIVERABLES_DIR,
-        ) as f:
-            f.write(code)
-            script_path = f.name
-        proc = subprocess.run(
-            [sys.executable, "-I", script_path],
-            cwd=DELIVERABLES_DIR,
-            capture_output=True,
-            text=True,
-            timeout=SCRIPT_TIMEOUT,
-            encoding="utf-8",
-            errors="replace",
-            env=_safe_env(),
+
+def _sanitize_table(table) -> dict | None:
+    if not isinstance(table, dict):
+        return None
+    headers = [str(h).strip()[:30] for h in (table.get("headers") or []) if str(h).strip()][:6]
+    if len(headers) < 2:
+        return None
+    rows = []
+    for row in (table.get("rows") or [])[:8]:
+        if isinstance(row, list):
+            cells = ["" if c is None else str(c).strip()[:40] for c in row][: len(headers)]
+            cells += [""] * (len(headers) - len(cells))
+            rows.append(cells)
+    if not rows:
+        return None
+    return {"headers": headers, "rows": rows}
+
+
+def _sanitize_pptx(payload, source_spec: str = "") -> dict | None:
+    """清洗 LLM 返回的 PPT JSON 负载；结构严重不符时返回 None"""
+    if not isinstance(payload, dict):
+        return None
+    slides_raw = payload.get("slides")
+    if not isinstance(slides_raw, list):
+        # 兜底：模型换字段名时，取第一个「dict 列表」字段当页序列
+        slides_raw = next(
+            (
+                v for v in payload.values()
+                if isinstance(v, list) and v and isinstance(v[0], dict)
+            ),
+            [],
         )
-        if proc.returncode == 0:
-            return True, ""
-        return False, (proc.stderr or proc.stdout or "未知错误")[-1500:]
-    except subprocess.TimeoutExpired:
-        return False, f"脚本执行超过 {SCRIPT_TIMEOUT} 秒被终止"
-    except Exception as error:  # noqa: BLE001
-        return False, f"执行器异常：{error}"
-    finally:
-        if script_path:
-            try:
-                os.unlink(script_path)
-            except OSError:
-                pass
+    slides: list[dict] = []
+    for item in slides_raw[:15]:
+        if not isinstance(item, dict):
+            continue
+        heading = str(item.get("heading") or item.get("title") or "").strip()[:40]
+        bullets = [
+            str(b).strip()
+            for b in (item.get("bullets") or item.get("points") or [])
+            if str(b).strip()
+        ][:7]
+        note = str(item.get("note") or "").strip()[:300]
+        layout = str(item.get("layout") or "bullets").strip().lower()
+        if layout not in ("bullets", "conclusion", "compare", "process", "timeline", "chart", "table"):
+            layout = "bullets"
+        chart = item.get("chart") if isinstance(item.get("chart"), dict) else None
+        if chart:
+            categories = chart.get("categories")
+            series = chart.get("series")
+            source_refs = item.get("source_refs")
+            valid = (isinstance(categories, list) and 2 <= len(categories) <= 12
+                     and isinstance(series, list) and 1 <= len(series) <= 4
+                     and isinstance(source_refs, list) and bool(source_refs))
+            normalized = []
+            if valid:
+                for entry in series:
+                    values = entry.get("values") if isinstance(entry, dict) else None
+                    if not isinstance(values, list) or len(values) != len(categories) or any(type(v) not in (int, float) for v in values):
+                        valid = False
+                        break
+                    if source_spec and any(not re.search(rf"(?<!\d){re.escape(str(v))}(?!\d)", source_spec) for v in values):
+                        valid = False
+                        break
+                    normalized.append({"name": str(entry.get("name") or "数值")[:30], "values": values})
+            chart = {"categories": [str(c)[:30] for c in categories], "series": normalized,
+                     "title": str(chart.get("title") or "")[:60]} if valid else None
+        if layout == "chart" and not chart:
+            layout = "bullets"
+        if heading or bullets:
+            slides.append({
+                "heading": heading or "（未命名章节）",
+                "bullets": bullets,
+                "table": _sanitize_table(item.get("table")),
+                "note": note,
+                "layout": layout,
+                "claim": str(item.get("claim") or "").strip()[:160],
+                "evidence": str(item.get("evidence") or "").strip()[:300],
+                "source_refs": [str(ref).strip()[:100] for ref in (item.get("source_refs") or []) if str(ref).strip()][:8],
+                "chart": chart,
+            })
+    if len(slides) < 1:
+        return None
+    return {
+        "title": str(payload.get("title") or "演示文稿").strip()[:40] or "演示文稿",
+        "subtitle": str(payload.get("subtitle") or "").strip()[:60],
+        "slides": slides,
+        "include_cover": bool(payload.get("include_cover", True)),
+    }
 
 
-def _script_prompt(kind: str, spec: str, output_path: str) -> str:
-    meta = _KIND_META[kind]
+def _sanitize_xlsx(payload) -> list[dict] | None:
+    """清洗 LLM 返回的 Excel JSON 负载为工作表列表；无有效数据返回 None"""
+    if not isinstance(payload, dict):
+        return None
+    sheets_raw = payload.get("sheets")
+    if not isinstance(sheets_raw, list):
+        sheets_raw = next(
+            (
+                v for v in payload.values()
+                if isinstance(v, list) and v and isinstance(v[0], dict)
+            ),
+            [],
+        )
+    sheets: list[dict] = []
+    for item in sheets_raw[:4]:
+        if not isinstance(item, dict):
+            continue
+        headers = [str(h).strip()[:30] for h in (item.get("headers") or []) if str(h).strip()][:40]
+        if len(headers) < 2:
+            continue
+        rows: list[list] = []
+        for row in (item.get("rows") or [])[:2000]:
+            if not isinstance(row, list):
+                continue
+            cells = [
+                c if isinstance(c, (int, float)) else ("" if c is None else str(c).strip()[:2000])
+                for c in row
+            ][: len(headers)]
+            cells += [""] * (len(headers) - len(cells))
+            if any(str(c).strip() for c in cells):
+                rows.append(cells)
+        if len(rows) >= 2:
+            sheets.append({
+                "name": str(item.get("name") or f"工作表{len(sheets) + 1}").strip()[:20],
+                "headers": headers,
+                "rows": rows,
+                **{key: item[key] for key in ("formats", "column_types", "formulas", "notes") if isinstance(item.get(key), dict)},
+                **{key: item[key] for key in ("charts", "validations") if isinstance(item.get(key), list)},
+            })
+    return sheets or None
+
+
+# ===========================================================================
+# 内容生成 Prompt：全部 token 预算都留给内容本身，不浪费在代码上
+# ===========================================================================
+
+def _docx_content_prompt(spec: str, feedback: str = "") -> str:
     return (
-        f"你是资深办公自动化工程师。写一个完整、可直接运行的 Python 脚本，"
-        f"使用 {meta['lib']} 生成一份高质量的{meta['desc']}。\n"
-        f"硬性要求：\n"
-        f"1. 内容必须详实专业、贴近真实工作产出（质量优先，不要占位符式的空洞内容）；\n"
-        f"2. 所有文字使用中文，字体设置为「微软雅黑」或「宋体」；\n"
-        f"3. 脚本最后必须把成品保存到这个绝对路径：{output_path}\n"
-        f"4. 只输出一个 ```python 代码块，不要任何解释文字；\n"
-        f"5. 不得写 deliverables 目录以外的任何文件，不得访问网络；"
-        f"允许只读访问 uploads 目录下的用户附件；\n"
-        f"6. 脚本要紧凑高效：用循环/列表批量添加内容，避免逐行重复调用，总长度控制在 150 行以内。\n"
+        "根据用户需求完成可直接使用的正文，用 Markdown 输出。先判断它是作文、故事、信函、简报、报告、方案、手册还是论文，采用合适结构。"
+        "第一行用 # 写具体标题；只有适合分节的文档才使用 ## 和 ###，作文和故事保持自然段。"
+        "先给读者最需要的结论、决定或说明，再展开依据和实施细节。"
+        "如果提供上一版正文，保留已正确的内容和结构，只修复明确指出的问题，不要重新构思一篇新文档。"
+        "不要把所有文档写成六章报告，不要强行凑字数或增加封面；明确要求的字数、章节和受众优先。"
+        "对比、重复记录、数值用表格；长论述保留自然段。步骤可用列表。"
+        "保留用户素材、数字、单位、口径和不确定性；不编造来源、统计或完成事项。作文和故事允许合理的虚构情节，直接写成作品，不在正文解释素材是否真实。其他文档中必要的假设应在对应内容旁标明。"
+        "不能为了凑字数添加事实或绝对化结论；计算指标可从给定数据推导并注明口径，建议必须写成建议。"
+        "必要的引用在文中使用可识别的来源名称与真实链接。只给成品正文，不附加字数统计、写作说明、复制提示、示例免责声明、工作计划或自评。\n"
+        f"需修正的问题：{feedback}\n需求与素材：{spec}"
+    )
+
+
+def _pptx_content_prompt(spec: str, feedback: str = "") -> str:
+    return (
+        "根据以下需求设计一份完整的中文演示文稿，输出一个 JSON 对象：\n"
+        '{"title":"演示标题","subtitle":"副标题","slides":[{"heading":"页标题",'
+        '"claim":"本页中心结论","layout":"conclusion|compare|process|timeline|chart|table|bullets",'
+        '"bullets":["要点1"],"evidence":"依据说明","source_refs":["附件名/用户原话"],'
+        '"table":{"headers":["列"],"rows":[["值"]]},'
+        '"chart":{"title":"图表标题","categories":["第1周","第2周"],'
+        '"series":[{"name":"新增","values":[12,9]}]},"note":"演讲备注"}]}\n'
+        "内容要求：\n"
+        "1. 先规划逐页故事线，每页一个中心结论；明确页数和封面优先，短需求不要凑页；\n"
+        "2. 按内容选结论、双栏对比、流程、时间线、原生图表、表格或简短要点，不强迫固定要点数量；\n"
+        "3. 图表只使用用户或附件真实数值，categories/series 的每个值都要有 source_refs；无数据不造图；\n"
+        "4. note 写必要的演讲备注；\n"
+        "严禁：「略/待补充/示例」式内容、空话套话。\n"
+        f"{feedback}\n"
+        "事实要求：保留用户素材与关键约束；不编造来源、统计、已完成事项或测试结果；假设与模拟数据必须明确标记。\n"
+        "只写观众需要看到的幻灯片和必要演讲备注，不附加生成说明、示例免责声明或产品水印。\n"
         f"需求内容：{spec}"
     )
 
 
-def forge_file(kind: str, spec: str, filename: str, roster: int | None = None) -> str | None:
-    """让 LLM 写脚本并执行，生成真实 docx/pptx/xlsx；成功返回文件名，失败返回 None"""
-    if kind not in _KIND_META:
-        return None
-    filename = _unique_name(filename)
-    output_path = os.path.join(DELIVERABLES_DIR, filename)
+def _xlsx_content_prompt(spec: str, feedback: str = "") -> str:
+    return (
+        "设计能实际使用、可编辑且计算逻辑清楚的 Excel 工作簿，只输出 JSON：\n"
+        '{"sheets":[{"name":"明细","headers":["项目","数量","单价","金额"],'
+        '"rows":[["模拟样例",2,10,"=B2*C2"]],'
+        '"column_types":{"数量":"number","单价":"currency","金额":"currency"},'
+        '"formats":{"金额":"#,##0.00"},"formulas":{},'
+        '"charts":[{"type":"bar","title":"金额对比","category_column":1,"data_columns":[4]}],'
+        '"validations":[{"column":"A","options":["选项一","选项二"]}],"notes":{"B2":"数据来源或输入说明"}}]}\n'
+        "样例仅说明结构，不能照抄其中的模拟数据。根据需求决定工作表数量，能一张表解决的问题不要拆很多表。"
+        "原始输入、假设和计算结果要能区分；统计与汇总使用原生公式，不把算好的数字冒充公式。"
+        "公式行号从 2 开始，引用实际存在的单元格；跨表引用加单引号。公式必须能被 Excel/LibreOffice 计算。"
+        "图表必须有真实的数值列和分类列，列号从 1 开始。只在能帮助理解或用户要求时添加图表。"
+        "日期使用 ISO 日期并声明 date 类型；百分数保存为小数并声明 percent；编号保留文本前导零。"
+        "使用上传素材里的全部相关记录，不为达到行数编造数据。缺少输入时明确给出需要填写的字段与说明，"
+        "仅在用户允许或明确标记模拟时使用模拟数据。禁止外部工作簿、网络公式或可执行调用。\n"
+        "工作表、单元格和备注只写使用者需要的数据与业务说明，不附加生成说明、复制提示或示例免责声明。\n"
+        f"需修正的问题：{feedback}\n需求与素材：{spec}"
+    )
 
-    code = extract_code(chat_text(
-        "你只输出可运行的 Python 脚本，用代码块包裹。",
-        [{"role": "user", "content": _script_prompt(kind, spec, output_path)}],
-        fallback="",
-        temperature=0.4,
-        max_tokens=8000,
-        timeout=300,
-        roster=roster,
-    ))
-    if not code:
-        return None
 
-    for attempt in range(1 + MAX_REPAIR):
-        ok, err = run_script(code)
-        if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return filename
-        print(f"[Forge] 第 {attempt + 1} 轮失败（{filename}）：{err[:300]}")
-        if not ok and "ModuleNotFoundError" in err:
-            break  # 环境缺依赖，重试无意义
-        if attempt >= MAX_REPAIR:
-            break
-        repaired = chat_text(
-            "你只输出修复后的完整 Python 脚本，用代码块包裹。",
-            [
-                {"role": "user", "content": _script_prompt(kind, spec, output_path)},
-                {"role": "assistant", "content": f"```python\n{code}\n```"},
-                {"role": "user", "content": (
-                    f"脚本执行失败，错误信息：\n{err}\n"
-                    "请修复后输出完整脚本（仍须保存到同一路径）。"
-                    "注意控制脚本总长度，避免输出被截断导致字符串不闭合；"
-                    "长文本内容可以拆分多次调用，不要在单行里写过长的字符串。"
-                )},
-            ],
-            fallback="",
-            temperature=0.3,
-            max_tokens=8000,
-            timeout=300,
-            roster=roster,
+# ===========================================================================
+# 确定性渲染器：docx / pptx / xlsx（不调用 LLM）
+# ===========================================================================
+
+def _docx_set_run(run, size: float = 11, bold: bool = False,
+                  color: str | None = None, font: str = FONT_MAIN) -> None:
+    from docx.oxml.ns import qn
+    from docx.shared import Pt, RGBColor
+
+    run.font.name = font
+    run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), font)
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    if color:
+        run.font.color.rgb = RGBColor.from_string(color)
+
+
+def _docx_rich_text(paragraph, text: str, size: float = 11,
+                    color: str | None = None) -> None:
+    """按 **加粗** 分段输出 run"""
+    for segment, bold in _bold_segments(text):
+        _docx_set_run(paragraph.add_run(segment), size=size, bold=bold, color=color)
+
+
+def _docx_shade_cell(cell, fill: str) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:fill"), fill)
+    tc_pr.append(shd)
+
+
+def _docx_page_number(doc) -> None:
+    """页脚居中页码（PAGE 域）"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    footer_p = doc.sections[0].footer.paragraphs[0]
+    footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fld = OxmlElement("w:fldSimple")
+    fld.set(qn("w:instr"), "PAGE")
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    sz = OxmlElement("w:sz")
+    sz.set(qn("w:val"), "18")  # 9pt
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), COLOR_GRAY)
+    rpr.append(sz)
+    rpr.append(color)
+    run.append(rpr)
+    fld.append(run)
+    footer_p._p.append(fld)
+
+
+def _build_docx(content: str, output_path: str, cover: bool = False) -> bool:
+    """原生标题与导航、按内容分页的表格和正文；无需通用封面。"""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.shared import Pt, Cm
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    blocks = _parse_docx_markdown(content)
+    if not blocks:
+        return False
+    doc = Document()
+    for style_name in ("Title", "Heading 1", "Heading 2", "Heading 3"):
+        for border in list(doc.styles[style_name]._element.iter(qn("w:pBdr"))):
+            border.getparent().remove(border)
+    for section in doc.sections:
+        section.page_width, section.page_height = Cm(21), Cm(29.7)
+        section.top_margin = section.bottom_margin = Cm(2.2)
+        section.left_margin = section.right_margin = Cm(2.4)
+    for name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+        style = doc.styles[name]
+        style.font.name = FONT_MAIN
+        style._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), FONT_MAIN)
+        fonts = style._element.get_or_add_rPr().rFonts
+        for theme in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+            fonts.attrib.pop(qn("w:" + theme), None)
+        from docx.shared import RGBColor
+        style.font.color.rgb = RGBColor(0, 0, 0)
+    doc.styles["Normal"].font.size = Pt(10.5)
+    doc.styles["Normal"].paragraph_format.line_spacing = 1.45
+    doc.styles["Normal"].paragraph_format.space_after = Pt(7)
+    for name, size in (("Title", 25), ("Heading 1", 16), ("Heading 2", 13), ("Heading 3", 11)):
+        style = doc.styles[name]
+        style.font.size = Pt(size)
+        style.font.bold = True
+        style.paragraph_format.keep_with_next = True
+        style.paragraph_format.space_before = Pt(14 if name != "Title" else 0)
+        style.paragraph_format.space_after = Pt(8)
+    title_used = False
+    for block in blocks:
+        kind = block["type"]
+        if kind in ("h1", "h2", "h3"):
+            style = "Title" if kind == "h1" and not title_used else {"h1": "Heading 1", "h2": "Heading 1", "h3": "Heading 2"}[kind]
+            heading = doc.add_paragraph(block["text"], style=style)
+            for run in heading.runs:
+                _docx_set_run(run, size={"Title": 25, "Heading 1": 16, "Heading 2": 13}[style], bold=True, color="000000")
+            if cover and style == "Title":
+                doc.add_page_break()
+            title_used = True
+        elif kind == "table":
+            rows = block["rows"]
+            cols = max(len(r) for r in rows)
+            table = doc.add_table(rows=len(rows), cols=cols)
+            table.style = "Table Grid"
+            table.autofit = False
+            weights = [max(3, min(25, max(len(r[c]) if c < len(r) else 0 for r in rows[:15]))) for c in range(cols)]
+            for c, weight in enumerate(weights):
+                table.columns[c].width = Cm(16.2 * weight / sum(weights))
+            for r, row in enumerate(rows):
+                properties = table.rows[r]._tr.get_or_add_trPr()
+                if r == 0:
+                    properties.append(OxmlElement("w:tblHeader"))
+                # 超长记录允许跨页，普通记录保持完整。
+                if max(map(len, row), default=0) < 350:
+                    properties.append(OxmlElement("w:cantSplit"))
+                for c, cell in enumerate(table.rows[r].cells):
+                    cell.width = Cm(16.2 * weights[c] / sum(weights))
+                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                    text = row[c] if c < len(row) else ""
+                    _docx_rich_text(cell.paragraphs[0], text, size=9.5, color="000000")
+                    for paragraph in cell.paragraphs:
+                        paragraph.paragraph_format.space_after = Pt(5)
+                        paragraph.paragraph_format.space_before = Pt(5)
+                    if r == 0:
+                        _docx_shade_cell(cell, "DEEBF7")
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
+                    elif r % 2 == 0:
+                        _docx_shade_cell(cell, "F5F7FA")
+            doc.add_paragraph().paragraph_format.space_after = Pt(3)
+        elif kind in ("bullet", "ordered"):
+            paragraph = doc.add_paragraph(style="List Number" if kind == "ordered" else "List Bullet")
+            _docx_rich_text(paragraph, block["text"], size=10.5, color="000000")
+        elif kind == "code":
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(block["text"])
+            run.font.name, run.font.size = "Consolas", Pt(9)
+        else:
+            paragraph = doc.add_paragraph()
+            _docx_rich_text(paragraph, block["text"], size=10.5, color="000000")
+    doc.core_properties.title = next((b["text"] for b in blocks if b["type"] == "h1"), "文档")
+    doc.core_properties.author = ""
+    _docx_page_number(doc)
+    doc.save(output_path)
+    return os.path.getsize(output_path) > 0
+
+
+def _ppt_rect(slide, x, y, w, h, fill: str) -> None:
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, w, h)
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor.from_string(fill)
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+
+
+def _ppt_text(slide, x, y, w, h, lines, size: float, color: str,
+              bold: bool = False, align=None, line_spacing: float = 1.15) -> None:
+    """lines: [(text, bold, color)] 或纯 str 列表"""
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+
+    box = slide.shapes.add_textbox(x, y, w, h)
+    tf = box.text_frame
+    tf.word_wrap = True
+    for idx, item in enumerate(lines):
+        text, item_bold, item_color = (
+            item if isinstance(item, tuple) else (item, bold, color)
         )
-        code = extract_code(repaired)
-        if not code:
+        p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
+        if align is not None:
+            p.alignment = align
+        p.line_spacing = line_spacing
+        p.space_after = Pt(8)
+        run = p.add_run()
+        run.text = text
+        run.font.name = FONT_MAIN
+        run.font.size = Pt(size)
+        run.font.bold = item_bold
+        run.font.color.rgb = RGBColor.from_string(item_color)
+
+
+def _build_pptx(payload: dict, output_path: str) -> bool:
+    """把 PPT JSON 负载渲染为统一设计风格的 16:9 演示文稿"""
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Emu, Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+    width, height = prs.slide_width, prs.slide_height
+
+    if payload.get("include_cover", True):
+        # ---------- 标题页 ----------
+        slide = prs.slides.add_slide(blank)
+        _ppt_rect(slide, 0, 0, width, height, COLOR_PRIMARY)
+        _ppt_rect(slide, 0, Emu(int(height * 0.68)), width, Pt(6), COLOR_ORANGE)
+        _ppt_text(
+            slide, Inches(1), Emu(int(height * 0.30)), width - Inches(2), Inches(1.6),
+            [payload["title"]], 40, "FFFFFF", bold=True, align=PP_ALIGN.CENTER,
+        )
+        if payload.get("subtitle"):
+            _ppt_text(
+                slide, Inches(1), Emu(int(height * 0.50)), width - Inches(2), Inches(0.8),
+                [payload["subtitle"]], 18, COLOR_LIGHT, align=PP_ALIGN.CENTER,
+            )
+
+    # ---------- 内容页 ----------
+    total = len(payload["slides"])
+    for index, item in enumerate(payload["slides"], 1):
+        slide = prs.slides.add_slide(blank)
+        # 顶部标题带 + 点缀条
+        _ppt_rect(slide, 0, 0, width, Inches(1.0), COLOR_PRIMARY)
+        _ppt_rect(slide, 0, Inches(1.0), Inches(2.4), Pt(4), COLOR_ORANGE)
+        _ppt_text(
+            slide, Inches(0.6), Inches(0.12), width - Inches(1.2), Inches(0.8),
+            [item["heading"]], 26, "FFFFFF", bold=True,
+        )
+        from presentation_layout import render_body
+        render_body(slide, item)
+        # 演讲备注
+        if item.get("note"):
+            slide.notes_slide.notes_text_frame.text = item["note"]
+        # 页脚：左侧文档名 + 右侧页码
+        _ppt_text(
+            slide, Inches(0.5), height - Inches(0.45), Inches(6), Inches(0.35),
+            [payload["title"]], 10, COLOR_GRAY,
+        )
+        _ppt_text(
+            slide, width - Inches(2.6), height - Inches(0.45), Inches(2.1), Inches(0.35),
+            [f"第 {index} 页 / 共 {total} 页"], 10, COLOR_GRAY, align=PP_ALIGN.RIGHT,
+        )
+
+    try:
+        prs.save(output_path)
+        return os.path.getsize(output_path) > 0
+    except OSError as error:
+        print(f"[Forge] pptx 保存失败：{error}")
+        return False
+
+
+def _xlsx_number(value):
+    """把纯数字字符串转成数值类型，保证 Excel 里可求和排序"""
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip().replace(",", "")
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            return value
+    if re.fullmatch(r"-?\d*\.\d+%?", text):
+        try:
+            return float(text.rstrip("%")) / (100 if text.endswith("%") else 1)
+        except ValueError:
+            return value
+    return value
+
+
+def _xlsx_col_width(values) -> float:
+    """按显示宽度估算列宽（CJK 字符按 2 计）"""
+    def display_len(text) -> int:
+        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in str(text))
+
+    widest = max((display_len(v) for v in values), default=8)
+    return float(min(42, max(10, widest + 2)))
+
+
+def _build_xlsx(sheets: list[dict], output_path: str) -> bool:
+    from spreadsheet_builder import build_workbook
+    return build_workbook(sheets, output_path)
+
+
+def _gen_docx(spec: str, roster: int | None, feedback: str = "", generation_meta: dict | None = None) -> str:
+    _BUILD_ERROR.sections = []
+    long_form = bool(re.search(r"长篇|白皮书|论文|多章节|不少于\s*[2-9]\d{3}\s*字|至少\s*[2-9]\d{3}\s*字", spec[:1500]))
+    if long_form and not feedback:
+        plan = chat_json(
+            "你是文档主编。先规划长文档章节，不写正文。输出 JSON："
+            '{"title":"具体标题","sections":[{"heading":"章节标题","goal":"本节要解决的问题"}]}。'
+            "最多 6 节，遵守用户明确要求；不能把计划写成已完成。",
+            spec[:18000], fallback={}, roster=roster, max_tokens=1600, timeout=120,
+            meta=generation_meta, fallback_roster=1 if roster != 1 else None,
+        )
+        sections = plan.get("sections") if isinstance(plan, dict) else None
+        if isinstance(sections, list) and 2 <= len(sections) <= 6:
+            pieces = []
+            for section in sections:
+                if not isinstance(section, dict) or not section.get("heading"):
+                    pieces = []
+                    break
+                heading = str(section["heading"]).strip()[:80]
+                body = _strip_fences(chat_text(
+                    "你是文档作者。只写本节可直接交付的正文，不写计划、生成说明或虚构事实。"
+                    "如给定资料只说明计划，不能把它写成已完成。不要重复其他章节。",
+                    [{"role": "user", "content": json.dumps({"document_title": plan.get("title"),
+                        "section_heading": heading, "section_goal": section.get("goal", ""),
+                        "all_sections": [s.get("heading") for s in sections if isinstance(s, dict)],
+                        "requirement_and_sources": spec[:22000]}, ensure_ascii=False)}],
+                    fallback="", temperature=.4, max_tokens=5500, timeout=300, roster=roster,
+                ))
+                if not body:
+                    pieces = []
+                    break
+                pieces.append({"heading": heading, "body": body})
+            if pieces:
+                _BUILD_ERROR.sections = pieces
+                title = str(plan.get("title") or "文档")[:100]
+                return "# " + title + "\n\n" + "\n\n".join(
+                    f"## {part['heading']}\n\n{part['body']}" for part in pieces
+                )
+    return _strip_fences(chat_text(
+        "你是专业文档作者，完成实际内容并遵守用户的格式和篇幅要求。",
+        [{"role": "user", "content": _docx_content_prompt(spec, feedback)}],
+        fallback="", temperature=.5, max_tokens=12000, timeout=300, roster=roster,
+        meta=generation_meta, fallback_roster=1 if roster == 6 else None))
+
+
+def _gen_pptx(spec: str, roster: int | None, feedback: str = "",
+              generation_meta: dict | None = None) -> dict | None:
+    import artifact_quality
+    requested = artifact_quality.contract(spec, "pptx")
+    prompt = _pptx_content_prompt(spec, feedback)
+    explicit = requested.get("unit") == "页"
+    no_cover = bool(re.search(r"不要封面|不带封面|不含封面|无封面", spec[:500]))
+    wants_cover = bool(re.search(r"含封面|带封面|需要封面|包含封面", spec[:500]))
+    include_cover = not no_cover and (wants_cover or not explicit)
+    if explicit:
+        amount = requested["count"] - (1 if include_cover and "内容" not in spec[:300] else 0)
+        prompt = prompt.replace("8~12 页内容页（不含标题页）", f"{max(1, amount)} 页内容页")
+        prompt += f"\n用户明确指定页数；只生成 {max(1, amount)} 个 slides 元素。不要自行扩展页数。"
+    payload = _sanitize_pptx(chat_json(
+        "你是演示文稿设计师，只输出完整 JSON。", prompt,
+        fallback={}, temperature=.5, max_tokens=10000, timeout=300, roster=roster,
+        meta=generation_meta, fallback_roster=1 if roster != 1 else None), spec)
+    if payload:
+        payload["include_cover"] = include_cover
+    return payload
+
+
+def _gen_xlsx(spec: str, roster: int | None, feedback: str = "",
+              generation_meta: dict | None = None) -> list[dict] | None:
+    from spreadsheet_contract import budget_workbook
+    source = spec.split("附件内容：\n", 1)[1].split("\n\n加工需求", 1)[0] if "附件内容：\n" in spec else spec.split("团队各环节的产出", 1)[0]
+    grounded = budget_workbook(source)
+    if grounded:
+        return grounded
+    return _sanitize_xlsx(chat_json(
+        "你是电子表格建模专家，只输出完整 JSON。", _xlsx_content_prompt(spec, feedback),
+        fallback={}, temperature=.4, max_tokens=14000, timeout=300, roster=roster,
+        meta=generation_meta, fallback_roster=1 if roster != 1 else None))
+
+
+def _forge_once(kind: str, spec: str, output_path: str,
+                roster: int | None, feedback: str = "", generation_meta: dict | None = None) -> bool:
+    """单轮「生成内容 → 渲染」；失败返回 False（不残留半成品文件）"""
+    _BUILD_ERROR.message = ""
+    try:
+        if kind in ("docx", "pdf"):
+            content = strip_document_meta(_gen_docx(spec, roster, feedback, generation_meta))
+            leaks = meta_leaks(content)
+            if leaks:
+                _BUILD_ERROR.message = "成品正文含生成说明或字数自报，请只返回正文：" + "；".join(leaks[:3])
+                return False
+            if kind == "pdf":
+                from pdf_builder import build_pdf
+                built = bool(content) and build_pdf(_parse_docx_markdown(content), output_path)
+            else:
+                import artifact_quality
+                built = bool(content) and _build_docx(content, output_path, cover=artifact_quality.contract(spec, kind)["cover"])
+            if built:
+                import artifact_quality
+                directory = artifact_quality.report_directory(output_path, WORKSPACE_DIR)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "source.md").write_text(content, encoding="utf-8")
+                for index, section in enumerate(getattr(_BUILD_ERROR, "sections", []), 1):
+                    section_dir = directory / "sections"
+                    section_dir.mkdir(exist_ok=True)
+                    (section_dir / f"{index:02d}.md").write_text(
+                        f"## {section['heading']}\n\n{section['body']}", encoding="utf-8")
+            return built
+        if kind == "pptx":
+            payload = _gen_pptx(spec, roster, feedback, generation_meta)
+            leaks = payload_meta_leaks(payload)
+            if leaks:
+                _BUILD_ERROR.message = "演示文稿含生成说明，请删除：" + "；".join(leaks[:3])
+                return False
+            built = payload is not None and _build_pptx(payload, output_path)
+            if built:
+                import artifact_quality
+                directory = artifact_quality.report_directory(output_path, WORKSPACE_DIR)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "source.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            return built
+        if kind == "xlsx":
+            sheets = _gen_xlsx(spec, roster, feedback, generation_meta)
+            leaks = payload_meta_leaks(sheets)
+            if leaks:
+                _BUILD_ERROR.message = "表格含生成说明，请删除：" + "；".join(leaks[:3])
+                return False
+            built = sheets is not None and _build_xlsx(sheets, output_path)
+            if built:
+                import artifact_quality
+                directory = artifact_quality.report_directory(output_path, WORKSPACE_DIR)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "source.json").write_text(json.dumps({"sheets": sheets}, ensure_ascii=False), encoding="utf-8")
+            return built
+    except Exception as error:  # noqa: BLE001 —— 单类产物失败不影响整体流程
+        _BUILD_ERROR.message = str(error)[:2000]
+        print(f"[Forge] {kind} 生成异常：{error}")
+    return False
+
+
+def forge_file(kind: str, spec: str, filename: str, roster: int | None = None,
+               generation_meta: dict | None = None) -> str | None:
+    """制作 -> 真实文件检查 -> 成品评审 -> 按问题修订；保留最佳候选。"""
+    import artifact_quality
+    if kind not in _CONTENT_KINDS:
+        return None
+    best_name, best_report, feedback = None, None, ""
+    attempts = []
+    for attempt in range(3):
+        candidate = _unique_name(filename)
+        candidate_path = output_path(candidate)
+        attempt_meta = {}
+        generated = (
+            _forge_once(kind, spec, candidate_path, roster, feedback, attempt_meta)
+            if generation_meta is not None
+            else _forge_once(kind, spec, candidate_path, roster, feedback)
+        )
+        if not generated:
+            if generation_meta is not None:
+                generation_meta.update(attempt_meta)
+            feedback = getattr(_BUILD_ERROR, "message", "") or "未生成可用文件，请检查内容结构并返回完整内容。"
+            attempts.append({"attempt": attempt + 1, "stage": "build", "status": "failed", "detail": feedback})
+            continue
+        # 保存完整需求，检查的是实际文件而不是模型自述。
+        report = artifact_quality.inspect(candidate_path, kind, spec, WORKSPACE_DIR)
+        if not any(c["ok"] is False for c in report["checks"]):
+            report = artifact_quality.model_review(report, candidate_path, WORKSPACE_DIR, roster)
+        attempts.append({"attempt": attempt + 1, "stage": "review", "status": report["status"]})
+        def score_of(result):
+            return (sum(c["ok"] is False for c in result["checks"]),
+                    len(result.get("review", {}).get("issues", [])) if result.get("review", {}).get("status") == "failed" else 0,
+                    sum(c["ok"] is None for c in result["checks"]))
+        score = score_of(report)
+        old_score = score_of(best_report) if best_report else None
+        if best_report is None or score <= old_score:
+            best_name, best_report = candidate, report
+            if generation_meta is not None:
+                generation_meta.update(attempt_meta)
+        feedback = artifact_quality.feedback(report)
+        if report["ok"] or not feedback:
             break
-    print(f"[Forge] {kind} 生成失败，回退 Markdown：{filename}")
-    return None
+        directory = artifact_quality.report_directory(candidate_path, WORKSPACE_DIR)
+        previous = next((path for path in (directory / "source.md", directory / "source.json") if path.is_file()), None)
+        if previous:
+            feedback += "\n\n上一版完整内容或结构（以它为基准定点修订，保留正确部分）：\n" + previous.read_text(encoding="utf-8")[:30000]
+    if best_name:
+        best_report["attempts"] = attempts
+        artifact_quality.save_report(output_path(best_name), WORKSPACE_DIR, best_report)
+    return best_name
 
 
-def forge_code(task_title: str, requirement: str, subdir: str = "", roster: int | None = None) -> list[str]:
+# ===========================================================================
+# 代码类产物：LLM 直接写源文件（===FILE 标记格式，只落盘不执行）
+# ===========================================================================
+
+_CODE_FILE_PATTERN = re.compile(r"===FILE:\s*([^\n]+)\n(.*?)===END", re.DOTALL)
+
+
+def _parse_code_files(raw: str) -> list[tuple[str, str]]:
+    """从 ===FILE/===END 标记文本中提取 (相对路径, 内容) 列表"""
+    return [
+        (match.group(1).strip(), match.group(2).strip("\n"))
+        for match in _CODE_FILE_PATTERN.finditer(raw or "")
+    ]
+
+
+def forge_code(task_title: str, requirement: str, subdir: str = "", roster: int | None = None,
+               generation_meta: dict | None = None) -> list[str]:
     """让 LLM 为开发任务直接产出真实代码文件，落盘到 deliverables/code/；返回相对路径列表"""
     target_dir = os.path.join(CODE_DIR, subdir) if subdir else CODE_DIR
     os.makedirs(target_dir, exist_ok=True)
 
     raw = chat_text(
-        "你是资深全栈工程师。根据开发任务产出真实、可运行的代码。"
-        "只输出一个 JSON 对象（不要用代码块包裹）："
-        '{"files":[{"path":"相对路径/文件名","content":"完整文件内容"}]}'
-        "要求：代码完整可运行、带必要注释、贴近工程实践；文件数量 1-4 个；"
-        "path 只能是相对路径，不允许 .. 或绝对路径。",
-        [{"role": "user", "content": f"所属需求：{requirement}\n开发任务：{task_title}"}],
+        "你是资深全栈工程师。根据开发任务产出真实、可运行的代码。",
+        [{"role": "user", "content": (
+            f"所属需求：{requirement}\n开发任务：{task_title}\n\n"
+            "输出 1-4 个完整代码文件，每个文件严格使用如下格式（不要输出任何其他解释文字）：\n"
+            "===FILE: 相对路径/文件名\n文件完整内容\n===END\n"
+            "要求：代码完整可运行、带必要注释、贴近工程实践；严格遵循用户消息中的角色文件边界，"
+            "只输出本任务允许的文件，不要复刻其他成员负责的职责或提交一份完整重复项目；"
+            "path 只能是相对路径，不允许 .. 或绝对路径。"
+        )}],
         fallback="",
         temperature=0.4,
-        max_tokens=6000,
+        max_tokens=8000,
         timeout=300,
-        roster=roster,
+        roster=roster, meta=generation_meta, tool_mode=False,
+        fallback_roster=1 if roster != 1 else None,
     )
-    if not raw:
-        return []
-
-    try:
-        payload = json.loads(raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```"))
-        files = payload.get("files", [])
-    except (json.JSONDecodeError, AttributeError):
-        print(f"[Forge] 代码 JSON 解析失败：{task_title}")
-        return []
+    files = _parse_code_files(raw)
+    if not files:
+        print(f"[Forge] 代码标记解析失败，进行一次格式修复：{task_title}")
+        retry_meta: dict = {}
+        raw = chat_text(
+            "你是代码文件格式修复器。只输出完整文件，不要写解释。每个文件严格使用\n"
+            "===FILE: 相对路径/文件名\n完整文件内容\n===END\n格式，至少输出一个文件。",
+            [{"role": "user", "content": json.dumps({
+                "task": task_title,
+                "requirements_and_role_boundary": requirement,
+                "previous_response": (raw or "（空响应）")[:4000],
+                "instruction": "重新生成本任务所需文件；仅返回上述标记格式。",
+            }, ensure_ascii=False)}],
+            fallback="", temperature=0.2, max_tokens=8000, timeout=300,
+            roster=roster, meta=retry_meta, tool_mode=False,
+            fallback_roster=1 if roster != 1 else None,
+        )
+        if generation_meta is not None:
+            generation_meta.update({key: value for key, value in retry_meta.items() if value})
+        files = _parse_code_files(raw)
+        if not files:
+            return []
 
     written: list[str] = []
-    for item in files[:4]:
-        rel = str(item.get("path", "")).strip().lstrip("/\\").replace("\\", "/")
-        content = str(item.get("content", ""))
-        if not rel or ".." in rel.split("/") or not content:
+    for rel, content in files[:4]:
+        rel = rel.strip().lstrip("/\\").replace("\\", "/")
+        if not rel or ".." in rel.split("/") or not content.strip() or meta_leaks(content):
+            continue
+        parts = [part.lower() for part in rel.split("/")]
+        name = parts[-1]
+        is_test_file = (any(part in ("test", "tests") for part in parts[:-1])
+                        or bool(re.match(r"(?:test_.*|.*_test|.*\.test|.*\.spec)\.[^.]+$", name)))
+        if roster == 4 and not is_test_file:
+            print(f"[Forge] QA 贡献越界，已拒绝非测试文件：{rel}")
+            continue
+        if roster in (2, 3) and is_test_file:
+            print(f"[Forge] 开发贡献越界，测试文件应由 QA 负责：{rel}")
             continue
         abs_path = os.path.realpath(os.path.join(target_dir, rel))
-        if not abs_path.startswith(os.path.realpath(target_dir)):
+        if os.path.commonpath([abs_path, os.path.realpath(target_dir)]) != os.path.realpath(target_dir):
             continue
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         try:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            written.append(os.path.relpath(abs_path, DELIVERABLES_DIR).replace("\\", "/"))
+            written.append("_process/" + os.path.relpath(abs_path, WORKSPACE_DIR).replace("\\", "/"))
         except OSError as error:
             print(f"[Forge] 代码落盘失败 {rel}：{error}")
     return written
@@ -489,10 +1212,11 @@ def clear_code_dir() -> None:
     os.makedirs(CODE_DIR, exist_ok=True)
 
 
-def verify_generated_code() -> list[str]:
+def verify_generated_code(code_dir: str | None = None) -> list[str]:
     """对产出代码做基础可运行性检查：Python 语法编译 + Node 语法检查"""
     failures: list[str] = []
-    for py_file in Path(CODE_DIR).rglob("*.py"):
+    root = Path(code_dir or CODE_DIR)
+    for py_file in root.rglob("*.py"):
         try:
             py_compile.compile(
                 str(py_file),
@@ -503,7 +1227,7 @@ def verify_generated_code() -> list[str]:
             failures.append(f"{py_file.name}: {str(error).splitlines()[-1][:60]}")
     node = shutil.which("node")
     if node:
-        for js_file in list(Path(CODE_DIR).rglob("*.js")) + list(Path(CODE_DIR).rglob("*.mjs")):
+        for js_file in list(root.rglob("*.js")) + list(root.rglob("*.mjs")):
             try:
                 proc = subprocess.run(
                     [node, "--check", str(js_file)],
@@ -522,99 +1246,124 @@ def verify_generated_code() -> list[str]:
     return failures
 
 
+def selected_project(code_dir: str | None = None) -> str:
+    root = Path(code_dir or CODE_DIR).resolve()
+    try:
+        selection = json.loads((root / ".selected-project.json").read_text(encoding="utf-8"))
+        chosen = (root / selection["directory"]).resolve()
+        if chosen.is_relative_to(root) and chosen.is_dir():
+            return str(chosen)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return str(root)
+
+
+def project_report(code_dir: str | None = None) -> dict:
+    root = Path(code_dir or CODE_DIR)
+    try:
+        return json.loads((root / ".project-quality.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        import project_agent
+        return project_agent.evaluate(Path(selected_project(str(root))), [], "node" if (root / "package.json").is_file() else "python", execute=False)
+
+
+def create_project(requirement: str, code_dir: str, roster: int | None = None, project_title: str = "") -> dict:
+    import project_agent
+    from llm import llm_available
+    if roster is not None and not llm_available(roster):
+        roster = None
+    root = Path(code_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    project_name = semantic_stem(project_title or requirement, "代码项目")
+    destination = root / project_name
+    index = 2
+    while destination.exists():
+        destination = root / f"{project_name} ({index})"
+        index += 1
+    destination, report = project_agent.assemble(requirement, root, destination, roster)
+    (root / ".selected-project.json").write_text(json.dumps({"directory": destination.relative_to(root).as_posix()}), encoding="utf-8")
+    (root / ".project-quality.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
 def finalize_project(requirement: str) -> list[str]:
-    """为代码类交付补齐 README 与 requirements，返回新增文件名列表"""
-    files = [p for p in Path(CODE_DIR).rglob("*") if p.is_file()]
-    names = [str(p.relative_to(CODE_DIR)).replace("\\", "/") for p in files]
-    added: list[str] = []
-
-    # requirements.txt：从 import 语句推断常见第三方依赖
-    packages = set()
-    for py_file in Path(CODE_DIR).rglob("*.py"):
-        try:
-            text = py_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for module, package in {
-            "fastapi": "fastapi",
-            "uvicorn": "uvicorn[standard]",
-            "flask": "flask",
-            "requests": "requests",
-            "httpx": "httpx",
-            "pandas": "pandas",
-            "numpy": "numpy",
-            "openpyxl": "openpyxl",
-            "docx": "python-docx",
-            "pptx": "python-pptx",
-            "pydantic": "pydantic",
-            "sqlalchemy": "sqlalchemy",
-            "dotenv": "python-dotenv",
-        }.items():
-            if re.search(rf"^\s*(import|from)\s+{module}\b", text, re.MULTILINE):
-                packages.add(package)
-    requirements = Path(CODE_DIR) / "requirements.txt"
-    requirements.write_text("\n".join(sorted(packages)) + "\n", encoding="utf-8")
-    added.append("requirements.txt")
-
-    main_file = next((n for n in names if n.endswith(".py") and n.split("/")[-1] == "main.py"), "")
-    run_hint = f"python {main_file}" if main_file else "python <入口文件>.py"
-    readme = (
-        f"# {requirement[:40] or 'AI 生成项目'}\n\n"
-        "> 由 AI 敏捷开发办公室自动生成。\n\n"
-        "## 文件结构\n\n"
-        + ("\n".join(f"- `{n}`" for n in sorted(names)) or "- （暂无文件）")
-        + "\n\n## 运行方式\n\n```bash\n"
-        "python -m venv .venv\n"
-        "pip install -r requirements.txt\n"
-        f"{run_hint}\n```\n\n"
-        "## 说明\n\n"
-        "- 代码已通过 Python 语法编译检查（若为 JS 项目则通过 Node 语法检查）。\n"
-        "- 运行前请确认已安装 requirements.txt 中的依赖。\n"
-        "- 生成代码仅供本地学习与演示，请勿直接用于生产环境。\n"
-    )
-    (Path(CODE_DIR) / "README.md").write_text(readme, encoding="utf-8")
-    added.append("README.md")
-    return added
+    """将角色贡献整合为完整项目；保留真实测试证据，不用通用 README 冒充工程交付。"""
+    create_project(requirement, CODE_DIR, 5)
+    root = Path(selected_project())
+    return [p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()]
 
 
 def render_docx_from_markdown(content: str, filename: str) -> str | None:
-    """确定性渲染：把 Markdown 文本直接渲染为真实 docx（不调用 LLM）
+    """确定性渲染：把 Markdown 文本渲染为带封面/样式/页码的真实 docx（不调用 LLM）
 
-    支持 # / ## / ### 标题、"- " 无序列表，其余按普通段落。
     用于演示模式与产物站内文本编辑（编辑后确定性重渲染为新版本文件）。"""
     filename = _unique_name(filename)
-    output_path = os.path.join(DELIVERABLES_DIR, filename)
-    try:
-        from docx import Document
+    file_path = output_path(filename)
+    if _build_docx(content, file_path):
+        import artifact_quality
+        directory = artifact_quality.report_directory(file_path, WORKSPACE_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "source.md").write_text(content, encoding="utf-8")
+        return filename
+    print(f"[Forge] Markdown 渲染 docx 失败：{filename}")
+    return None
 
-        doc = Document()
-        for raw in (content or "").splitlines():
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            if stripped.startswith("### "):
-                doc.add_heading(stripped[4:].strip(), level=3)
-            elif stripped.startswith("## "):
-                doc.add_heading(stripped[3:].strip(), level=2)
-            elif stripped.startswith("# "):
-                doc.add_heading(stripped[2:].strip(), level=1)
-            elif stripped.startswith("- "):
-                doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
-            else:
-                doc.add_paragraph(stripped)
-        doc.save(output_path)
-        return filename if os.path.getsize(output_path) > 0 else None
-    except Exception as error:  # noqa: BLE001
-        print(f"[Forge] Markdown 渲染 docx 失败：{error}")
+
+def pdf_from_docx(docx_name: str, filename: str = "同源文档.pdf") -> str | None:
+    """Convert the exact Word candidate to searchable PDF without rewriting text."""
+    import artifact_quality
+    import office_runtime
+
+    source = safe_deliverable_path(docx_name)
+    if not source:
         return None
+    pdf_name = _unique_name(filename)
+    destination = output_path(pdf_name)
+    try:
+        with tempfile.TemporaryDirectory(prefix="word-pdf-") as directory:
+            converted = office_runtime.convert(source, directory, "pdf")
+            shutil.copy2(converted, destination)
+        source_markdown = artifact_quality.report_directory(source, WORKSPACE_DIR) / "source.md"
+        if source_markdown.is_file():
+            target_quality = artifact_quality.report_directory(destination, WORKSPACE_DIR)
+            target_quality.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_markdown, target_quality / "source.md")
+        return pdf_name
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"[Forge] Word 同源 PDF 转换失败：{error}")
+        return None
+
+
+def render_document_from_markdown(content: str, filename: str) -> str | None:
+    if not filename.lower().endswith(".pdf"):
+        name = render_docx_from_markdown(content, filename)
+    else:
+        from pdf_builder import build_pdf
+        name = _unique_name(filename)
+        if not build_pdf(_parse_docx_markdown(content), output_path(name)):
+            return None
+    if name:
+        import artifact_quality
+        directory = artifact_quality.report_directory(output_path(name), WORKSPACE_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "source.md").write_text(content, encoding="utf-8")
+        artifact_quality.inspect(output_path(name), Path(filename).suffix.lstrip("."), "", WORKSPACE_DIR)
+    return name
 
 
 def safe_deliverable_path(file_name: str) -> str | None:
     """下载接口用：校验文件名必须落在 deliverables 目录内，防路径穿越"""
     if not file_name:
         return None
-    abs_path = os.path.realpath(os.path.join(DELIVERABLES_DIR, file_name))
-    if not abs_path.startswith(os.path.realpath(DELIVERABLES_DIR)):
+    try:
+        abs_path = output_path(file_name)
+        # 旧事件或正文中的文件标识仍可解析，迁移不破坏历史下载。
+        if not os.path.isfile(abs_path) and not file_name.startswith("_process/"):
+            legacy = "_process/" + (file_name if file_name.replace("\\", "/").startswith("code/") else "legacy/" + file_name)
+            legacy_path = output_path(legacy)
+            if os.path.isfile(legacy_path):
+                return legacy_path
+    except (ValueError, OSError):
         return None
     return abs_path if os.path.isfile(abs_path) else None
 
@@ -624,6 +1373,9 @@ def extract_preview(file_name: str, limit: int = 1500) -> str:
     path = safe_deliverable_path(file_name)
     if not path:
         return ""
+    if file_name.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+        return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)[:limit]
     try:
         if file_name.endswith(".docx"):
             from docx import Document
@@ -655,16 +1407,16 @@ def extract_preview(file_name: str, limit: int = 1500) -> str:
         if file_name.endswith(".xlsx"):
             from openpyxl import load_workbook
 
-            wb = load_workbook(path, read_only=True, data_only=True)
-            lines = []
-            for ws in wb.worksheets:
-                lines.append(f"【工作表：{ws.title}】")
-                for row in ws.iter_rows(max_row=10, max_col=6, values_only=True):
-                    cells = [str(c) for c in row if c is not None]
-                    if cells:
-                        lines.append(" | ".join(cells))
-                lines.append("")
-            return "\n".join(lines)[:limit]
+            with closing(load_workbook(path, read_only=True, data_only=True)) as wb:
+                lines = []
+                for ws in wb.worksheets:
+                    lines.append(f"【工作表：{ws.title}】")
+                    for row in ws.iter_rows(max_row=10, max_col=6, values_only=True):
+                        cells = [str(c) for c in row if c is not None]
+                        if cells:
+                            lines.append(" | ".join(cells))
+                    lines.append("")
+                return "\n".join(lines)[:limit]
     except Exception as error:  # noqa: BLE001 —— 预览失败不影响文件本身
         print(f"[Forge] 预览提取失败 {file_name}：{error}")
     return ""
@@ -722,90 +1474,49 @@ def preview_html(file_name: str, max_rows: int = 60) -> str:
         if file_name.endswith(".xlsx"):
             from openpyxl import load_workbook
 
-            wb = load_workbook(path, read_only=True, data_only=True)
-            parts = []
-            for ws in wb.worksheets:
-                rows = []
-                for row in ws.iter_rows(max_row=max_rows, max_col=8, values_only=True):
-                    cells = "".join(
-                        f"<td>{esc('' if c is None else str(c))}</td>" for c in row
+            with closing(load_workbook(path, read_only=True, data_only=True)) as wb:
+                parts = []
+                for ws in wb.worksheets:
+                    rows = []
+                    for row in ws.iter_rows(max_row=max_rows, max_col=8, values_only=True):
+                        cells = "".join(
+                            f"<td>{esc('' if c is None else str(c))}</td>" for c in row
+                        )
+                        rows.append(f"<tr>{cells}</tr>")
+                    parts.append(
+                        f'<section class="preview-sheet"><h3>{esc(ws.title)}</h3>'
+                        f'<table>{"".join(rows)}</table></section>'
                     )
-                    rows.append(f"<tr>{cells}</tr>")
-                parts.append(
-                    f'<section class="preview-sheet"><h3>{esc(ws.title)}</h3>'
-                    f'<table>{"".join(rows)}</table></section>'
-                )
-            return "".join(parts)
+                return "".join(parts)
     except Exception as error:  # noqa: BLE001
         print(f"[Forge] HTML 预览失败 {file_name}：{error}")
     return ""
 
 
 def self_check(file_name: str, kind: str | None = None) -> dict:
-    """成品自检：检查真实文件是否具备可交付的基本要素（章节/页数/行列/体积）"""
+    import artifact_quality
     path = safe_deliverable_path(file_name)
-    checks: list[dict] = []
     if not path:
-        return {
-            "ok": False,
-            "checks": [{"label": "文件存在", "ok": False, "detail": "未找到生成的文件"}],
-        }
-    ext = (kind or file_name.rpartition(".")[2]).lower()
-    try:
-        if ext == "docx":
-            from docx import Document
-
-            doc = Document(path)
-            paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-            chars = sum(len(p) for p in paras)
-            checks.append(
-                {"label": "正文章节", "ok": len(paras) >= 5, "detail": f"{len(paras)} 个段落"}
-            )
-            checks.append(
-                {"label": "正文篇幅", "ok": chars >= 300, "detail": f"{chars} 字"}
-            )
-        elif ext == "pptx":
-            from pptx import Presentation
-
-            slides = list(Presentation(path).slides)
-            text_chars = 0
-            for slide in slides:
-                for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        text_chars += len(shape.text_frame.text.strip())
-            checks.append(
-                {"label": "幻灯片页数", "ok": len(slides) >= 3, "detail": f"{len(slides)} 页"}
-            )
-            checks.append(
-                {"label": "页面内容", "ok": text_chars >= 80, "detail": f"{text_chars} 字"}
-            )
-        elif ext == "xlsx":
-            from openpyxl import load_workbook
-
-            wb = load_workbook(path, read_only=True, data_only=True)
-            rows = sum(ws.max_row or 0 for ws in wb.worksheets)
-            checks.append(
-                {"label": "工作表", "ok": len(wb.worksheets) >= 1, "detail": f"{len(wb.worksheets)} 个"}
-            )
-            checks.append(
-                {"label": "数据行数", "ok": rows >= 3, "detail": f"{rows} 行"}
-            )
-        else:
-            checks.append(
-                {"label": "文件体积", "ok": os.path.getsize(path) > 0, "detail": f"{os.path.getsize(path)} 字节"}
-            )
-    except Exception as error:  # noqa: BLE001 —— 自检失败按未通过处理，如实告知
-        checks.append({"label": "解析文件", "ok": False, "detail": str(error)[:120]})
-    return {"ok": all(item["ok"] for item in checks), "checks": checks}
+        return {"ok": False, "status": "failed", "checks": [{"label": "文件存在", "ok": False, "detail": "文件不存在"}]}
+    existing = artifact_quality.load_report(path, WORKSPACE_DIR)
+    if existing and existing.get("kind") in _CONTENT_KINDS:
+        import office_runtime
+        if existing.get("capabilities") != office_runtime.capabilities():
+            return artifact_quality.inspect(path, existing["kind"], existing.get("requirement", ""), WORKSPACE_DIR)
+    return existing or artifact_quality.inspect(path, kind or Path(file_name).suffix.lstrip("."), "", WORKSPACE_DIR)
 
 
 def self_check_note(result: dict) -> str:
     """把自检结果格式化为可直接附在产物正文后的 Markdown 小节"""
     lines = ["", "", "## 成品自检", ""]
     for item in result.get("checks", []):
-        mark = "✅" if item["ok"] else "⚠️"
+        mark = "✅" if item["ok"] is True else "未验证" if item["ok"] is None else "⚠️"
         lines.append(f"- {mark} {item['label']}：{item['detail']}")
+    review = result.get("review", {})
+    if review.get("status") in ("passed", "failed"):
+        lines.append("- 模型成品评审：" + ("通过" if review["status"] == "passed" else "需修正"))
+        lines.extend("- " + str(issue) for issue in review.get("issues", []))
     if not result.get("ok"):
         lines.append("")
-        lines.append("> 自检未全部通过，成品可能不完整，建议点击「重新生成」再试一次。")
+        lines.append("> 请查看未通过项或未验证项；缺少工具能力时，重新生成不会替代实际验证。")
     return "\n".join(lines)

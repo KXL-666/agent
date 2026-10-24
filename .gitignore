@@ -3,6 +3,16 @@ dist
 .dev-server.log
 *.tsbuildinfo
 
+# 本地环境变量与凭据（示例文件可提交）
+.env
+.env.*
+!.env.example
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
 # IDE / 工具配置
 .idea/
 .trae/
@@ -13,8 +23,11 @@ backend/agent_config.json
 backend/office.db
 backend/office.db-*
 backend/deliverables/
+backend/workspace/
 backend/uploads/
 backend/_server*.log
 backend/artifacts_data.json
 backend/usage.json
+backend/skills_data.json
+backend/skills_data.tmp
 __pycache__/

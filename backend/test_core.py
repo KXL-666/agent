@@ -1,7 +1,7 @@
 """后端核心逻辑测试（不依赖网络与 LLM）
 
 运行：cd backend && python -m unittest test_core -v
-覆盖：Sprint/任务/产物持久化、产物版本链、路径解析、脚本安全防护、Sprint 代码目录隔离、
+覆盖：Sprint/任务/产物持久化、产物版本链、路径解析、内容解析与代码目录隔离、
 API Key 加密落盘、显式保存位置覆盖、Sprint 用量落库、迁移命名修正。
 """
 
@@ -53,6 +53,7 @@ class StorageTest(unittest.TestCase):
         storage.add_artifact(
             sprint_id,
             {"id": first_id, "kind": "custom", "title": "初稿", "content": "v1",
+             "source": "model", "quality_status": "passed",
              "created_at": 1.0, "regen": {"mode": "custom", "prompt": "x"}},
         )
         second_id = storage.next_artifact_id(sprint_id)
@@ -63,9 +64,12 @@ class StorageTest(unittest.TestCase):
              "parent_id": first_id, "version": 2, "created_at": 2.0},
         )
         self.assertEqual(storage.latest_artifact_version(sprint_id, first_id), 2)
-        storage.update_artifact(first_id, degraded=True, degraded_reason="兜底")
+        storage.update_artifact(first_id, degraded=True, degraded_reason="兜底",
+                                source="fallback", quality_status="failed")
         updated = storage.get_artifact(first_id)
         self.assertTrue(updated["degraded"])
+        self.assertEqual(updated["source"], "fallback")
+        self.assertEqual(updated["quality_status"], "failed")
         self.assertEqual(updated["regen"]["mode"], "custom")
         self.assertEqual(len(storage.list_artifacts(sprint_id)), 2)
 
@@ -151,19 +155,19 @@ class EventAndSearchTest(unittest.TestCase):
 
     def test_duplicate_deliverable(self):
         original = forge._unique_name("回滚测试.txt")
-        with open(os.path.join(forge.DELIVERABLES_DIR, original), "w", encoding="utf-8") as f:
+        with open(forge.output_path(original), "w", encoding="utf-8") as f:
             f.write("旧版内容")
         try:
             copied = forge.duplicate_deliverable(original)
             self.assertTrue(copied)
             self.assertNotEqual(copied, original)
-            with open(os.path.join(forge.DELIVERABLES_DIR, copied), encoding="utf-8") as f:
+            with open(forge.output_path(copied), encoding="utf-8") as f:
                 self.assertEqual(f.read(), "旧版内容")
             self.assertIsNone(forge.duplicate_deliverable("不存在的文件.txt"))
         finally:
             for name in (original, locals().get("copied")):
                 if name:
-                    path = os.path.join(forge.DELIVERABLES_DIR, name)
+                    path = forge.output_path(name)
                     if os.path.exists(path):
                         os.remove(path)
 
@@ -187,11 +191,37 @@ class PathTest(unittest.TestCase):
         self.assertIsNone(forge.extract_target_dir("放在最后"))
 
 
-class SafetyTest(unittest.TestCase):
-    def test_blocked_patterns(self):
-        self.assertIn("文件", forge.check_script_safety("open('x.txt','w')"))
-        self.assertIn("系统", forge.check_script_safety("import os\nos.system('dir')"))
-        self.assertEqual(forge.check_script_safety("print('hello')"), "")
+class ContentParseTest(unittest.TestCase):
+    def test_markdown_blocks(self):
+        blocks = forge._parse_docx_markdown(
+            "# 标题\n\n## 章节一\n正文段落。\n- 要点一\n\n| 列A | 列B |\n| --- | --- |\n| 1 | 2 |\n"
+        )
+        types = [b["type"] for b in blocks]
+        self.assertEqual(types, ["h1", "h2", "p", "bullet", "table"])
+        self.assertEqual(blocks[-1]["rows"], [["列A", "列B"], ["1", "2"]])
+
+    def test_bold_segments(self):
+        segs = forge._bold_segments("普通**加粗**结尾")
+        self.assertEqual(segs, [("普通", False), ("加粗", True), ("结尾", False)])
+
+    def test_pptx_payload_salvage(self):
+        # 模型换了字段名（title/points）也能被清洗为可用结构
+        payload = forge._sanitize_pptx({
+            "title": "测试演示",
+            "pages": [
+                {"title": "现状", "points": ["要点一内容足够长", "要点二内容也足够长"]},
+                {"title": "方案", "points": ["要点三内容足够长"]},
+            ],
+        })
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["slides"]), 2)
+        self.assertEqual(payload["slides"][0]["heading"], "现状")
+
+    def test_code_marker_parse(self):
+        raw = "===FILE: src/main.py\nprint(1)\n===END\n===FILE: a/b.txt\nhello\n===END\n"
+        files = forge._parse_code_files(raw)
+        self.assertEqual([f[0] for f in files], ["src/main.py", "a/b.txt"])
+        self.assertIn("print(1)", files[0][1])
 
     def test_code_dir_isolation(self):
         original_root = forge.CODE_ROOT
@@ -212,12 +242,12 @@ class SafetyTest(unittest.TestCase):
 
 class SecretBoxTest(unittest.TestCase):
     def test_roundtrip(self):
-        cipher = secretbox.encrypt_value("sk-test-123456")
+        cipher = secretbox.encrypt_value("test-api-key-123456")
         if os.name == "nt":
             self.assertTrue(secretbox.is_encrypted(cipher))
-            self.assertEqual(secretbox.decrypt_value(cipher), "sk-test-123456")
+            self.assertEqual(secretbox.decrypt_value(cipher), "test-api-key-123456")
         else:
-            self.assertEqual(cipher, "sk-test-123456")
+            self.assertEqual(cipher, "test-api-key-123456")
 
     def test_decrypt_plain_passthrough(self):
         self.assertEqual(secretbox.decrypt_value("sk-plain"), "sk-plain")
@@ -232,7 +262,7 @@ class SecretBoxTest(unittest.TestCase):
 
         roster = 99  # 使用独立成员号，避免污染真实配置
         try:
-            agent_config.update_agent_config(roster, llm={"api_key": "sk-secret-abc", "base_url": "", "model": ""})
+            agent_config.update_agent_config(roster, llm={"api_key": "test-api-key-secret-abc", "base_url": "", "model": ""})
             with open(agent_config.CONFIG_PATH, encoding="utf-8") as f:
                 import json
 
@@ -240,9 +270,9 @@ class SecretBoxTest(unittest.TestCase):
             on_disk = raw[str(roster)]["llm"]["api_key"]
             if os.name == "nt":
                 self.assertTrue(secretbox.is_encrypted(on_disk))
-                self.assertNotIn("sk-secret-abc", on_disk)
+                self.assertNotIn("test-api-key-secret-abc", on_disk)
             resolved = agent_config.resolve_llm(roster)
-            self.assertEqual(resolved["api_key"], "sk-secret-abc")
+            self.assertEqual(resolved["api_key"], "test-api-key-secret-abc")
         finally:
             import json
 

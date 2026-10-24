@@ -10,6 +10,7 @@ export type OfficeView =
   | 'tasks'
   | 'agents'
   | 'files'
+  | 'knowledge'
   | 'artifacts'
   | 'skills'
   | 'browser'
@@ -23,12 +24,13 @@ export type Workspace = {
   roles: readonly number[] | null
 }
 
-/** 工作空间 = 任务过滤视角（名册：1 产品 2/3 研发 4 测试 5 主管 6 教练） */
+/** 任务负责人筛选：名册 1 产品、2/3 研发、4/5 测试评审、6 协调 */
 export const WORKSPACES: Workspace[] = [
-  { label: '我的空间', roles: null },
-  { label: '产品空间', roles: [1] },
-  { label: '研发空间', roles: [2, 3] },
-  { label: '质量空间', roles: [4, 5, 6] },
+  { label: '全部', roles: null },
+  { label: '产品', roles: [1] },
+  { label: '研发', roles: [2, 3] },
+  { label: '测试与评审', roles: [4, 5] },
+  { label: '协调', roles: [6] },
 ]
 
 let activeView: OfficeView = 'home'

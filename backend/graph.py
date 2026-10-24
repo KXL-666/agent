@@ -9,8 +9,10 @@ set_state（状态/任务牌）、desk_visit（起身找某人说话）、emote�
 
 import asyncio
 import os
+import json
 import random
 import zipfile
+import hashlib
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -18,6 +20,14 @@ from langgraph.graph import END, START, StateGraph
 
 import forge
 import llm
+import storage
+import handoffs
+import contributions
+import verification
+import review_decision
+import candidate_revision
+from agile import plan_fields
+from requirement_contract import build_contract
 from artifacts import add_artifact, artifacts_store
 from events import emit, set_stage, sprint_meta, tasks_store, wait_if_paused
 from llm import chat_json
@@ -28,10 +38,18 @@ MAX_REWORK = 2
 
 class SprintState(TypedDict):
     requirement: str
+    requirement_contract: dict
+    candidate_id: str
+    candidate_sha256: str
+    companion_candidates: list
+    qa_report: dict
+    lead_decision: dict
+    repair_blocked: bool
     tasks: list
     rework_count: int
     review_note: str
     deliver_kind: str  # 最终交付物类型：docx/pptx/xlsx/code
+    task_kind: str  # 用户在执行计划中明确选择的任务路线
     uploads_text: str  # 用户上传附件提取出的文本素材（可为空）
     uploads_images: list  # 图片附件的 data URL（视觉模型多模态输入，可为空）
 
@@ -189,6 +207,10 @@ def mock_review(first_pass: bool) -> str:
 def detect_final_kind(requirement: str) -> str:
     """关键词兜底：判断需求最终要交付什么（LLM 不可用时使用）"""
     text = requirement.lower()
+    if "pdf" in text and any(word in text for word in ("word", "docx")):
+        return "docx"
+    if "pdf" in text:
+        return "pdf"
     if any(w in text for w in ("ppt", "幻灯", "演示文稿", "slides")):
         return "pptx"
     if any(w in text for w in ("excel", "表格", "xlsx", "预算表", "统计表")):
@@ -204,7 +226,7 @@ def detect_final_kind(requirement: str) -> str:
 def pick_assignee(title: str, index: int) -> int:
     backend_words = ("数据库", "接口", "后端", "API", "服务", "存储")
     frontend_words = ("前端", "页面", "界面", "UI", "组件", "联调")
-    test_words = ("测试", "用例", "自动化")
+    test_words = ("测试", "用例", "自动化", "校核", "验证", "验收", "检查")
 
     if any(w in title for w in backend_words):
         return DEV_BE
@@ -213,6 +235,112 @@ def pick_assignee(title: str, index: int) -> int:
     if any(w in title for w in test_words):
         return QA
     return DEV_BE if index % 2 == 0 else DEV_FE
+
+
+def compact_short_document_tasks(planned: list[dict], contract: dict) -> list[dict]:
+    """Collapse duplicate FE calls for one-page file requests without losing coverage."""
+    kind = contract.get("target_kind")
+    raw = str(contract.get("raw_requirement") or "")
+    if kind not in {"docx", "pdf", "pptx"} or not any(
+        marker in raw for marker in ("控制在一页", "不超过一页", "最多一页", "一页以内")
+    ):
+        return planned
+    fe_hints = {"前端", "写作", "设计"}
+    fe = [item for item in planned if str(item.get("role_hint") or "") in fe_hints]
+    if len(fe) < 2:
+        return planned
+    primary = dict(fe[0])
+    primary["title"] = "撰写通知正文并完成一页排版"
+    primary["role_hint"] = "前端"
+    stories = [str(item.get("user_story") or "").strip() for item in fe]
+    primary["user_story"] = "；".join(story for story in stories if story)[:400]
+    primary["acceptance_criteria"] = list(dict.fromkeys(
+        str(criteria).strip() for item in fe
+        for criteria in (item.get("acceptance_criteria") if isinstance(item.get("acceptance_criteria"), list) else [])
+        if str(criteria).strip()
+    ))[:6]
+    primary["requirement_ids"] = list(dict.fromkeys(
+        str(req_id) for item in fe
+        for req_id in (item.get("requirement_ids") if isinstance(item.get("requirement_ids"), list) else [])
+    ))
+    primary["story_points"] = max((item.get("story_points", 3) for item in fe
+                                   if isinstance(item.get("story_points"), int)), default=3)
+    merged = []
+    inserted = False
+    for item in planned:
+        if item in fe:
+            if not inserted:
+                merged.append(primary)
+                inserted = True
+            continue
+        merged.append(item)
+    return merged
+
+
+def compact_code_tasks(planned: list[dict]) -> list[dict]:
+    """Merge duplicate same-role coding stories into one bounded contribution."""
+    role_aliases = {
+        "后端": {"后端", "backend", "be"},
+        "前端": {"前端", "frontend", "fe", "写作", "设计"},
+        "测试": {"测试", "qa"},
+    }
+    title_signals = {
+        "测试": ("测试", "验收", "验证", "检查"),
+        "后端": ("逻辑", "接口", "数据", "后端", "服务", "校验", "错误处理"),
+        "前端": ("前端", "界面", "命令行", "交互", "README", "说明", "文档", "入口"),
+    }
+    grouped: dict[str, list[dict]] = {}
+    other: list[dict] = []
+    for item in planned:
+        hint = str(item.get("role_hint") or "").strip().lower()
+        title = str(item.get("title") or "")
+        role = next((name for name, aliases in role_aliases.items() if hint in aliases), None)
+        if role is None:
+            role = next((name for name, signals in title_signals.items()
+                         if any(signal.lower() in title.lower() for signal in signals)), None)
+        if role:
+            grouped.setdefault(role, []).append(item)
+        else:
+            other.append(item)
+
+    merged = []
+    role_titles = {
+        "后端": "实现核心逻辑、接口与输入校验",
+        "前端": "实现命令行入口与使用说明",
+        "测试": "编写自动化测试并验证错误路径",
+    }
+    for role in ("后端", "前端", "测试"):
+        entries = grouped.get(role, [])
+        if not entries:
+            continue
+        combined = dict(entries[0])
+        combined.update({
+            "title": role_titles[role],
+            "role_hint": role,
+            "user_story": "；".join(str(item.get("user_story") or "").strip()
+                                    for item in entries if str(item.get("user_story") or "").strip())[:600],
+            "acceptance_criteria": list(dict.fromkeys(
+                str(criteria).strip() for item in entries
+                for criteria in (item.get("acceptance_criteria") if isinstance(item.get("acceptance_criteria"), list) else [])
+                if str(criteria).strip()
+            ))[:8],
+            "requirement_ids": list(dict.fromkeys(
+                str(req_id) for item in entries
+                for req_id in (item.get("requirement_ids") if isinstance(item.get("requirement_ids"), list) else [])
+                if str(req_id).strip()
+            )),
+            "story_points": max((item.get("story_points", 3) for item in entries
+                                 if isinstance(item.get("story_points"), int)), default=3),
+        })
+        merged.append(combined)
+    return merged + other
+
+
+def code_task_phases(tasks: list[dict]) -> list[list[dict]]:
+    """Finish BE interface contributions before parallel FE and QA work begins."""
+    backend = [task for task in tasks if task.get("assignee_roster") == DEV_BE]
+    downstream = [task for task in tasks if task.get("assignee_roster") != DEV_BE]
+    return [phase for phase in (backend, downstream) if phase]
 
 
 # ---------- LangGraph 节点 ----------
@@ -227,25 +355,48 @@ async def kickoff(state: SprintState) -> dict:
 
     uploads_text = state.get("uploads_text", "")
     attachments_note = (
-        f"\n\n用户提供了附件素材，任务拆解须围绕对这些素材的加工改造：\n{uploads_text[:2000]}"
+        f"\n\n用户提供了附件素材，任务拆解须围绕对这些素材的加工改造：\n{uploads_text[:6000]}"
         if uploads_text else ""
     )
-    llm.consume_fallback()  # 清掉历史回退记录，只观察本次拆解调用
-    plan = chat_json(
+    plan_meta: dict = {}
+    plan = await asyncio.to_thread(
+        chat_json,
         system=(
             "你是敏捷团队的产品经理。把需求拆解为 3-5 个任务，"
-            '输出 JSON：{"tasks":[{"title":"任务名","role_hint":"后端|前端|测试|写作|设计|其他"}]}。'
+            '输出 JSON：{"contract":{"target_kind":"docx|pdf|pptx|xlsx|code",'
+            '"audience":"读者或使用者","purpose":"用途",'
+            '"requirements":[{"source":"user|attachment","source_quote":"原文连续片段",'
+            '"source_name":"附件名（仅附件）","source_location":"附件位置（仅附件）",'
+            '"text":"条款","priority":"P0|P1|P2","acceptance_method":"具体核验方法"}],'
+            '"missing_info":[],"allowed_assumptions":[]},'
+            '"tasks":[{"title":"任务名","role_hint":"后端|前端|测试|写作|设计|其他",'
+            '"user_story":"作为某类用户，我希望某个能力，以便实现某个价值",'
+            '"priority":"P0|P1|P2","story_points":3,"requirement_ids":["R1"],'
+            '"acceptance_criteria":["可验证的验收条件"]}]}。'
+            "把用户原话按句号、分号、逗号逐段列为 user 条款，source_quote 必须是原文连续片段，"
+            "按出现顺序编号 R1、R2……；附件条款须写精确附件名和位置。"
+            "不要把猜测写成事实，未知信息放 missing_info，allowed_assumptions 只放用户原文中明确授权的连续片段。"
+            "按业务优先级排序；故事点仅使用 1/2/3/5/8/13，每个任务给出 2-4 条具体、可观察的验收条件。"
+            "一页以内的通知或简短文件最多拆成 3 个任务：BE核对事实、FE完成正文与排版、QA按条款检查；"
+            "正文与排版由同一个 FE 任务完成，不要为同一角色重复拆分调用。"
             "注意判断需求性质：如果需求是要一份成品内容（写作文/报告/方案/周报/PPT/表格），"
             "任务应为内容生产环节（如：资料与大纲、正文撰写、排版与导出成品）；"
             "只有需求是开发软件/接口/页面时，任务才是开发环节。"
             "如果提供了附件素材，任务必须体现对附件的加工（阅读、提取、改写、转换、扩展）。"
+            "软件需求按不重叠职责拆解：BE负责核心逻辑/接口，FE负责入口/交互/使用说明，QA只负责测试与验收；"
+            "同一职责的重复事项合并为一个任务，QA不得生成生产代码或 README，FE不得重写 BE 的核心模块。"
         ),
         user=f"需求：{state['requirement']}{attachments_note}{drain_instructions()}",
         fallback=mock_plan,
+        max_tokens=4500,
+        meta=plan_meta,
         roster=PO,
         images=state.get("uploads_images") or None,
     )
-    fallback_info = llm.consume_fallback()
+    fallback_info = {"reason": plan_meta["fallback_reason"]} if plan_meta.get("fallback_reason") else None
+    if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list) or not any(isinstance(t, dict) and t.get("title") for t in plan["tasks"]):
+        plan = mock_plan()
+        fallback_info = {"reason": "模型返回的任务列表无效"}
     if fallback_info:
         # 拆解未按预期输出：明示前端，避免用户误以为 LLM 拆解生效
         emit(
@@ -256,8 +407,22 @@ async def kickoff(state: SprintState) -> dict:
             }
         )
 
+    contract = build_contract(
+        state["requirement"], uploads_text, plan.get("contract"),
+        deliver_kind="code" if state.get("task_kind") == "software" else detect_final_kind(state["requirement"]),
+        fallback_reason=(fallback_info or {}).get("reason", ""),
+    )
+    storage.save_contract(sprint_meta.get("id", ""), contract)
+    emit({"type": "requirement_contract", "contract": contract})
+
     tasks: list[dict] = []
-    for i, item in enumerate(plan.get("tasks", [])):
+    planned = [item for item in plan["tasks"] if isinstance(item, dict) and item.get("title")][:8]
+    planned.sort(key=lambda item: {"P0": 0, "P1": 1, "P2": 2}.get(item.get("priority", "P1"), 1))
+    if contract.get("target_kind") == "code":
+        planned = compact_code_tasks(planned)
+    else:
+        planned = compact_short_document_tasks(planned, contract)
+    for i, item in enumerate(planned):
         title = str(item.get("title", f"任务 {i + 1}")).strip()[:40]
         tasks.append(
             {
@@ -267,6 +432,7 @@ async def kickoff(state: SprintState) -> dict:
                 "assignee_roster": None,
                 "status": "待分派",
                 "summary": "",
+                **plan_fields(item, state["requirement"], contract),
             }
         )
 
@@ -274,52 +440,55 @@ async def kickoff(state: SprintState) -> dict:
     tasks_store.extend(tasks)
     for t in tasks:
         update_task(t)
+    sprint_id = sprint_meta.get("id", "")
+    if sprint_id and storage.get_sprint(sprint_id):
+        handoffs.offer(
+            sprint_id, task_id="", from_roster=PO, to_roster=SM,
+            input_refs=[f"requirement:{c['requirement_id']}" for c in contract["requirements"]],
+            output_refs=[f"contract:{sprint_id}"],
+            claims=["已拆解原始需求并保留每条要求的来源与验收方法"],
+            open_questions=contract["missing_info"],
+            acceptance_criteria=["逐条检查原文与附件条款", "检查任务对 requirement_id 的覆盖"],
+        )
 
     # 产物：需求拆解文档（PRD）——真实 .docx 文件，失败回退 Markdown
     prd_lines = [f"# 需求拆解文档（PRD）", "", f"## 原始需求", "", state["requirement"], "", "## 任务拆解", ""]
     for t in tasks:
-        prd_lines.append(f"- **{t['id']} {t['title']}**（{t['role_hint']}）")
+        prd_lines.append(f"- **{t['id']} {t['title']}**（{t['role_hint']} / {t['priority']} / {t['story_points']} 点）\n"
+                         f"  {t['user_story']}\n  验收：{'；'.join(t['acceptance_criteria'])}")
     prd_md = "\n".join(prd_lines)
-    prd_spec = (
-        f"生成一份《需求拆解文档（PRD）》Word 文档。原始需求：{state['requirement']}。"
-        f"任务拆解清单：{[f"{t['id']} {t['title']}（{t['role_hint']}）" for t in tasks]}。"
-        "文档须包含：文档标题页信息、1.背景与目标、2.需求范围、3.任务拆解表格（编号/任务/负责方向）、"
-        "4.验收标准、5.风险与依赖。正文用规范书面语，内容详实。"
+    # The plan already contains the complete PRD source. Render it locally so
+    # a short file task does not spend another model call on a verbose process doc.
+    prd_file = await asyncio.to_thread(
+        forge.render_docx_from_markdown, prd_md, "PRD需求拆解文档.docx"
     )
-    prd_file = await asyncio.to_thread(forge.forge_file, "docx", prd_spec, "PRD需求拆解文档.docx", PO)
     add_artifact(
         kind="prd",
         title="需求拆解文档（PRD）",
+        source="fallback" if plan_meta.get("fallback_reason") else "model",
         author_roster=PO,
         content=prd_md if not prd_file else prd_md + f"\n\n真实文件：{prd_file}",
         file_name=prd_file,
         degraded=not prd_file,
         degraded_reason="" if prd_file else "Word 文件生成失败，当前仅为 Markdown 摘要",
         regen={
-            "mode": "forge",
+            "mode": "structured_plan",
             "file_kind": "docx",
-            "spec": prd_spec,
+            "source_markdown": prd_md,
             "filename": "PRD需求拆解文档.docx",
-            "roster": PO,
         },
     )
 
-    # 判断最终交付物类型：内容成品（docx/pptx/xlsx）还是代码（code）
-    classification = chat_json(
-        system=(
-            '判断这个需求的最终交付物类型。输出 JSON：{"type":"docx|pptx|xlsx|code"}。'
-            "docx=作文/文章/报告/周报/方案/总结等文字成品；pptx=演示文稿；"
-            "xlsx=表格/数据表；code=软件/系统/接口/页面等程序开发"
-        ),
-        user=f"需求：{state['requirement']}",
-        fallback=lambda: {"type": detect_final_kind(state["requirement"])},
-        roster=PO,
-    )
-    deliver_kind = (
-        classification.get("type", "code") if isinstance(classification, dict) else "code"
-    )
-    if deliver_kind not in ("docx", "pptx", "xlsx", "code"):
+    # The PO contract already records the intended output format.
+    deliver_kind = contract.get("target_kind") or detect_final_kind(state["requirement"])
+    if deliver_kind not in ("docx", "pptx", "xlsx", "pdf", "code"):
         deliver_kind = "code"
+    if state.get("task_kind") == "software":
+        deliver_kind = "code"
+    elif "pdf" in state["requirement"].lower() and any(word in state["requirement"].lower() for word in ("word", "docx")):
+        deliver_kind = "docx"
+    contract["target_kind"] = deliver_kind
+    storage.save_contract(sprint_meta.get("id", ""), contract)
 
     set_state(PO, "working", "编写需求说明")
     await pause(1.0)
@@ -329,7 +498,7 @@ async def kickoff(state: SprintState) -> dict:
         f"需求「{state['requirement']}」拆解出了 {len(tasks)} 个任务，请教练组织分派",
         f"需求拆解完成，共 {len(tasks)} 个任务，请组织分派",
     )
-    return {"tasks": tasks, "deliver_kind": deliver_kind}
+    return {"tasks": tasks, "deliver_kind": deliver_kind, "requirement_contract": contract}
 
 
 async def assign(state: SprintState) -> dict:
@@ -339,11 +508,51 @@ async def assign(state: SprintState) -> dict:
     set_state(SM, "thinking", "评估工作量与分工")
     await pause(1.5)
 
+    file_route = state.get("deliver_kind") != "code"
     for i, t in enumerate(tasks):
-        t["assignee_roster"] = pick_assignee(t["title"], i)
+        hint = t.get("role_hint")
+        title = t["title"]
+        hinted = {"测试": QA, "前端": DEV_FE, "后端": DEV_BE,
+                  "写作": DEV_FE, "设计": DEV_FE}.get(hint)
+        if file_route and any(word in title for word in ("测试", "验收", "校核", "检查", "验证")):
+            t["assignee_roster"] = QA
+        elif file_route and any(word in title for word in ("资料", "来源", "数据", "计算", "事实", "要素", "调研")):
+            t["assignee_roster"] = DEV_BE
+        elif file_route and any(word in title for word in ("正文", "撰写", "排版", "版式", "设计", "导出")):
+            t["assignee_roster"] = DEV_FE
+        else:
+            t["assignee_roster"] = hinted or pick_assignee(title, i)
+    dev_tasks = [t for t in tasks if t["assignee_roster"] != QA]
+    if len(dev_tasks) >= 2:
+        assigned = {t["assignee_roster"] for t in dev_tasks}
+        if DEV_BE not in assigned:
+            dev_tasks[0]["assignee_roster"] = DEV_BE
+        if DEV_FE not in assigned:
+            dev_tasks[-1]["assignee_roster"] = DEV_FE
+    scopes = {
+        DEV_BE: "事实、数据、计算和来源核对" if file_route else "业务逻辑、接口和数据结构",
+        DEV_FE: "结构、正文与版式" if file_route else "命令行或界面交互与呈现",
+        QA: "按条款设计并执行验证",
+    }
+    sprint_id = sprint_meta.get("id", "")
+    po_offers = storage.list_handoffs(sprint_id) if sprint_id and storage.get_sprint(sprint_id) else []
+    for offer in po_offers:
+        if offer["from_roster"] == PO and offer["to_roster"] == SM and offer["status"] == "ready":
+            handoffs.receive(offer["id"], accepted=True)
+    for t in tasks:
+        t["role_scope"] = scopes.get(t["assignee_roster"], "待确认")
         t["status"] = "待开发"
         update_task(t)
-
+        if sprint_id and storage.get_sprint(sprint_id):
+            refs = [f"contract:{sprint_id}"] + [f"requirement:{key}" for key in t.get("requirement_ids", [])]
+            offer = handoffs.offer(
+                sprint_id, task_id=t["id"], from_roster=SM, to_roster=t["assignee_roster"],
+                input_refs=refs, output_refs=[f"task:{t['id']}"],
+                claims=[f"职责：{t['role_scope']}；任务：{t['title']}"],
+                acceptance_criteria=t.get("acceptance_criteria", []),
+            )
+            t["assignment_handoff_id"] = offer["id"]
+            update_task(t)
     set_state(SM, "working", "分派任务")
     await pause(0.8)
     for t in tasks:
@@ -374,6 +583,8 @@ async def develop(state: SprintState) -> dict:
         if t["status"] == "已取消":
             return
         no = t["assignee_roster"] or DEV_BE
+        if t.get("assignment_handoff_id"):
+            handoffs.receive(t["assignment_handoff_id"], accepted=True)
         verb = "修复缺陷" if t["status"] == "打回" else "开发中"
         set_state(no, "working", f"{verb}：{t['title']}")
         await pause(1.8)
@@ -387,68 +598,151 @@ async def develop(state: SprintState) -> dict:
                 return
             # 产物：开发说明（LLM 生成实现要点，未配 LLM 时用模板兜底）
             note_meta: dict = {}
-            note = await asyncio.to_thread(
-                chat_json,
-                (
-                    f"你是{roster_name(no)}，刚完成开发任务「{t['title']}」（需求：{state['requirement']}）。"
-                    "用 2 句话向团队说明你做了什么、实现要点是什么。"
-                    '输出 JSON：{"note":"..."}'
-                ),
-                f"任务：{t['title']}{drain_instructions()}",
-                lambda: mock_develop_result(t["title"]),
-                0.7,
-                160,
-                60,
-                no,
-                note_meta,
-            )
-            summary = ""
-            if isinstance(note, dict):
-                summary = str(note.get("note", "")).strip()
-            if not summary:
-                summary = mock_develop_result(t["title"])
+            if state.get("deliver_kind", "code") == "code":
+                summary = ""
+            else:
+                role_instruction = (
+                    "你是后端工程师，负责事实、数字、计算和来源核对。提交可复用的素材核对表，"
+                    "每条写明原文、来源位置、可确认事实、待确认项；不撰写空泛完成汇报。"
+                    if no == DEV_BE else
+                    "你是前端工程师，负责内容结构、正文和版式。提交可直接用于最终文件的完整内容，"
+                    "明确标题、正文、表格或页面结构；不得捏造附件没有的数字和事实。"
+                    if no == DEV_FE else
+                    "你是测试工程师，提交可执行或可逐条核对的测试用例和预期结果；未执行的检查不得写通过。"
+                )
+                summary = await asyncio.to_thread(
+                    llm.chat_text,
+                    role_instruction,
+                    [{"role": "user", "content": json.dumps({"requirement": state["requirement"], "task": t,
+                        "requirement_contract": state.get("requirement_contract", {}),
+                        "source_material": state.get("uploads_text", "")[:18000], "instructions": drain_instructions()}, ensure_ascii=False)}],
+                    fallback="当前模型不可用，未能生成本任务的真实内容。", roster=no, meta=note_meta,
+                    max_tokens=6000, timeout=240, temperature=.45, tool_mode=False,
+                    fallback_roster=1 if no != 1 else None,
+                )
 
             # 真实代码产出：仅软件类需求由 LLM 为该任务编写真实代码文件
             written: list[str] = []
             if state.get("deliver_kind", "code") == "code":
                 dev_requirement = state["requirement"]
+                dev_requirement += f"\n本任务用户故事：{t.get('user_story', '')}\n验收条件：{'；'.join(t.get('acceptance_criteria', []))}"
+                role_boundaries = {
+                    DEV_BE: "只实现核心业务逻辑、公开接口和输入/领域校验；不要生成 CLI/界面、测试、README 或另一份完整项目。",
+                    DEV_FE: "只实现命令行/用户入口、参数交互和 README；遵循 BE 贡献的模块/函数接口，不要重写核心逻辑或生成测试。",
+                    QA: "只生成测试文件（tests/ 下或 test_*.py），覆盖成功路径和错误路径；必须实际测试 CLI 成功与失败退出码；禁止 skip/xfail/跳过测试；禁止生成或修改生产代码、README、依赖文件。测试必须针对共享计划中的 BE 接口。",
+                }
+                dev_requirement += (f"\n角色文件边界：{role_boundaries.get(no, '只提交本任务职责范围内的文件，不要复制其他任务的实现。')}"
+                                    "\n禁止复刻其他任务已负责的模块；如依赖接口尚未明确，以最少可检查的调用假设编写，并将问题写入测试。")
+                if state.get("deliver_kind", "code") == "code" and no in (DEV_FE, QA):
+                    backend_material = []
+                    for backend_task in tasks:
+                        if backend_task.get("assignee_roster") != DEV_BE:
+                            continue
+                        valid, _, backend_manifest = contributions.inspect(sprint_meta.get("id", ""), backend_task["id"])
+                        if not valid:
+                            continue
+                        for file_info in backend_manifest.get("files", []):
+                            try:
+                                source = Path(file_info["path"]).read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                continue
+                            backend_material.append(f"--- {file_info['logical_path']} ---\n{source[:5000]}")
+                    if backend_material:
+                        dev_requirement += "\n\n已完成并校验的 BE 接口源码；必须按此导入和调用，不得自行猜测接口：\n" + "\n".join(backend_material)[:12000]
                 up = state.get("uploads_text", "")
                 if up:
                     dev_requirement += f"\n\n（需加工改造的现有代码/素材如下，请在此基础上改写扩展）\n{up[:3000]}"
                 dev_requirement += drain_instructions()
+                dev_requirement += f"\n本轮共享任务计划：{json.dumps([{'id': x['id'], 'title': x['title'], 'role_scope': x.get('role_scope', '')} for x in tasks], ensure_ascii=False)}"
                 written = await asyncio.to_thread(
-                    forge.forge_code, t["title"], dev_requirement, t["id"], no
+                    forge.forge_code, t["title"], dev_requirement, t["id"], no, note_meta
                 )
+                summary = "实际代码文件：" + ("、".join(written) if written else "未生成")
 
         if t["status"] == "已取消":
             # 生成期间被取消：保留取消状态，不再翻回待测试
             set_state(no, "idle", "等待新任务")
             return
-        t["status"] = "待测试"
-        t["summary"] = summary
+        sprint_id = sprint_meta.get("id", "")
+        source_refs = [f"requirement:{key}" for key in t.get("requirement_ids", [])]
+        if state.get("uploads_text"):
+            source_refs += [f"attachment:{src['name']}:{src.get('location') or 'unknown'}"
+                            for src in state.get("requirement_contract", {}).get("attachment_sources", [])]
+        if sprint_id and storage.get_sprint(sprint_id):
+            if state.get("deliver_kind", "code") == "code":
+                manifest = contributions.save_code(
+                    sprint_id, t["id"], no, t.get("role_scope", ""), written,
+                    t.get("requirement_ids", []), source_refs, generation_meta=note_meta,
+                )
+            else:
+                manifest = contributions.save_text(
+                    sprint_id, t["id"], no, t.get("role_scope", ""), summary,
+                    t.get("requirement_ids", []), source_refs,
+                    status="unchecked" if note_meta.get("fallback_reason") else "ready",
+                    generation_meta=note_meta,
+                )
+            t["contribution_ref"] = f"contribution:{t['id']}"
+        else:
+            manifest = {}
+        task_has_deliverable = bool(written) if state.get("deliver_kind", "code") == "code" else bool(summary.strip()) and not note_meta.get("fallback_reason")
+        t["status"] = "待测试" if task_has_deliverable else "打回"
+        t["summary"] = summary[:1500]
         t["code_files"] = written
         update_task(t)
         code_note = (
             "\n\n真实代码文件：\n" + "\n".join(f"- `{p}`" for p in written)
             if written else ""
         )
-        add_artifact(
+        dev_artifact = add_artifact(
             kind="dev",
             title=f"开发说明 · {t['title']}",
+            source="fallback" if note_meta.get("fallback_reason") else "model",
             author_roster=no,
             content=(
                 f"# 开发说明 · {t['title']}\n\n"
                 f"- 负责人：{roster_name(no)}\n"
                 f"- 所属需求：{state['requirement']}\n\n"
-                f"{summary}{code_note}"
+                f"{summary[:14000]}{code_note}\n\n贡献清单：{manifest.get('files', [])}"
             ),
             task_id=t["id"],
-            degraded=bool(note_meta.get("fallback_reason")),
-            degraded_reason=note_meta.get("fallback_reason", ""),
+            degraded=bool(note_meta.get("fallback_reason")) or (state.get("deliver_kind") == "code" and not written),
+            degraded_reason=note_meta.get("fallback_reason", "") or ("未生成可复用代码文件" if state.get("deliver_kind") == "code" and not written else ""),
         )
+        sprint_id = sprint_meta.get("id", "")
+        if sprint_id and storage.get_sprint(sprint_id):
+            handoffs.offer(
+                sprint_id, task_id=t["id"], from_roster=no, to_roster=SM,
+                input_refs=[f"contract:{sprint_id}"] + [f"requirement:{key}" for key in t.get("requirement_ids", [])] + [f"task:{t['id']}"],
+                output_refs=[f"artifact:{dev_artifact['id']}", t["contribution_ref"]],
+                claims=[f"已提交任务内容：{t['title']}"],
+                open_questions=([] if (written or summary) and not note_meta.get("fallback_reason")
+                                else [note_meta.get("fallback_reason") or "没有可复用的实际内容"]),
+                acceptance_criteria=t.get("acceptance_criteria", []),
+            )
         emote(no, "emotes/idea", "灵感")
 
-    await asyncio.gather(*(run_one(t) for t in pending))
+    if state.get("deliver_kind", "code") == "code":
+        # BE owns the shared production interface. FE and QA receive its actual
+        # source before they generate their dependent files, while FE and QA
+        # remain parallel with each other.
+        for phase in code_task_phases(pending):
+            await asyncio.gather(*(run_one(t) for t in phase))
+    else:
+        await asyncio.gather(*(run_one(t) for t in pending))
+    sprint_id = sprint_meta.get("id", "")
+    if sprint_id and storage.get_sprint(sprint_id):
+        issues = contributions.scan_conflicts(sprint_id)
+        for issue in issues:
+            emit({"type": "integration_issue", "issue": issue, "sprint_id": sprint_id})
+            for task in tasks:
+                if task["id"] in issue.get("tasks", []) or task["id"] == issue.get("task_id"):
+                    task.setdefault("integration_conflicts", []).append(issue)
+                    update_task(task)
+        for offer in storage.list_handoffs(sprint_id):
+            if offer["to_roster"] == SM and offer["from_roster"] in (DEV_BE, DEV_FE) and offer["status"] == "ready":
+                related = next((task for task in tasks if task["id"] == offer["task_id"]), None)
+                handoffs.receive(offer["id"], accepted=not bool(related and related.get("integration_conflicts")),
+                                 reason="接口或文件冲突，等待整合" if related and related.get("integration_conflicts") else "")
 
     # 交接给测试：由最后一个"非测试岗"开发者去向 QA 交接；
     # 若本轮待测任务全部由 QA 自研（如自动化用例），直接进入测试，避免自己拜访自己
@@ -470,318 +764,381 @@ async def develop(state: SprintState) -> dict:
     return {"tasks": tasks}
 
 
+def _workflow_evidence(sprint_id: str, tasks: list[dict], contract: dict, candidate_sha256: str) -> dict:
+    manifests = []
+    for task in tasks:
+        roster = task.get("assignee_roster")
+        if roster not in (DEV_BE, DEV_FE) or not sprint_id:
+            continue
+        valid, reason, manifest = contributions.inspect(sprint_id, task["id"])
+        contents = []
+        if valid:
+            for file in manifest.get("files", []):
+                try:
+                    contents.append(Path(file["path"]).read_text(encoding="utf-8")[:5000])
+                except OSError:
+                    valid, reason = False, "贡献文件不可读取"
+                    break
+        manifests.append({"task_id": task["id"], "roster": roster, "valid": valid,
+                          "reason": reason, "requirement_ids": task.get("requirement_ids", []),
+                          "source_refs": manifest.get("source_refs", []),
+                          "files": manifest.get("files", []), "content": "\n".join(contents)[:7000]})
+    return {"contract_status": contract.get("status"), "candidate_sha256": candidate_sha256,
+            "tasks": [{"task_id": t.get("id"), "roster": t.get("assignee_roster"),
+                       "requirement_ids": t.get("requirement_ids", []), "status": t.get("status")}
+                      for t in tasks],
+            "contributions": manifests,
+            "handoffs": storage.list_handoffs(sprint_id) if sprint_id and storage.get_sprint(sprint_id) else []}
+
+
+def _offer_candidate_to_qa(sprint_id: str, state: SprintState, candidate_id: str,
+                           candidate_sha256: str, companions: list[dict] | None = None) -> None:
+    if not sprint_id or not storage.get_sprint(sprint_id) or not candidate_id:
+        return
+    refs = [f"requirement:{item['requirement_id']}"
+            for item in state.get("requirement_contract", {}).get("requirements", [])]
+    refs += [task["contribution_ref"] for task in state.get("tasks", []) if task.get("contribution_ref")]
+    outputs = [f"artifact:{candidate_id}"] + [f"artifact:{item['id']}" for item in companions or []]
+    handoffs.offer(
+        sprint_id, task_id="", from_roster=SM, to_roster=QA,
+        input_refs=refs, output_refs=outputs,
+        claims=[f"已整合候选 SHA-256 {candidate_sha256}，请按 PO 条款检查同一版本"],
+        acceptance_criteria=["逐条核对候选文件及协作来源；记录同一哈希"],
+    )
+
+
 async def test(state: SprintState) -> dict:
-    """测试工程师：真实语法检查 + 生成真实测试用例 .xlsx"""
-    set_state(QA, "thinking", "设计测试用例")
-    await pause(1.5)
-
-    tasks = state["tasks"]
+    """QA verifies the candidate bytes against every PO clause."""
     set_stage("测试验证")
-    # 真实质量检查：Python 语法编译 + JS 语法检查（不产生 __pycache__ 污染交付包）
-    compile_failures: list[str] = await asyncio.to_thread(forge.verify_generated_code)
-    compile_ok = not compile_failures
-
-    first_pass = state["rework_count"] == 0
-    report_meta: dict = {}
-    report = chat_json(
-        system=(
-            "你是测试工程师，根据任务列表和真实语法检查结果给出测试结论。"
-            '输出 JSON：{"verdict":"通过|有缺陷","bug_task":"任务id或null","note":"一句话说明"}'
-        ),
-        user=(
-            f"任务列表：{[{'id': t['id'], 'title': t['title']} for t in tasks]}\n"
-            f"真实语法检查：{'全部通过' if compile_ok else '；'.join(compile_failures)}"
-            f"{drain_instructions()}"
-        ),
-        fallback=lambda: mock_test_report(tasks, first_pass),
-        roster=QA,
-        meta=report_meta,
+    set_state(QA, "thinking", "逐条核验候选成品")
+    await pause(0.8)
+    sprint_id = sprint_meta.get("id", "")
+    if sprint_id and storage.get_sprint(sprint_id):
+        for offer in storage.list_handoffs(sprint_id):
+            if offer["from_roster"] == SM and offer["to_roster"] == QA and offer["status"] == "ready":
+                handoffs.receive(offer["id"], accepted=True)
+    candidate_id = state.get("candidate_id", "")
+    item = storage.get_artifact(candidate_id) if candidate_id else None
+    if not item:
+        item = next((a for a in artifacts_store if a.get("id") == candidate_id), None)
+    workflow_evidence = _workflow_evidence(
+        sprint_id, state.get("tasks", []), state.get("requirement_contract", {}),
+        state.get("candidate_sha256", ""),
     )
-    if not compile_ok and report.get("verdict") == "通过":
-        # 真实检查发现问题时，以真实结果为准
-        report["verdict"] = "有缺陷"
-        report["note"] = f"语法检查未过：{compile_failures[0]}"
-        dev_tasks = [t for t in tasks if t["assignee_roster"] in (DEV_BE, DEV_FE)]
-        if dev_tasks and not report.get("bug_task"):
-            report["bug_task"] = dev_tasks[0]["id"]
-
-    bug_task_id = report.get("bug_task")
-    if report.get("verdict") == "有缺陷" and bug_task_id:
-        for t in tasks:
-            if t["status"] == "已取消":
-                continue
-            t["status"] = "打回" if t["id"] == bug_task_id else "通过"
-            update_task(t)
-    else:
-        for t in tasks:
-            if t["status"] not in ("通过", "已取消"):
-                t["status"] = "通过"
-                update_task(t)
-
-    set_state(QA, "working", f"测试结论：{report.get('note', '')}")
-    await pause(1.0)
-
-    # 产物：真实测试用例 .xlsx + 文本报告
-    round_no = state["rework_count"] + 1
-    done_ids = [t["id"] for t in tasks if t["status"] == "通过"]
-    xlsx_spec = (
-        f"生成一份《测试报告（第 {round_no} 轮）》Excel 工作簿。"
-        f"需求背景：{state['requirement']}。"
-        f"Sheet1「测试结论」：结论={report.get('verdict', '通过')}，说明={report.get('note', '')}，"
-        f"语法检查={'全部通过' if compile_ok else '；'.join(compile_failures)}。"
-        f"Sheet2「用例清单」：表头为 用例编号/关联任务/用例标题/前置条件/步骤/预期结果/实际结果/状态，"
-        f"为以下任务各设计 2-3 条真实用例：{[f'{t['id']} {t['title']}' for t in tasks]}，"
-        f"状态列按实际结论填 通过/失败。表头加粗、列宽自适应内容。"
+    report = await asyncio.to_thread(
+        verification.verify, item or {}, state.get("requirement_contract", {}),
+        state.get("candidate_sha256", ""), workflow_evidence,
     )
-    xlsx_file = await asyncio.to_thread(
-        forge.forge_file, "xlsx", xlsx_spec, f"测试报告-第{round_no}轮.xlsx", QA
+    companion_reports = []
+    for companion in state.get("companion_candidates", []):
+        extra = storage.get_artifact(companion["id"]) if sprint_id and storage.get_sprint(sprint_id) else None
+        if not extra:
+            extra = next((a for a in artifacts_store if a.get("id") == companion["id"]), None)
+        checked = await asyncio.to_thread(
+            verification.verify, extra or {}, state.get("requirement_contract", {}), companion["sha256"],
+            workflow_evidence,
+        )
+        companion_reports.append(checked)
+    if companion_reports:
+        report["companions"] = companion_reports
+        report["companion_hashes"] = [entry["candidate_sha256"] for entry in companion_reports]
+        statuses = [report["status"]] + [entry["status"] for entry in companion_reports]
+        report["status"] = "failed" if "failed" in statuses else "unchecked" if "unchecked" in statuses else "passed"
+        report["items"] += [
+            {**part, "location": f"PDF {part.get('location', '')}"}
+            for entry in companion_reports for part in entry.get("items", []) if part.get("status") == "failed"
+        ]
+    qa_artifact = add_artifact(
+        kind="test", title="QA 逐条验证报告", author_roster=QA,
+        content=json.dumps(report, ensure_ascii=False, indent=2),
+        quality_status=report["status"], source="model" if report["status"] != "unchecked" else "fallback",
+        degraded=report["status"] == "failed", degraded_reason=report.get("reason", ""),
+        regen={"mode": "qa_report", "candidate_id": candidate_id,
+               "candidate_sha256": state.get("candidate_sha256", "")},
     )
-    add_artifact(
-        kind="test",
-        title=f"测试报告（第 {round_no} 轮）",
-        author_roster=QA,
-        content=(
-            f"# 测试报告（第 {round_no} 轮）\n\n"
-            f"- 结论：{report.get('verdict', '通过')}\n"
-            f"- 说明：{report.get('note', '')}\n"
-            f"- 语法检查：{'全部通过' if compile_ok else '；'.join(compile_failures)}\n"
-            f"- 本轮通过：{'、'.join(done_ids) or '无'}\n"
-            f"- 缺陷任务：{report.get('bug_task') or '无'}"
-            + (f"\n- 真实文件：{xlsx_file}" if xlsx_file else "")
-        ),
-        file_name=xlsx_file,
-        degraded=not xlsx_file or bool(report_meta.get("fallback_reason")),
-        degraded_reason=(
-            "Excel 测试报告生成失败，当前仅为文字汇总"
-            if not xlsx_file
-            else report_meta.get("fallback_reason", "")
-        ),
-        regen={
-            "mode": "forge",
-            "file_kind": "xlsx",
-            "spec": xlsx_spec,
-            "filename": f"测试报告-第{round_no}轮.xlsx",
-            "roster": QA,
-        },
-    )
-    await speak(
-        QA,
-        LEAD,
-        f"测试执行完毕，结论是：{report.get('note', '见报告')}",
-        f"测试完成：{report.get('note', '见报告')}",
-    )
-    return {"tasks": tasks, "review_note": report.get("verdict", "通过")}
+    tasks = state["tasks"]
+    failed_ids = {item["requirement_id"] for item in report.get("items", []) if item["status"] == "failed"}
+    for task in tasks:
+        if task["status"] == "已取消":
+            continue
+        task["status"] = "打回" if failed_ids.intersection(task.get("requirement_ids", [])) else "待评审"
+        update_task(task)
+    if sprint_id and storage.get_sprint(sprint_id):
+        handoffs.offer(
+            sprint_id, task_id="", from_roster=QA, to_roster=LEAD,
+            input_refs=[f"contract:{sprint_id}", f"artifact:{candidate_id}"],
+            output_refs=[f"artifact:{qa_artifact['id']}"],
+            claims=[f"QA 对候选 {state.get('candidate_sha256', '')} 的逐条结论：{report['status']}"],
+            open_questions=[report["reason"]] if report.get("reason") else [],
+            acceptance_criteria=["LEAD 独立复核相同 SHA-256 候选"],
+        )
+    await speak(QA, LEAD, f"候选逐条核验为 {report['status']}，请复核同一版本", f"QA 结论：{report['status']}")
+    return {"tasks": tasks, "qa_report": report, "review_note": report["status"]}
 
 
 async def review(state: SprintState) -> dict:
-    """技术主管：代码评审"""
-    tasks = state["tasks"]
-    buggy = [t for t in tasks if t["status"] == "打回"]
-    first_pass = state["rework_count"] < 1
+    """LEAD independently reads the same candidate even when QA has failed."""
     set_stage("技术评审")
-
-    set_state(LEAD, "thinking", "代码评审")
-    await pause(1.8)
-
-    if first_pass and buggy:
-        names = "、".join(t["title"] for t in buggy)
-        note = f"打回：{names} 需修复后重新提交"
-        set_state(LEAD, "working", note)
-        await pause(1.0)
-        await speak(
-            LEAD,
-            SM,
-            f"评审发现问题，{names} 要打回给开发修复",
-            note,
+    set_state(LEAD, "thinking", "独立复核候选与 QA 证据")
+    await pause(0.8)
+    sprint_id = sprint_meta.get("id", "")
+    records = storage.list_handoffs(sprint_id) if sprint_id and storage.get_sprint(sprint_id) else []
+    for offer in records:
+        if offer["to_roster"] == LEAD and offer["status"] == "ready":
+            handoffs.receive(offer["id"], accepted=True)
+    candidate_id = state.get("candidate_id", "")
+    item = storage.get_artifact(candidate_id) if candidate_id else None
+    if not item:
+        item = next((a for a in artifacts_store if a.get("id") == candidate_id), None)
+    companion_artifacts = []
+    for companion in state.get("companion_candidates", []):
+        extra = storage.get_artifact(companion["id"]) if sprint_id and storage.get_sprint(sprint_id) else None
+        if not extra:
+            extra = next((a for a in artifacts_store if a.get("id") == companion["id"]), None)
+        if extra:
+            companion_artifacts.append(extra)
+    workflow_evidence = _workflow_evidence(
+        sprint_id, state.get("tasks", []), state.get("requirement_contract", {}),
+        state.get("candidate_sha256", ""),
+    )
+    decision = await asyncio.to_thread(
+        review_decision.decide, item or {}, state.get("requirement_contract", {}),
+        state.get("qa_report", {}), records, state.get("candidate_sha256", ""), companion_artifacts,
+        workflow_evidence,
+    )
+    review_artifact = add_artifact(
+        kind="review", title="LEAD 独立复核决定", author_roster=LEAD,
+        content=json.dumps(decision, ensure_ascii=False, indent=2),
+        quality_status=decision["status"], source="model" if decision["status"] != "unchecked" else "fallback",
+        degraded=decision["status"] == "failed", degraded_reason=decision.get("reason", ""),
+        regen={"mode": "lead_decision", "candidate_id": candidate_id,
+               "candidate_sha256": state.get("candidate_sha256", "")},
+    )
+    tasks = state["tasks"]
+    if decision["status"] == "failed":
+        failed_ids = {part["requirement_id"] for part in state.get("qa_report", {}).get("items", [])
+                      if part.get("status") == "failed"}
+        failed_ids.update(issue.get("requirement_id") for issue in decision.get("issues", []))
+        assigned = False
+        for task in tasks:
+            if task["status"] == "已取消":
+                continue
+            if failed_ids.intersection(task.get("requirement_ids", [])):
+                task["status"] = "打回"
+                assigned = True
+                update_task(task)
+        if not assigned:
+            for task in tasks:
+                if task["status"] != "已取消":
+                    task["status"] = "打回"
+                    update_task(task)
+    elif decision["status"] == "passed":
+        for task in tasks:
+            if task["status"] not in ("已取消", "通过"):
+                task["status"] = "通过"
+                update_task(task)
+    if sprint_id and storage.get_sprint(sprint_id):
+        handoffs.offer(
+            sprint_id, task_id="", from_roster=LEAD, to_roster=SM,
+            input_refs=[f"contract:{sprint_id}", f"artifact:{candidate_id}"],
+            output_refs=[f"artifact:{review_artifact['id']}"],
+            claims=[f"LEAD 对候选 {state.get('candidate_sha256', '')} 的独立决定：{decision['status']}"],
+            open_questions=[decision["reason"]] if decision.get("reason") else [],
+            acceptance_criteria=["发布字节 SHA-256 与 LEAD 审阅候选一致"],
         )
-        return {"rework_count": state["rework_count"] + 1, "review_note": note}
-
-    verdict_meta: dict = {}
-    verdict = chat_json(
-        system="你是技术主管，给出最终评审结论。输出 JSON：{\"verdict\":\"通过|打回\",\"note\":\"一句话说明\"}",
-        user=f"任务状态：{[{'id': t['id'], 'status': t['status']} for t in tasks]}{drain_instructions()}",
-        fallback=lambda: {"verdict": "通过", "note": mock_review(not first_pass)},
-        roster=LEAD,
-        meta=verdict_meta,
-    )
-    note = f"评审结论：{verdict.get('note', '通过')}"
-    set_state(LEAD, "working", note)
-    await pause(1.0)
-
-    # 产物：真实代码评审记录 .docx（评审基于真实产出的代码内容）
-    code_excerpt = ""
-    for py_file in sorted(Path(forge.CODE_DIR).rglob("*.py"))[:5]:
-        try:
-            snippet = py_file.read_text(encoding="utf-8", errors="replace")[:400]
-            code_excerpt += f"\n### {py_file.name}\n{snippet}\n"
-        except OSError:
-            continue
-    review_opinion = chat_json(
-        system=(
-            "你是技术主管，阅读真实代码后给出评审意见（2-4 条具体建议或肯定）。"
-            '输出 JSON：{"opinion":"..."}'
-        ),
-        user=f"代码节选：{code_excerpt or '（本次未产出代码）'}",
-        fallback=lambda: {"opinion": verdict.get("note", "通过")},
-        temperature=0.6,
-        max_tokens=300,
-        roster=LEAD,
-    )
-    opinion_text = (
-        review_opinion.get("opinion", "") if isinstance(review_opinion, dict) else ""
-    ) or verdict.get("note", "通过")
-
-    review_spec = (
-        f"生成一份《代码评审记录》Word 文档。评审人：{roster_name(LEAD)}。"
-        f"评审结论：{verdict.get('verdict', '通过')}。评审意见：{opinion_text}。"
-        f"任务状态：{[{'id': t['id'], 'status': t['status']} for t in tasks]}。"
-        "文档须包含：1.评审概述、2.代码质量评价、3.具体意见（分条）、4.结论与后续建议。"
-    )
-    review_file = await asyncio.to_thread(
-        forge.forge_file, "docx", review_spec, "代码评审记录.docx", LEAD
-    )
-    add_artifact(
-        kind="review",
-        title="代码评审记录",
-        author_roster=LEAD,
-        content=(
-            f"# 代码评审记录\n\n"
-            f"- 评审人：{roster_name(LEAD)}\n"
-            f"- 结论：{verdict.get('verdict', '通过')}\n"
-            f"- 意见：{opinion_text}\n"
-            f"- 任务状态：{[{'id': t['id'], 'status': t['status']} for t in tasks]}"
-            + (f"\n- 真实文件：{review_file}" if review_file else "")
-        ),
-        file_name=review_file,
-        degraded=not review_file or bool(verdict_meta.get("fallback_reason")),
-        degraded_reason=(
-            "Word 评审记录生成失败，当前仅为文字汇总"
-            if not review_file
-            else verdict_meta.get("fallback_reason", "")
-        ),
-        regen={
-            "mode": "forge",
-            "file_kind": "docx",
-            "spec": review_spec,
-            "filename": "代码评审记录.docx",
-            "roster": LEAD,
-        },
-    )
-    await speak(
-        LEAD,
-        PO,
-        f"评审结束，结论：{verdict.get('note', '通过')}，请知悉",
-        note,
-    )
-    return {"review_note": note}
+    await speak(LEAD, SM, f"同版本独立评审：{decision['status']}", f"LEAD 结论：{decision['status']}")
+    return {"tasks": tasks, "lead_decision": decision,
+            "review_note": decision.get("reason", ""),
+            "rework_count": state["rework_count"] + (1 if decision["status"] == "failed" else 0)}
 
 
 async def fix(state: SprintState) -> dict:
-    """开发工程师：并行修复缺陷"""
-    buggy = [t for t in state["tasks"] if t["status"] == "打回"]
-    set_stage("缺陷修复")
-
-    async def run_one(t: dict) -> None:
-        if t["status"] == "已取消":
-            return
-        no = t["assignee_roster"] or DEV_BE
-        set_state(no, "thinking", f"定位缺陷：{t['title']}")
-        await pause(1.2)
-        if t["status"] == "已取消":
-            set_state(no, "idle", "等待新任务")
-            return
-        set_state(no, "working", f"修复缺陷：{t['title']}")
-        await pause(1.5)
-        if t["status"] == "已取消":
-            set_state(no, "idle", "等待新任务")
-            return
-        t["status"] = "待测试"
-        t["summary"] = f"修复「{t['title']}」缺陷并补充用例"
-        update_task(t)
-        emote(no, "emotes/excited", "修复完成")
-
-    await asyncio.gather(*(run_one(t) for t in buggy))
-
-    # 修复人若就是 QA 本人（缺陷出在测试类任务上），直接回归，不再自我拜访
-    fixer = buggy[-1]["assignee_roster"] if buggy else DEV_BE
-    if fixer != QA:
-        fix_titles = "、".join(t["title"] for t in buggy) or "缺陷"
-        await speak(
-            fixer,
-            QA,
-            f"缺陷「{fix_titles}」已修复并补充了用例，请回归测试",
-            "缺陷已修复，请回归测试",
+    """Route located issues to the owner and create a new candidate version."""
+    set_stage("定点返工")
+    old_id = state.get("candidate_id", "")
+    current = storage.get_artifact(old_id) if old_id else None
+    if not current:
+        current = next((a for a in artifacts_store if a.get("id") == old_id), None)
+    if not current or not current.get("file_name"):
+        return {"repair_blocked": True}
+    kind = (current.get("regen") or {}).get("file_kind")
+    qa_items = [item for item in state.get("qa_report", {}).get("items", []) if item.get("status") == "failed"]
+    lead_items = state.get("lead_decision", {}).get("issues", [])
+    issues = qa_items + lead_items
+    succeeded = 0
+    for issue in issues[:6]:
+        requirement_id = issue.get("requirement_id")
+        owner = issue.get("owner_roster")
+        if owner not in (DEV_BE, DEV_FE):
+            matched = next((t for t in state["tasks"] if requirement_id in t.get("requirement_ids", [])
+                            and t.get("assignee_roster") in (DEV_BE, DEV_FE)), None)
+            owner = matched["assignee_roster"] if matched else DEV_FE
+        set_state(owner, "working", f"修复 {issue.get('location') or requirement_id or '候选问题'}")
+        preview = await asyncio.to_thread(forge.extract_preview, current["file_name"], 14000)
+        project_dir = (current.get("regen") or {}).get("project_dir", "")
+        if kind == "code" and project_dir:
+            import project_agent
+            preview = project_agent.snapshot(Path(project_dir), limit=20000)
+        meta = {}
+        patch = await asyncio.to_thread(
+            chat_json,
+            system=(
+                f"你是{roster_name(owner)}，只修复指定位置的缺陷。"
+                '输出 JSON {"location":"第N页/第N段/工作表!A1/文件路径",'
+                '"old_text":"文档或PPT中的精确旧文本","replacement":"完整替换文本/公式/代码文件内容",'
+                '"path":"代码相对路径（代码任务必填）"}。'
+                "Word/PPT 必须给精确旧文本；Excel 给精确单元格；代码只给一个既有文件的完整新内容。"
+                "不删除测试、功能或无关内容。无法定位则返回空 JSON。"
+            ),
+            user=json.dumps({"kind": kind, "issue": issue, "candidate_sha256": state.get("candidate_sha256"),
+                             "actual_content": preview, "requirement": state["requirement"]}, ensure_ascii=False),
+            fallback={}, roster=owner, meta=meta, max_tokens=6500, timeout=180,
         )
+        if meta.get("fallback_reason") or not isinstance(patch, dict):
+            continue
+        new_file, reason, detail = await asyncio.to_thread(
+            candidate_revision.apply, sprint_meta.get("id", ""), kind, current["file_name"], patch, project_dir
+        )
+        if not new_file:
+            emit({"type": "repair_attempt", "status": "blocked", "reason": reason, "issue": issue})
+            continue
+        digest = _sha256_file(new_file)
+        previous_regen = current.get("regen") or {}
+        next_regen = {**previous_regen, "sha256": digest, "repair": {"issue": issue, "detail": detail,
+                        "previous_sha256": state.get("candidate_sha256")}}
+        if detail.get("project_dir"):
+            next_regen["project_dir"] = detail["project_dir"]
+        revised = add_artifact(
+            kind="candidate", title=f"返工候选 v{int(current.get('version') or 1) + 1}",
+            author_roster=owner, content=f"修订位置：{detail}\n原因：{issue.get('problem', '')}",
+            file_name=new_file, quality_status="unchecked", source="model",
+            parent_id=current["id"], version=int(current.get("version") or 1) + 1,
+            regen=next_regen,
+        )
+        from artifacts import update_artifact
+        update_artifact(revised["id"], quality_status="unchecked")
+        if sprint_meta.get("id") and storage.get_sprint(sprint_meta["id"]):
+            handoffs.offer(
+                sprint_meta["id"], task_id="", from_roster=owner, to_roster=QA,
+                input_refs=[f"contract:{sprint_meta['id']}", f"artifact:{current['id']}"],
+                output_refs=[f"artifact:{revised['id']}"],
+                claims=[f"定点修复 {detail}，旧哈希 {state.get('candidate_sha256')}，新哈希 {digest}"],
+                acceptance_criteria=["QA 对新 SHA-256 重新逐条验收"],
+                version=revised["version"],
+            )
+        emit({"type": "repair_attempt", "status": "ready", "from_candidate": current["id"],
+              "to_candidate": revised["id"], "detail": detail, "sha256": digest})
+        current = revised
+        state["candidate_id"] = revised["id"]
+        state["candidate_sha256"] = digest
+        if kind == "docx" and state.get("companion_candidates"):
+            previous_companion = state["companion_candidates"][0]
+            pdf_file = await asyncio.to_thread(forge.pdf_from_docx, new_file, "同源报告-修订.pdf")
+            if not pdf_file:
+                emit({"type": "repair_attempt", "status": "blocked", "reason": "新 Word 无法导出同源 PDF"})
+                return {"repair_blocked": True, "candidate_id": revised["id"], "candidate_sha256": digest}
+            pdf_hash = _sha256_file(pdf_file)
+            pdf_artifact = add_artifact(
+                kind="candidate", title=f"同源 PDF 候选 v{revised['version']}", author_roster=owner,
+                content=f"由修订 Word {revised['id']} 导出", file_name=pdf_file,
+                quality_status="unchecked", parent_id=previous_companion["id"], version=revised["version"],
+                regen={"mode": "candidate", "file_kind": "pdf", "sha256": pdf_hash,
+                       "source_candidate_id": revised["id"], "source_sha256": digest},
+            )
+            state["companion_candidates"] = [{"id": pdf_artifact["id"], "sha256": pdf_hash}]
+        succeeded += 1
+    if succeeded:
+        for task in state["tasks"]:
+            if task["status"] == "打回":
+                task["status"] = "待测试"
+                update_task(task)
+    return {"tasks": state["tasks"], "candidate_id": state.get("candidate_id", ""),
+            "candidate_sha256": state.get("candidate_sha256", ""),
+            "companion_candidates": state.get("companion_candidates", []),
+            "repair_blocked": not bool(succeeded)}
+
+
+def retrospective_content(state: SprintState, accepted: bool, finals: list[dict]) -> tuple[str, str]:
+    """Build a factual retrospective from task and review evidence only."""
+    done = [task for task in state["tasks"] if task.get("status") == "通过"]
+    qa_report = state.get("qa_report", {})
+    lead_decision = state.get("lead_decision", {})
+    status_label = "通过" if accepted else "未通过"
+    task_rows = "\n".join(
+        f"| {task.get('id', '')} | {roster_name(task.get('assignee_roster', 0))} | "
+        f"{str(task.get('title', '')).replace('|', '/')} | {task.get('status', '未知')} |"
+        for task in state["tasks"]
+    ) or "| — | — | 没有任务 | — |"
+    outstanding = [task for task in state["tasks"] if task.get("status") != "通过"]
+    if outstanding:
+        next_steps = "\n".join(f"- 补齐或返工 {task.get('id', '')}：{task.get('title', '')}（当前状态：{task.get('status', '未知')}）。"
+                                for task in outstanding)
+    elif not accepted:
+        next_steps = "- 修复最终产物的未通过检查，并在同一候选版本上重新完成 QA 与主管复核。"
     else:
-        set_state(QA, "working", "缺陷修复完毕，直接回归")
-        await pause(0.8)
-    return {"tasks": state["tasks"]}
+        next_steps = "- 记录本轮验收证据，并按计划继续下一轮工作。"
+    final_rows = "\n".join(
+        f"- {artifact.get('title', artifact.get('kind', '产物'))}：{artifact.get('quality_status', '未知')}；"
+        f"{'降级' if artifact.get('degraded') else '未标记降级'}"
+        for artifact in finals
+    ) or "- 没有已登记的最终产物。"
+    summary_text = (
+        f"验收状态：{status_label}。通过任务 {len(done)}/{len(state['tasks'])}。"
+        f"QA 状态：{qa_report.get('status', '未记录')}；主管复核状态：{lead_decision.get('status', '未记录')}。"
+    )
+    markdown = (
+        "# Sprint 复盘总结\n\n"
+        f"## 需求\n\n{state['requirement']}\n\n"
+        "## 验收结论\n\n"
+        f"- 最终交付验收：{status_label}\n"
+        f"- 通过任务：{len(done)}/{len(state['tasks'])}\n"
+        f"- QA：{qa_report.get('status', '未记录')}\n"
+        f"- 主管复核：{lead_decision.get('status', '未记录')}\n\n"
+        "## 任务结果\n\n| 编号 | 负责人 | 任务 | 状态 |\n|---|---|---|---|\n"
+        f"{task_rows}\n\n## 最终产物\n\n{final_rows}\n\n"
+        f"## 下一步\n\n{next_steps}\n"
+    )
+    return summary_text, markdown
 
 
 async def wrapup(state: SprintState) -> dict:
-    """敏捷教练：复盘收尾。先庆祝并宣告完成（人物转空闲），复盘文档后台生成后补推，
-    避免「产物已交付、人还在忙」的进度错位。"""
+    """Close the run and create a factual retrospective from stored evidence."""
     done = [t for t in state["tasks"] if t["status"] == "通过"]
+    finals = [a for a in artifacts_store if a.get("kind") == "final"]
+    accepted = bool(finals) and all(not a.get("degraded") and a.get("quality_status") == "passed" for a in finals)
+    pending_checks = bool(finals) and not any(a.get("degraded") or a.get("quality_status") == "failed" for a in finals) and not accepted
     set_stage("复盘收尾")
 
     # 1) 立即收尾：庆祝 → 全员空闲 → 完成信号（前端播提示音、弹气泡）
     await speak(
         SM,
         PO,
-        f"Sprint 完成，共交付 {len(done)} 个任务，团队表现不错",
-        f"Sprint 完成！共交付 {len(done)} 个任务",
+        f"本轮迭代结束，{len(done)} 个任务通过；最终交付{'通过质检' if accepted else '仍需修正'}，请复盘问题与下一步",
+        f"迭代结束：{len(done)} 个任务通过，交付{'通过质检' if accepted else '待修正'}",
     )
-    emote(SM, "emotes/hooray", "庆祝")
+    if accepted:
+        emote(SM, "emotes/hooray", "庆祝")
     for no in (PO, DEV_BE, DEV_FE, QA, LEAD, SM):
         set_state(no, "idle", "等待新任务")
-    emit({"type": "sprint_done", "tasks": state["tasks"]})
+    emit({"type": "sprint_done", "tasks": state["tasks"], "accepted": accepted, "pending_checks": pending_checks})
 
-    # 2) 复盘文档后台生成：不阻塞完成信号，完成后经 artifact_new 推送到产物中心
+    # 2) Render a deterministic retrospective so failed work is never described
+    # as completed by a second unconstrained model call.
     set_state(SM, "working", "整理复盘文档")
-    summary = chat_json(
-        system=(
-            "你是敏捷教练，为刚结束的 Sprint 写一段 3 句话以内的复盘总结，"
-            "覆盖交付结果与团队协作亮点。输出 JSON：{\"summary\":\"...\"}"
-        ),
-        user=(
-            f"需求：{state['requirement']}；"
-            f"任务：{[{'id': t['id'], 'title': t['title'], 'status': t['status']} for t in state['tasks']]}"
-        ),
-        fallback=lambda: (
-            f"本轮 Sprint 交付 {len(done)}/{len(state['tasks'])} 个任务，"
-            "历经拆解、开发、测试与评审环节，团队协作顺畅。"
-        ),
-        temperature=0.7,
-        max_tokens=200,
-        roster=SM,
-    )
-    summary_text = ""
-    if isinstance(summary, dict):
-        summary_text = str(summary.get("summary", "")).strip()
-    if not summary_text:
-        summary_text = (
-            f"本轮 Sprint 交付 {len(done)}/{len(state['tasks'])} 个任务，"
-            "历经拆解、开发、测试与评审环节，团队协作顺畅。"
-        )
-
-    summary_spec = (
-        f"生成一份《Sprint 复盘总结》Word 文档。需求：{state['requirement']}。"
-        f"交付情况：{len(done)}/{len(state['tasks'])} 个任务通过。"
-        f"复盘总结：{summary_text}。"
-        "文档须包含：1.Sprint 概览（需求/交付数/周期）、2.交付清单表格、3.亮点与不足、4.下轮改进建议。"
-    )
+    summary_text, summary_markdown = retrospective_content(state, accepted, finals)
     summary_file = await asyncio.to_thread(
-        forge.forge_file, "docx", summary_spec, "Sprint复盘总结.docx", SM
+        forge.render_docx_from_markdown, summary_markdown, "Sprint复盘总结.docx"
     )
     add_artifact(
         kind="summary",
         title="Sprint 复盘总结",
+        source="system",
         author_roster=SM,
         content=(
             f"# Sprint 复盘总结\n\n"
             f"- 需求：{state['requirement']}\n"
             f"- 交付：{len(done)}/{len(state['tasks'])} 个任务\n\n"
-            f"{summary_text}"
+            f"{summary_text}\n\n{summary_markdown}"
             + (f"\n\n真实文件：{summary_file}" if summary_file else "")
         ),
         file_name=summary_file,
@@ -790,7 +1147,7 @@ async def wrapup(state: SprintState) -> dict:
         regen={
             "mode": "forge",
             "file_kind": "docx",
-            "spec": summary_spec,
+            "spec": summary_markdown,
             "filename": "Sprint复盘总结.docx",
             "roster": SM,
         },
@@ -799,24 +1156,49 @@ async def wrapup(state: SprintState) -> dict:
     return {"tasks": state["tasks"]}
 
 
-def _zip_code_dir() -> str | None:
+def _zip_code_dir(requirement: str) -> str | None:
     """把本次 Sprint 的代码目录打成 zip，返回相对 deliverables 的文件名"""
-    files = [p for p in Path(forge.CODE_DIR).rglob("*") if p.is_file()]
+    project_root = Path(forge.selected_project())
+    files = [p for p in project_root.rglob("*") if p.is_file()]
     if not files:
         return None
-    zip_name = forge._unique_name("sprint-code.zip")
-    zip_path = os.path.join(forge.DELIVERABLES_DIR, zip_name)
+    zip_name = forge._unique_name(forge.semantic_filename(requirement, "zip", "代码项目"))
+    zip_path = forge.output_path(zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in files:
-            zf.write(p, os.path.relpath(p, forge.CODE_DIR))
+            zf.write(p, os.path.relpath(p, project_root))
+    import artifact_quality
+    artifact_quality.save_report(zip_path, forge.WORKSPACE_DIR, forge.project_report())
     return zip_name
 
 
-async def deliver(state: SprintState) -> dict:
-    """交付环节：把老板要的最终成品做出来（内容类=成品文件，软件类=代码包说明）"""
+def _sha256_file(file_name: str | None) -> str:
+    path = forge.safe_deliverable_path(file_name) if file_name else None
+    if not path:
+        return ""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def candidate(state: SprintState) -> dict:
+    """Build one traceable candidate before QA and LEAD see the file."""
     kind = state.get("deliver_kind", "code") or "code"
     tasks = state["tasks"]
-    set_stage("交付成品")
+    set_stage("形成候选成品")
+    sprint_id = sprint_meta.get("id", "")
+    if sprint_id and storage.get_sprint(sprint_id):
+        contribution_issues = contributions.integrity_issues(
+            sprint_id, [t["id"] for t in tasks if t.get("assignee_roster") in (DEV_BE, DEV_FE) and t["status"] != "已取消"]
+        )
+        if contribution_issues:
+            add_artifact(kind="candidate", title="贡献缺失或冲突，无法整合", author_roster=SM,
+                         source="fallback", quality_status="failed",
+                         content=json.dumps(contribution_issues, ensure_ascii=False, indent=2),
+                         degraded=True, degraded_reason="真实贡献缺失、已改动或接口冲突")
+            return {"tasks": tasks}
 
     if kind == "code":
         files = [p for p in Path(forge.CODE_DIR).rglob("*") if p.is_file()]
@@ -825,31 +1207,31 @@ async def deliver(state: SprintState) -> dict:
         added: list[str] = []
         if files:
             added = await asyncio.to_thread(forge.finalize_project, state["requirement"])
-            files = [p for p in Path(forge.CODE_DIR).rglob("*") if p.is_file()]
-        # 真实代码包：始终打包并挂到最终产物，用户可直接下载
-        zip_name = await asyncio.to_thread(_zip_code_dir) if files else None
-        saved_note = ""
-        target_dir = forge.extract_target_dir(state["requirement"])
-        if target_dir and zip_name:
-            dest = await asyncio.to_thread(forge.copy_to_target, zip_name, target_dir)
-            saved_note = (
-                f"\n\n📁 代码包已按你的要求保存到：{dest}"
-                if dest
-                else f"\n\n⚠ 保存到「{target_dir}」失败：目录不可写或不存在，代码包仍可在产物中心下载"
-            )
+            files = [p for p in Path(forge.selected_project()).rglob("*") if p.is_file()]
+            names = "、".join(p.name for p in files[:8]) or "（无）"
+            report = forge.project_report()
+            check_failures = [c["detail"] for c in report["checks"] if c["ok"] is False]
+        else:
+            report = {"status": "failed"}
+        # 代码项目在 QA 前整合、打包；后续发布复用同一字节。
+        zip_name = await asyncio.to_thread(_zip_code_dir, state["requirement"]) if files else None
         check_note = (
             "\n\n## 可运行性检查\n\n"
             + (
-                "✅ Python/JS 语法检查全部通过"
+                forge.self_check_note(report) if report.get("checks") else "未完成项目验收"
                 if not check_failures
                 else "⚠️ 以下文件未通过语法检查：\n"
                 + "\n".join(f"- `{item}`" for item in check_failures[:8])
             )
-            + ("\n\n已自动补充：`README.md`、`requirements.txt`" if added else "")
+            + ("\n\n已整合项目入口、依赖和测试文件。" if added else "")
         )
-        add_artifact(
-            kind="final",
-            title=f"最终交付物 · 代码包（{len(files)} 个文件）",
+        candidate_hash = _sha256_file(zip_name)
+        source_refs = [t.get("contribution_ref") for t in tasks if t.get("contribution_ref")]
+        candidate_artifact = add_artifact(
+            kind="candidate",
+            title=f"候选成品 · 代码包（{len(files)} 个文件）",
+            source="fallback" if any(a.get("source") == "fallback" for a in artifacts_store) else "model",
+            quality_status="unchecked" if zip_name else "failed",
             author_roster=LEAD,
             content=(
                 f"# 最终交付物\n\n"
@@ -858,7 +1240,7 @@ async def deliver(state: SprintState) -> dict:
                 f"- 文件：{names}\n"
                 f"- README：{'已生成' if 'README.md' in added else '未生成'}"
                 f"{check_note}"
-            ) + saved_note,
+            ),
             file_name=zip_name,
             degraded=not zip_name or bool(check_failures),
             degraded_reason=(
@@ -866,22 +1248,33 @@ async def deliver(state: SprintState) -> dict:
                 if zip_name and not check_failures
                 else ("未产出可打包的代码文件" if not zip_name else "部分代码未通过语法检查")
             ),
-            regen={"mode": "code", "target_dir": target_dir or ""},
+            regen={"mode": "candidate", "file_kind": "code", "sha256": candidate_hash,
+                   "requirement_ids": [c["requirement_id"] for c in state.get("requirement_contract", {}).get("requirements", [])],
+                   "contribution_refs": source_refs, "source_structure": added,
+                   "project_dir": forge.selected_project()},
         )
-        set_state(LEAD, "working", "打包交付代码")
+        if zip_name and not check_failures:
+            from artifacts import update_artifact
+            update_artifact(candidate_artifact["id"], quality_status="unchecked")
+        _offer_candidate_to_qa(sprint_id, state, candidate_artifact["id"], candidate_hash)
+        set_state(SM, "working", "整合候选代码")
         await pause(1.0)
-        return {"tasks": tasks}
+        return {"tasks": tasks, "candidate_id": candidate_artifact["id"], "candidate_sha256": candidate_hash}
 
     set_state(SM, "working", "整合最终成品文件")
     await pause(1.0)
 
-    # 汇总本 Sprint 全员实际产出（PRD/开发说明/测试报告/评审记录），
-    # 让最终成品基于团队真实工作成果汇编，而不是凭空重写
+    # 直接读取完整贡献源文件，避免过程产物预览截断后再次猜写。
     team_parts: list[str] = []
-    for a in artifacts_store:
-        if a.get("kind") in ("prd", "dev", "test", "review"):
-            team_parts.append(f"【{a['title']}】\n{a['content'][:1500]}")
-    team_digest = "\n\n".join(team_parts)[:6000]
+    for t in tasks:
+        if t.get("assignee_roster") not in (DEV_BE, DEV_FE):
+            continue
+        valid, _, manifest = contributions.inspect(sprint_id, t["id"])
+        if not valid or manifest.get("kind") != "text":
+            continue
+        source = Path(manifest["files"][0]["path"]).read_text(encoding="utf-8")
+        team_parts.append(f"【{roster_label(t['assignee_roster'])} · {t['id']} · 来源 {manifest['source_refs']}】\n{source}")
+    team_digest = "\n\n".join(team_parts)[:40000]
     tasks_digest = "、".join(
         f"{t['id']} {t['title']}（{t['status']}）" for t in tasks
     )
@@ -906,8 +1299,10 @@ async def deliver(state: SprintState) -> dict:
             "而不是描述怎么做或给模板。"
         )
     spec += drain_instructions()
+    generation_meta = {}
     final_file = await asyncio.to_thread(
-        forge.forge_file, kind, spec, f"最终交付物.{kind}", SM
+        forge.forge_file, kind, spec, forge.semantic_filename(state["requirement"], kind, "最终交付物"),
+        SM, generation_meta,
     )
     preview = (
         await asyncio.to_thread(forge.extract_preview, final_file)
@@ -920,25 +1315,18 @@ async def deliver(state: SprintState) -> dict:
     if final_file:
         check = await asyncio.to_thread(forge.self_check, final_file, kind)
         check_note = forge.self_check_note(check)
-        check_failed = not check.get("ok", False)
-    # 用户在需求中指定保存位置时，把成品复制过去（如「生成word放在D:\资料」）
-    saved_note = ""
-    target_dir = forge.extract_target_dir(state["requirement"])
-    if target_dir and final_file:
-        dest = await asyncio.to_thread(forge.copy_to_target, final_file, target_dir)
-        saved_note = (
-            f"\n\n📁 已按你的要求保存到：{dest}"
-            if dest
-            else f"\n\n⚠ 保存到「{target_dir}」失败：目录不可写或不存在，成品仍可在产物中心下载"
-        )
-    add_artifact(
-        kind="final",
-        title=f"最终交付物 · {state['requirement'][:20]}",
+        check_failed = check.get("status", "failed" if not check.get("ok") else "passed") == "failed"
+    candidate_hash = _sha256_file(final_file)
+    candidate_artifact = add_artifact(
+        kind="candidate",
+        title=f"候选成品 · {state['requirement'][:20]}",
+        source="fallback" if any(a.get("source") == "fallback" for a in artifacts_store) else "model",
+        quality_status="unchecked" if final_file and not check_failed else "failed",
         author_roster=SM,
         content=(
             preview
             or f"需求：{state['requirement']}\n\n成品文件：{final_file or '生成失败，请查看过程产物或重试'}"
-        ) + saved_note + check_note,
+        ) + check_note,
         file_name=final_file,
         degraded=not final_file or check_failed,
         degraded_reason=(
@@ -950,16 +1338,117 @@ async def deliver(state: SprintState) -> dict:
                 else "成品自检未全部通过，成品可能不完整，建议重新生成"
             )
         ),
-        regen={
-            "mode": "forge",
-            "file_kind": kind,
-            "spec": spec,
-            "filename": f"最终交付物.{kind}",
-            "roster": SM,
-            "target_dir": target_dir or "",
-        },
+        regen={"mode": "candidate", "file_kind": kind, "sha256": candidate_hash,
+               "generation_model": generation_meta.get("model"),
+               "generation_primary_model": generation_meta.get("primary_model"),
+               "generation_fallback_roster": generation_meta.get("fallback_roster"),
+               "requirement_ids": [c["requirement_id"] for c in state.get("requirement_contract", {}).get("requirements", [])],
+               "contribution_refs": [t.get("contribution_ref") for t in tasks if t.get("contribution_ref")],
+               "source_structure": [t["id"] for t in tasks if t.get("contribution_ref")]},
     )
-    emote(SM, "emotes/hooray", "成品交付")
+    # The file report describes structure only. QA/LEAD have not reviewed it.
+    if final_file and not check_failed:
+        from artifacts import update_artifact
+        update_artifact(candidate_artifact["id"], quality_status="unchecked")
+    companions = []
+    if kind == "docx" and final_file and "pdf" in state["requirement"].lower() and any(
+        word in state["requirement"].lower() for word in ("word", "docx")
+    ):
+        pdf_file = await asyncio.to_thread(forge.pdf_from_docx, final_file, "同源报告.pdf")
+        pdf_hash = _sha256_file(pdf_file)
+        pdf_artifact = add_artifact(
+            kind="candidate", title="同源 PDF 候选", author_roster=SM,
+            content=f"由 Word 候选 {candidate_artifact['id']} 直接导出；Word SHA-256：{candidate_hash}",
+            file_name=pdf_file, quality_status="unchecked" if pdf_file else "failed",
+            degraded=not bool(pdf_file), degraded_reason="Word 同源 PDF 转换失败" if not pdf_file else "",
+            parent_id=candidate_artifact["id"],
+            regen={"mode": "candidate", "file_kind": "pdf", "sha256": pdf_hash,
+                   "source_candidate_id": candidate_artifact["id"], "source_sha256": candidate_hash,
+                   "requirement_ids": [c["requirement_id"] for c in state.get("requirement_contract", {}).get("requirements", [])],
+                   "contribution_refs": [t.get("contribution_ref") for t in tasks if t.get("contribution_ref")]},
+        )
+        if pdf_file:
+            from artifacts import update_artifact
+            update_artifact(pdf_artifact["id"], quality_status="unchecked")
+        companions.append({"id": pdf_artifact["id"], "sha256": pdf_hash})
+    _offer_candidate_to_qa(sprint_id, state, candidate_artifact["id"], candidate_hash, companions)
+    return {"tasks": tasks, "candidate_id": candidate_artifact["id"],
+            "candidate_sha256": candidate_hash, "companion_candidates": companions}
+
+
+async def publish(state: SprintState) -> dict:
+    """Publish the already inspected bytes; never generate a second document."""
+    set_stage("发布或保留候选")
+    tasks = state["tasks"]
+    candidate_id = state.get("candidate_id", "")
+    item = storage.get_artifact(candidate_id) if candidate_id else None
+    expected = state.get("candidate_sha256", "")
+    unresolved = [t for t in tasks if t["status"] not in ("通过", "已取消")]
+    qa_report = state.get("qa_report", {})
+    lead_decision = state.get("lead_decision", {})
+    companion_expected = [entry["sha256"] for entry in state.get("companion_candidates", [])]
+    same_version = (qa_report.get("candidate_sha256") == expected
+                    and lead_decision.get("candidate_sha256") == expected
+                    and qa_report.get("companion_hashes", []) == companion_expected
+                    and lead_decision.get("companion_hashes", []) == companion_expected)
+    verified = (same_version and state.get("requirement_contract", {}).get("status") == "ready"
+                and qa_report.get("status") == "passed" and lead_decision.get("status") == "passed")
+    current = _sha256_file(item.get("file_name")) if item and item.get("file_name") else ""
+    companion_items = []
+    for entry in state.get("companion_candidates", []):
+        extra = storage.get_artifact(entry["id"]) or next((a for a in artifacts_store if a.get("id") == entry["id"]), None)
+        companion_items.append((extra, entry["sha256"]))
+    companions_valid = all(extra and extra.get("file_name") and not extra.get("degraded")
+                           and _sha256_file(extra["file_name"]) == digest for extra, digest in companion_items)
+    if not item or not current or current != expected or not companions_valid or (unresolved and lead_decision.get("status") == "failed") or item.get("degraded"):
+        reasons = []
+        if unresolved:
+            reasons.append("仍有任务未通过：" + "、".join(t["id"] for t in unresolved))
+        if not item or not current:
+            reasons.append("候选文件缺失")
+        elif current != expected:
+            reasons.append("候选文件 SHA-256 已变化，旧检查失效")
+        if item and item.get("degraded"):
+            reasons.append("候选成品生成或结构检查失败")
+        if not companions_valid:
+            reasons.append("同源附属候选缺失或 SHA-256 已变化")
+        add_artifact(kind="final", title="交付待修正", author_roster=SM,
+                     source="fallback", quality_status="failed", degraded=True,
+                     degraded_reason="；".join(reasons), content="；".join(reasons))
+        return {"tasks": tasks}
+    published = add_artifact(
+        kind="final", title=f"{'正式交付' if verified else '待验证交付'} · {state['requirement'][:20]}",
+        author_roster=SM, source=item.get("source", "model"),
+        content=item.get("content", "") + f"\n\n候选 SHA-256：{expected}\nQA：{qa_report.get('status', 'unchecked')}；LEAD：{lead_decision.get('status', 'unchecked')}。",
+        file_name=item["file_name"], quality_status="passed" if verified else "unchecked",
+        parent_id=candidate_id, version=item.get("version", 1),
+        regen={"mode": "published_candidate", "candidate_id": candidate_id, "sha256": expected},
+    )
+    actual = _sha256_file(published.get("file_name"))
+    from artifacts import update_artifact
+    if actual != expected:
+        update_artifact(published["id"], quality_status="failed", degraded=True,
+                        degraded_reason="发布后的文件 SHA-256 与候选不一致")
+    else:
+        update_artifact(published["id"], quality_status="passed" if verified else "unchecked")
+        target_dir = forge.extract_target_dir(state["requirement"])
+        if target_dir:
+            await asyncio.to_thread(forge.copy_to_target, published["file_name"], target_dir)
+        for extra, digest in companion_items:
+            published_extra = add_artifact(
+                kind="final", title=f"{'正式交付' if verified else '待验证交付'} · PDF",
+                author_roster=SM, content=f"与 Word 候选同源；PDF SHA-256：{digest}",
+                file_name=extra["file_name"], quality_status="passed" if verified else "unchecked",
+                source=extra.get("source", "model"), parent_id=extra["id"], version=extra.get("version", 1),
+                regen={"mode": "published_candidate", "candidate_id": extra["id"], "sha256": digest},
+            )
+            if _sha256_file(published_extra["file_name"]) != digest:
+                update_artifact(published_extra["id"], quality_status="failed", degraded=True,
+                                degraded_reason="PDF 发布字节与候选不一致")
+            else:
+                update_artifact(published_extra["id"], quality_status="passed" if verified else "unchecked")
+                if target_dir:
+                    await asyncio.to_thread(forge.copy_to_target, published_extra["file_name"], target_dir)
     return {"tasks": tasks}
 
 
@@ -971,28 +1460,34 @@ def route_review(state: SprintState) -> str:
     return "approved"
 
 
+def route_fix(state: SprintState) -> str:
+    return "blocked" if state.get("repair_blocked") else "retest"
+
+
 def build_sprint_graph():
     graph = StateGraph(SprintState)
     graph.add_node("kickoff", kickoff)
     graph.add_node("assign", assign)
     graph.add_node("develop", develop)
+    graph.add_node("candidate", candidate)
     graph.add_node("test", test)
     graph.add_node("review", review)
     graph.add_node("fix", fix)
-    graph.add_node("deliver", deliver)
+    graph.add_node("publish", publish)
     graph.add_node("wrapup", wrapup)
 
     graph.add_edge(START, "kickoff")
     graph.add_edge("kickoff", "assign")
     graph.add_edge("assign", "develop")
-    graph.add_edge("develop", "test")
+    graph.add_edge("develop", "candidate")
+    graph.add_edge("candidate", "test")
     graph.add_edge("test", "review")
     graph.add_conditional_edges(
         "review",
         route_review,
-        {"rework": "fix", "approved": "deliver"},
+        {"rework": "fix", "approved": "publish"},
     )
-    graph.add_edge("fix", "test")
-    graph.add_edge("deliver", "wrapup")
+    graph.add_conditional_edges("fix", route_fix, {"retest": "test", "blocked": "publish"})
+    graph.add_edge("publish", "wrapup")
     graph.add_edge("wrapup", END)
     return graph.compile()

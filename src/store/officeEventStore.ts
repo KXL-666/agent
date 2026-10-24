@@ -5,6 +5,8 @@ export type OfficeNotification = {
   kind: string
   text: string
   time: string
+  title?: string
+  detail?: string
 }
 
 const NOTIFICATION_LIMIT = 100
@@ -39,7 +41,11 @@ export function getUnreadSnapshot(): number {
 }
 
 /** 通知一条事件（角标 +1；重复内容 3 秒内去重，避免刷屏） */
-export function recordNotification(text: string, kind: string) {
+export function recordNotification(
+  text: string,
+  kind: string,
+  record?: { title?: string; detail?: string },
+) {
   if (!text) return
   const last = items[0]
   if (last && last.text === text && Date.now() - Number(last.id.split('-')[0]) < 3000) {
@@ -51,6 +57,8 @@ export function recordNotification(text: string, kind: string) {
       kind,
       text,
       time: nowTime(),
+      title: record?.title,
+      detail: record?.detail,
     },
     ...items,
   ].slice(0, NOTIFICATION_LIMIT)
@@ -72,12 +80,14 @@ export function clearNotifications() {
 }
 
 /** 刷新/重连后用后端持久化的事件恢复通知列表（不计未读，避免历史刷屏） */
-export function restoreNotifications(entries: { text: string; kind: string; time: string }[]) {
+export function restoreNotifications(entries: { text: string; kind: string; time: string; title?: string; detail?: string }[]) {
   items = entries.slice(0, NOTIFICATION_LIMIT).map((entry, index) => ({
     id: `restored-${index}-${entry.time}`,
     kind: entry.kind,
     text: entry.text,
     time: entry.time,
+    title: entry.title,
+    detail: entry.detail,
   }))
   unread = 0
   notify()

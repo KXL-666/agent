@@ -93,7 +93,7 @@ def emit(event: dict) -> None:
             print(f"[Events] 任务落库失败：{error}")
     # 关键事件落库：刷新/重连后可恢复通知与时间线
     try:
-        storage.add_event(sprint_meta.get("id", ""), event)
+        storage.add_event(event.get("sprint_id") or sprint_meta.get("id", ""), event)
     except Exception as error:  # noqa: BLE001
         print(f"[Events] 事件落库失败：{error}")
     asyncio.ensure_future(broadcast(event))

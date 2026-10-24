@@ -87,7 +87,7 @@ def _render_demo_xlsx() -> str | None:
         for col, width in zip("ABCDE", (10, 30, 12, 10, 10)):
             ws.column_dimensions[col].width = width
         filename = forge._unique_name("任务进度表（演示）.xlsx")
-        wb.save(os.path.join(forge.DELIVERABLES_DIR, filename))
+        wb.save(forge.output_path(filename))
         return filename
     except Exception as error:  # noqa: BLE001
         print(f"[Demo] Excel 生成失败：{error}")
@@ -143,10 +143,12 @@ async def run_demo_sprint() -> None:
     add_artifact(
         kind="prd",
         title="需求拆解文档（PRD·演示）",
+        source="demo",
         author_roster=PO,
         content=prd_md + (f"\n\n真实文件：{prd_file}" if prd_file else ""),
         file_name=prd_file,
         degraded=not prd_file,
+        quality_status="failed" if not prd_file else "unchecked",
         degraded_reason="" if prd_file else "Word 文件生成失败，当前仅为 Markdown 摘要",
     )
 
@@ -181,6 +183,7 @@ async def run_demo_sprint() -> None:
         add_artifact(
             kind="dev",
             title=f"开发说明 · {t['title']}",
+            source="demo",
             author_roster=no,
             content=(
                 f"# 开发说明 · {t['title']}\n\n"
@@ -209,6 +212,7 @@ async def run_demo_sprint() -> None:
     add_artifact(
         kind="test",
         title="测试报告（第 1 轮·演示）",
+        source="demo",
         author_roster=QA,
         content=(
             "# 测试报告（第 1 轮·演示）\n\n- 结论：通过\n- 说明：演示脚本全部用例通过\n"
@@ -216,6 +220,7 @@ async def run_demo_sprint() -> None:
         ),
         file_name=xlsx_file,
         degraded=not xlsx_file,
+        quality_status="failed" if not xlsx_file else "unchecked",
         degraded_reason="" if xlsx_file else "Excel 测试报告生成失败，当前仅为文字汇总",
     )
     await _beat(0.8)
@@ -227,6 +232,7 @@ async def run_demo_sprint() -> None:
     add_artifact(
         kind="review",
         title="内容评审记录（演示）",
+        source="demo",
         author_roster=LEAD,
         content="# 内容评审记录（演示）\n\n- 结论：通过\n- 意见：周报结构完整、数据齐备，同意交付",
     )
@@ -242,10 +248,12 @@ async def run_demo_sprint() -> None:
     add_artifact(
         kind="final",
         title="最终交付物 · 项目周报（演示）",
+        source="demo",
         author_roster=SM,
         content=_WEEKLY_REPORT_MD + (f"\n\n真实文件：{final_file}" if final_file else ""),
         file_name=final_file,
         degraded=not final_file,
+        quality_status="failed" if not final_file else "unchecked",
         degraded_reason="" if final_file else "Word 成品生成失败，当前仅为内容摘要",
     )
     bus.emit({"type": "emote", "rosterNo": SM, "animation": "emotes/hooray", "label": "成品交付"})
@@ -256,6 +264,7 @@ async def run_demo_sprint() -> None:
     add_artifact(
         kind="summary",
         title="Sprint 复盘总结（演示）",
+        source="demo",
         author_roster=SM,
         content=(
             "# Sprint 复盘总结（演示）\n\n"

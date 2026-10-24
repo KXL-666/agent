@@ -24,6 +24,28 @@ let initialized = false
 const EMPTY_THREAD: ChatMessage[] = []
 
 const listeners = new Set<() => void>()
+let pendingRosters: readonly number[] = []
+const controllers = new Map<number, AbortController>()
+
+export function getPendingRosters() { return pendingRosters }
+
+export function beginChat(roster: number): AbortController | null {
+  if (controllers.has(roster)) return null
+  const controller = new AbortController()
+  controllers.set(roster, controller)
+  pendingRosters = [...controllers.keys()]
+  notify()
+  return controller
+}
+
+export function finishChat(roster: number) {
+  controllers.delete(roster)
+  pendingRosters = [...controllers.keys()]
+  persist()
+  notify()
+}
+
+export function abortChat(roster: number) { controllers.get(roster)?.abort() }
 
 function restore() {
   if (initialized) return

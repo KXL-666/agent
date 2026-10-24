@@ -108,14 +108,8 @@ export const AGENT_ROSTER: AgentRosterEntry[] = [
   },
 ]
 
-const BOOT_STATES: AgentState[] = [
-  'working',
-  'working',
-  'working',
-  'working',
-  'working',
-  'working',
-]
+// 没有活跃 Sprint 时，团队从空闲开始；真实任务状态由后端事件驱动。
+const BOOT_STATES: AgentState[] = ['idle', 'idle', 'idle', 'idle', 'idle', 'idle']
 
 function buildInitialAgents(): Agent[] {
   return AGENT_ROSTER.map((entry, i) => {

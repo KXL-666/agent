@@ -231,6 +231,18 @@ export function captureOfficeScreenshot(): string | null {
 
 export function setAgentState(agentId: string, state: AgentState, task?: string) {
   if (!scene) {
+    setOfficeAgents(
+      getOfficeAgents().map((agent) =>
+        agent.id === agentId ? { ...agent, state, currentTask: task } : agent,
+      ),
+    )
+    // 同一成员只保留最新状态，避免场景稍后挂载时重放过期状态。
+    for (let i = pendingActions.length - 1; i >= 0; i--) {
+      const action = pendingActions[i]!
+      if (action.kind === 'set_state' && action.agentId === agentId) {
+        pendingActions.splice(i, 1)
+      }
+    }
     pendingActions.push({
       kind: 'set_state',
       agentId,

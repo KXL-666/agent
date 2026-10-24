@@ -6,7 +6,6 @@ import {
   AGENT_ROSTER,
   COLORS,
   DESKS,
-  INITIAL_AGENTS,
   pickHandoffVisitMessage,
   SCENE_HEIGHT,
   SCENE_WIDTH,
@@ -25,7 +24,7 @@ import {
   hasPendingVisitQueue,
   notifyVisitMissionActivity,
 } from '@/services/officeActionDispatcher'
-import { setOfficeAgents } from '@/store/officeStore'
+import { getOfficeAgents, setOfficeAgents } from '@/store/officeStore'
 import {
   getOfficeBackgroundTexture,
   loadOfficeAssets,
@@ -114,8 +113,9 @@ export class OfficeScene {
   private animation = new AnimationSystem()
   private simulator = new OfficeSimulator()
 
-  private agents: Agent[] = INITIAL_AGENTS.map((a) => ({ ...a }))
+  private agents: Agent[] = getOfficeAgents().map((a) => ({ ...a }))
   private paused = false
+  private pausedAgentStates = new Map<string, { state: AgentState; currentTask?: string }>()
   private autoWorkflowTimer = 0.8
   private autoWorkflowIndex = 0
   private readonly options: {
@@ -308,6 +308,7 @@ export class OfficeScene {
   setAgentState(id: string, state: AgentState, task?: string) {
     const current = this.agents.find((a) => a.id === id)
     if (!current) return
+    if (this.paused) this.pausedAgentStates.set(id, { state, currentTask: task })
 
     // 离座小人：先走回座位，到位后再落入目标状态（避免被钉座位瞬移）
     if (!isHomeDeskSeat(current.assignedDeskId, current.x, current.y)) {
@@ -366,11 +367,17 @@ export class OfficeScene {
     entity.setSkin(skin)
   }
 
-  /** 全局暂停/继续：暂停时所有无行程的小人每帧强制空闲，继续时恢复工作 */
+  /** 全局暂停/继续：暂停时暂存角色状态，继续时恢复暂停前的状态 */
   setPaused(paused: boolean) {
     if (this.paused === paused) return
     this.paused = paused
     if (paused) {
+      this.pausedAgentStates = new Map(
+        this.agents.map((agent): [string, { state: AgentState; currentTask?: string }] => [
+          agent.id,
+          { state: agent.state, currentTask: agent.currentTask },
+        ]),
+      )
       this.agents = this.agents.map((agent) =>
         agent.mission
           ? agent
@@ -383,15 +390,14 @@ export class OfficeScene {
             },
       )
     } else {
-      this.agents = this.agents.map((agent, index) =>
-        agent.mission
-          ? agent
-          : {
-              ...agent,
-              state: 'working' as const,
-              currentTask: AGENT_ROSTER[index]?.task ?? '处理当前任务',
-            },
-      )
+      this.agents = this.agents.map((agent) => {
+        if (agent.mission) return agent
+        const previous = this.pausedAgentStates.get(agent.id)
+        return previous
+          ? { ...agent, state: previous.state, currentTask: previous.currentTask }
+          : { ...agent, state: 'idle' as const, currentTask: undefined }
+      })
+      this.pausedAgentStates.clear()
     }
     setOfficeAgents(this.agents)
     this.pushDataToEntities()
