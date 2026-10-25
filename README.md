@@ -14,8 +14,6 @@
 
 > A web-based visualization of a multi-agent AI team collaborating on a full Scrum Sprint. Six AI roles (PM, Frontend, Backend, QA, Tech Lead, Scrum Master) work together in a pixel-art office, producing real deliverables (Word / PPT / Excel / code bundles).
 
-![preview](docs/page-preview.jpeg)
-
 ---
 
 ## ✨ 核心亮点
@@ -49,7 +47,7 @@
 
 Windows 新环境可运行 `powershell -File scripts/setup-artifact-runtime.ps1` 准备 Python 与 Office/PDF 依赖。已有 Office 可用 `OFFICE_SOFFICE` 指定程序路径；Linux/macOS 安装 LibreOffice 后也可使用。依赖和渲染缓存放在 `backend/workspace/`，不进入 Git；备份不打包工具安装目录。
 
-详细机制和实测范围见 [多格式产物质量引擎](docs/多格式产物质量引擎.md) 与 [固定质量样本记录](docs/生成质量基线样本.md)。固定集的改造后协作运行仍有失败和未验证项，不能据此宣称协作成品质量已经普遍提升。
+固定集的改造后协作运行仍有失败和未验证项，不能据此宣称协作成品质量已经普遍提升。
 
 ### 🔑 每个成员独立 LLM
 - 对话按成员独立管理请求、中断和草稿，回复期间可以切换并向其他成员发送消息
@@ -180,7 +178,6 @@ src/
   scene/           PixiJS 场景（角色、导航、动画系统、Spine）
   services/        WebSocket 客户端、动作分发
   store/           任务/产物/聊天等轻量 Zustand 状态
-docs/              README 用的截图素材
 scripts/           一键启动 / action-gateway 脚本
 ```
 
