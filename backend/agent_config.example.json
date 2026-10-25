@@ -1,0 +1,44 @@
+{
+  "1": {
+    "name": "王明",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "misaki",
+    "avatar": "🐲"
+  },
+  "2": {
+    "name": "李研",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "default",
+    "avatar": "🧑‍💻"
+  },
+  "3": {
+    "name": "周理",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "default",
+    "avatar": "🎨"
+  },
+  "4": {
+    "name": "陈书",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "default",
+    "avatar": "🔍"
+  },
+  "5": {
+    "name": "刘市",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "default",
+    "avatar": "🧭"
+  },
+  "6": {
+    "name": "赵审",
+    "llm": { "base_url": "", "model": "", "api_key": "" },
+    "llm_backup": { "base_url": "", "model": "", "api_key": "" },
+    "skin": "default",
+    "avatar": "📋"
+  }
+}

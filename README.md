@@ -142,6 +142,8 @@ npm run mobile
 
 > 不配置 API 也能体验演示回放：首页点「内置演示」即可。
 
+API Key 不入库：仓库里只有空白模板 [backend/agent_config.example.json](backend/agent_config.example.json)，需要时复制为 `backend/agent_config.json` 再填入你自己的 Key（或直接在界面里配，界面保存时会用 Windows DPAPI 加密落盘，换台机器无法解密，所以也不需要共享）。
+
 ### 4. 配置成员技能
 
 进入「技能中心」，新建技能或选择周报、代码审查、数据分析模板，填写适用场景与 Markdown 工作指令，勾选成员并启用后保存。也可以导入独立的 `SKILL.md`（支持 `name` / `description` frontmatter）或导出已有技能。
