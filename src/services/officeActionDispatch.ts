@@ -1,7 +1,7 @@
 import { isOfficePaused, playAgentEmote, setAgentState } from '@/scene/officeSceneBridge'
 import { submitVisitAction } from '@/services/officeActionDispatcher'
 import { notifySprintOutcome } from '@/services/officeNotify'
-import { playDoneSound } from '@/services/officeSound'
+import { playDoneSound, playTaskSound } from '@/services/officeSound'
 import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
 import {
   clearArtifacts,
@@ -13,7 +13,7 @@ import {
 } from '@/store/officeArtifactStore'
 import { clearNotifications, recordNotification, restoreNotifications } from '@/store/officeEventStore'
 import { getOfficeAgents } from '@/store/officeStore'
-import { showToast } from '@/store/officeUiStore'
+import { pulseArtifacts, showToast } from '@/store/officeUiStore'
 import {
   getViewedSprint,
   refreshSprintHistory,
@@ -297,6 +297,14 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
           task.acceptance_criteria?.length ? `验收标准：\n${task.acceptance_criteria.map((criterion) => `• ${criterion}`).join('\n')}` : '',
         ].filter(Boolean).join('\n')
         recordNotification(statusText, 'task_update', { title: '任务状态详情', detail: taskLines })
+        // 任务级结束提示：完成/打回时给一次轻量气泡与提示音，不必等整轮 Sprint 结束
+        if (task.status === '通过') {
+          playTaskSound()
+          showToast(`✅ 任务完成：「${task.title ?? task.id}」`, { kind: 'success' })
+        } else if (task.status === '打回') {
+          playTaskSound()
+          showToast(`↩ 「${task.title ?? task.id}」被打回，转交修复`)
+        }
       }
       return
     }
@@ -351,6 +359,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       void refreshSprintHistory()
       const recordKinds = new Set(['prd', 'dev', 'test', 'review', 'summary'])
       const record = recordKinds.has(artifact.kind)
+      // 成品落地就点亮左侧「交付」徽标，不必等整轮 Sprint 完全结束
+      if (!record) pulseArtifacts()
       const outcome = artifact.degraded
         ? `成品生成未成功，已保存失败说明：《${artifact.title}》`
         : !artifact.file_name && !record
@@ -382,6 +392,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       idleAllAgents()
       if (message.pending_checks === true) {
         applySprintMeta({ status: 'completed', stage: '交付待验证' })
+        playTaskSound()
+        pulseArtifacts()
         pushActivity('文件已生成，部分验收尚未执行，请查看验收详情')
         recordNotification('文件已生成，部分验收尚未执行', 'sprint_done', {
           title: '本轮验收状态', detail: finalQualityDetail(),
@@ -391,6 +403,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       }
       if (message.accepted === false) {
         applySprintMeta({ status: 'failed', stage: '交付待修正' })
+        playDoneSound()
+        pulseArtifacts()
         pushActivity('迭代已结束，交付未通过验收，请查看产物失败原因')
         recordNotification('交付待修正，请查看产物质检结果与复盘', 'sprint_error', {
           title: '验收失败详情', detail: finalQualityDetail(),
@@ -401,6 +415,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       }
       applySprintMeta({ status: 'completed', stage: '已完成' })
       playDoneSound()
+      pulseArtifacts()
       pushActivity('Sprint 完成，团队进入空闲')
       recordNotification('Sprint 完成，团队进入空闲', 'sprint_done', {
         title: '本轮交付结果', detail: finalQualityDetail(),
@@ -416,6 +431,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       setSprintRunning(false)
       applySprintMeta({ status: 'stopped', stage: '已手动结束' })
       idleAllAgents()
+      playTaskSound()
+      pulseArtifacts()
       pushActivity('任务已手动结束')
       recordNotification('任务已手动结束', 'sprint_done', {
         title: '结束时的交付状态', detail: finalQualityDetail(),
@@ -430,6 +447,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       const errorMessage = (message as { message?: unknown }).message
       const errorText = `Sprint 异常：${String(errorMessage ?? '未知错误')}`
       applySprintMeta({ status: 'failed' })
+      playDoneSound()
       pushActivity(errorText)
       recordNotification(errorText, 'sprint_error', {
         title: '错误详情', detail: String(errorMessage ?? '未知错误'),
@@ -454,6 +472,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       setSprintRunning(false)
       idleAllAgents()
       applySprintMeta({ status: 'completed', stage: '已达预算上限' })
+      playDoneSound()
       pushActivity(text)
       recordNotification(text, 'budget_exceeded', {
         title: '预算限制详情', detail: `当前需求：${getSprintMetaSnapshot().requirement || '未记录'}\n${text}`,

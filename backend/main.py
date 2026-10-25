@@ -150,8 +150,8 @@ async def preview_sprint_plan(req: SprintRequest):
     if req.execution_style == "quick" and (req.task_kind == "software" or _detect_file_kind(requirement) == "code"):
         raise HTTPException(400, "快速生成仅支持文件任务")
     direct = req.execution_style == "quick"
-    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf"):
-        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel 或 PDF")
+    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf", "html"):
+        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel、PDF 或 HTML")
     if req.execution_mode == "local" and not _local_model_ready():
         raise HTTPException(400, "本地模式需要先把所有已配置的主、备用模型 API 改为本机地址")
     uploads_by_id = {item["id"]: item for item in uploads.list_uploads()}
@@ -191,7 +191,7 @@ async def run_sprint(
                 raise RuntimeError("本地模式的模型配置已变更，已阻止后续模型调用")
             if stop_calls.is_set():
                 raise RuntimeError("本轮迭代已结束，停止后续模型调用")
-            if budget and llm.usage_total_cost() - baseline >= budget:
+            if budget and max(0.0, llm.usage_total_cost() - baseline) >= budget:
                 raise BudgetExceeded("已达到本轮预算，停止后续模型调用")
             if not bus.is_paused():
                 return
@@ -204,9 +204,9 @@ async def run_sprint(
         try:
             while True:
                 await asyncio.sleep(8)
-                cur_cost = round(
+                cur_cost = max(0.0, round(
                     llm.usage_total_cost() - sprint_meta["usage_baseline"], 4
-                )
+                ))
                 sprint_meta["cost"] = cur_cost
                 bus.emit(
                     {
@@ -367,8 +367,8 @@ async def start_sprint(req: SprintRequest):
     if req.execution_style == "quick" and (req.task_kind == "software" or _detect_file_kind(requirement) == "code"):
         raise HTTPException(400, "快速生成仅支持文件任务")
     direct_artifact = req.execution_style == "quick"
-    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf"):
-        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel 或 PDF")
+    if req.task_kind == "file" and _detect_file_kind(requirement) not in ("docx", "pptx", "xlsx", "pdf", "html"):
+        raise HTTPException(400, "文件任务请在需求中写明 Word、PPT、Excel、PDF 或 HTML")
 
     # 每轮 Sprint 独立入库，历史产物与代码不再被覆盖
     sprint_id = storage.create_sprint(requirement, budget=budget)
@@ -585,20 +585,32 @@ def _sprint_view(sprint_id: str | None) -> dict | None:
     return storage.get_sprint(sprint_id)
 
 
+def _active_round() -> dict:
+    """只有正在运行的 Sprint 才算「当前轮次」。
+
+    已结束的 Sprint 属于历史记录（可在「查看记录」里回看），
+    不能再回灌到新页面伪装成当前任务，否则用户一打开页面就会看到上一轮的旧任务与旧进度。
+    """
+    if running:
+        return {"tasks": tasks_store, "artifacts": artifacts_store, "sprint": sprint_meta}
+    return {"tasks": [], "artifacts": [], "sprint": {}}
+
+
 @app.get("/api/state")
 async def get_state():
-    sprint_id = sprint_meta.get("id")
+    sprint_id = sprint_meta.get("id") if running else None
     baseline = sprint_meta.get("usage_baseline") or 0.0
+    active = _active_round()
     return {
         "running": running,
         "paused": bus.is_paused(),
         "llm": llm_available(),
-        "tasks": tasks_store,
-        "artifacts": artifacts_store,
-        "sprint": sprint_meta,
+        "tasks": active["tasks"],
+        "artifacts": active["artifacts"],
+        "sprint": active["sprint"],
         "requirement_contract": (_sprint_view(sprint_id) or {}).get("contract", {}),
         "handoffs": storage.list_handoffs(sprint_id) if sprint_id else [],
-        "cost": round(llm.usage_total_cost() - baseline, 4) if running else 0,
+        "cost": max(0.0, round(llm.usage_total_cost() - baseline, 4)) if running else 0,
         "history": storage.list_sprints(20),
     }
 
@@ -790,7 +802,14 @@ def _extract_title(content: str, prompt: str) -> str:
 def _detect_file_kind(prompt: str) -> str | None:
     """根据老板指令判断要生成的真实文件类型；返回 None 表示保持 Markdown"""
     text = prompt.lower()
-    if any(word in text for word in ("代码包", "代码项目", "源代码", "编程", "写一个程序", "开发一个", "python脚本", "python 脚本")):
+    if any(w in text for w in ("html", "网页", "svg", "canvas", "h5", "前端页面")):
+        return "html"
+    if any(word in text for word in (
+        "代码包", "代码项目", "源代码", "编程", "写一个程序", "写个程序",
+        "开发一个", "开发个", "python脚本", "python 脚本", "软件系统",
+        "接口开发", "后端", "前端", "数据库", "api", "应用", "网站",
+        "命令行", "cli", "小工具", "脚本",
+    )):
         return "code"
     if "pdf" in text and any(word in text for word in ("word", "docx")):
         return "docx"
@@ -830,10 +849,10 @@ def _should_direct_artifact_sprint(requirement: str) -> bool:
         "完整项目", "代码项目", "源代码", "编程", "写一个程序", "开发一个系统",
         "开发网站", "开发应用", "软件系统", "接口开发",
     ))
-    return explicit_file and not collaborative and _detect_file_kind(requirement) in ("docx", "pptx", "xlsx", "pdf")
+    return explicit_file and not collaborative and _detect_file_kind(requirement) in ("docx", "pptx", "xlsx", "pdf", "html")
 
 
-_KIND_DEFAULT_NAME = {"docx": "文档.docx", "pptx": "演示文稿.pptx", "xlsx": "表格.xlsx", "pdf": "文档.pdf", "code": "项目.zip"}
+_KIND_DEFAULT_NAME = {"docx": "文档.docx", "pptx": "演示文稿.pptx", "xlsx": "表格.xlsx", "pdf": "文档.pdf", "code": "项目.zip", "html": "页面.html"}
 
 
 def _saved_note(dest: str | None, target_dir: str | None = None) -> str:
@@ -966,7 +985,7 @@ async def _generate_document_impl(
         filename = forge.semantic_filename(prompt, kind, _KIND_DEFAULT_NAME[kind].rpartition('.')[0])
         bus.emit({"type": "generate_progress", "stage": "正在撰写成品内容", "prompt": prompt[:40]})
         file_name = await asyncio.to_thread(
-            forge.forge_file, kind, spec, filename, roster
+            forge.forge_file, kind, spec, filename, roster, None, True
         )
         if file_name:
             bus.emit({"type": "generate_progress", "stage": "正在校验与自检成品", "prompt": prompt[:40]})
@@ -1985,7 +2004,7 @@ async def get_usage():
     for member in report["members"]:
         member["name"] = roster_name(member["roster"])
     baseline = sprint_meta.get("usage_baseline") or 0.0
-    report["sprint_cost"] = round(llm.usage_total_cost() - baseline, 4)
+    report["sprint_cost"] = max(0.0, round(llm.usage_total_cost() - baseline, 4))
     report["sprint_tokens"] = llm.usage_total_tokens()
     return report
 
@@ -2238,6 +2257,16 @@ def build_report_md(requirement: str, tasks: list[dict]) -> str:
 
 @app.get("/api/files")
 async def files():
+    if not running:
+        # 空闲状态没有「当前 Sprint 产物」：上一轮内容请从历史 Sprint 详情回看
+        return {
+            "requirement": "",
+            "running": False,
+            "updated_at": 0,
+            "tasks": [],
+            "artifacts": [],
+            "report_md": "",
+        }
     return {
         "requirement": sprint_meta["requirement"],
         "running": running,
@@ -2266,15 +2295,17 @@ async def ws_office(ws: WebSocket):
     print(f"[WS] 客户端接入，当前 {len(clients)} 个")
     try:
         # 完整快照：刷新/断线重连后可恢复任务、产物、阶段与运行状态
+        # 已结束的 Sprint 不再作为「当前轮次」下发，避免新页面凭空出现上一轮的旧任务
+        active = _active_round()
         await ws.send_json(
             {
                 "type": "hello",
                 "llm": llm_available(),
                 "running": running,
                 "paused": bus.is_paused(),
-                "tasks": tasks_store,
-                "artifacts": artifacts_store,
-                "sprint": sprint_meta,
+                "tasks": active["tasks"],
+                "artifacts": active["artifacts"],
+                "sprint": active["sprint"],
                 "events": bus.event_log[-80:],
                 "usage": llm.usage_report(),
             }

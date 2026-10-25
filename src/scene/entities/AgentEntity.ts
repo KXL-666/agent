@@ -17,16 +17,20 @@ export class AgentEntity extends Container {
   private fallbackScarf: Graphics | null = null
   private statusLabel: StatusLabel
   private bubble: Bubble
+  /** 标签层：与人物分离，绘制在桌椅之上，避免坐下时被显示器挡住 */
+  private labelLayer: Container | null
   private walkPhase = 0
   private useSpine = false
 
-  constructor(agent: Agent) {
+  constructor(agent: Agent, labelLayer?: Container) {
     super()
     this.agentId = agent.id
     this.agent = { ...agent }
+    this.labelLayer = labelLayer ?? null
 
     this.statusLabel = new StatusLabel(agent.name)
     this.bubble = new Bubble()
+    this.labelLayer?.addChild(this.statusLabel)
 
     if (isSpineReady()) {
       this.spineChar = new SpineCharacter(agent.id, agent.color)
@@ -36,7 +40,8 @@ export class AgentEntity extends Container {
         this.spineChar.setFacing(agent.facing)
         this.spineChar.setViewFacing(agent.viewFacing ?? 'front')
         this.spineChar.playState(agent.state)
-        this.addChild(this.spineChar, this.statusLabel, this.bubble)
+        this.addChild(this.spineChar, this.bubble)
+        if (!this.labelLayer) this.addChild(this.statusLabel)
       } else {
         this.spineChar.destroy()
         this.spineChar = null
@@ -52,6 +57,7 @@ export class AgentEntity extends Container {
 
     this.syncVisual()
     this.position.set(agent.x, agent.y)
+    this.updateOverlayPositions()
   }
 
   get data(): Agent {
@@ -112,6 +118,7 @@ export class AgentEntity extends Container {
     this.agent.x = x
     this.agent.y = y
     this.position.set(x, y)
+    this.updateOverlayPositions()
   }
 
   showBubble(text: string, duration = 4) {
@@ -192,6 +199,12 @@ export class AgentEntity extends Container {
       ? this.spineChar.getHeadOffsetY()
       : -58
     this.statusLabel.layout(crownTopY)
+    if (this.labelLayer) {
+      // 标签已挂到独立图层：把本地偏移换算成世界坐标，并按 y 排序保证多人标签前后正确
+      this.statusLabel.position.x += this.position.x
+      this.statusLabel.position.y += this.position.y
+      this.statusLabel.zIndex = this.position.y
+    }
     const labelTopY = this.statusLabel.getLabelTopY(crownTopY)
     const gapAboveLabel = 4
     const bubbleExtraDown = 10
@@ -226,7 +239,8 @@ export class AgentEntity extends Container {
   private initFallbackGraphics() {
     this.fallbackBody = new Graphics()
     this.fallbackScarf = new Graphics()
-    this.addChild(this.fallbackBody, this.fallbackScarf, this.statusLabel, this.bubble)
+    this.addChild(this.fallbackBody, this.fallbackScarf, this.bubble)
+    if (!this.labelLayer) this.addChild(this.statusLabel)
     this.useSpine = false
   }
 

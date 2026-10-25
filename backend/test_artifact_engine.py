@@ -31,6 +31,68 @@ class ArtifactEngineTest(unittest.TestCase):
         self.patch.stop()
         self.temp.cleanup()
 
+    def test_unrequested_blank_fields_are_removed_from_notification(self):
+        content = ("# 接口联调通知\n\n11 月 4 日联调。\n\n"
+                   "会议链接：待补充\n报名：请填写\n日期：TBD\n"
+                   "发出方：待确认\n"
+                   "| 联调地点 | 线上会议室 A（接入链接/平台：待确认） |\n"
+                   "| 前端 | 提交接口清单（提交渠道：待确认） |\n"
+                   "## 三、需说明的信息\n入会方式待确认。\n上述信息确认后同步。\n")
+        cleaned = forge._strip_unrequested_docx_placeholders(content, "生成一页接口联调通知")
+        self.assertNotIn("待补充", cleaned)
+        self.assertNotIn("请填写", cleaned)
+        self.assertNotIn("TBD", cleaned)
+        self.assertNotIn("待确认", cleaned)
+        self.assertIn("线上会议室 A", cleaned)
+        self.assertIn("提交接口清单", cleaned)
+        self.assertNotIn("需说明的信息", cleaned)
+        self.assertNotIn("上述信息确认后同步", cleaned)
+        self.assertIn("11 月 4 日联调", cleaned)
+        collaborative_spec = "需求：生成接口联调通知。\n团队各环节的产出：\n发出方：待确认"
+        self.assertNotIn("待确认", forge._strip_unrequested_docx_placeholders(content, collaborative_spec))
+        self.assertEqual(forge._strip_unrequested_docx_placeholders(content, "制作待填写的通知模板"), content)
+
+    def test_strip_uses_raw_requirement_in_collaborative_assembly_spec(self):
+        # graph.py 交付节点的真实 spec：前缀含“团队各环节”，团队产出正文也含“待确认”，
+        # 两者都不应让短通知的严格清理失效（W1 Sprint S1792901859326 回归）。
+        spec = (
+            "根据需求与团队各环节的实际产出，汇编最终成品。需求：生成一份给研发与测试同事的 Word 通知，"
+            "说明 11 月 4 日 14:00 至 16:00 进行接口联调，地点为线上会议室 A。控制在一页，不要封面。\n"
+            "任务完成情况：T1 事实核对（completed）。\n\n"
+            "团队各环节的产出（请吸收其中的实质内容）：\n"
+            "【后端 · T1 · 来源 ['用户原话']】\n未知信息保持待确认。\n\n"
+            "重要：必须把实际内容完整做出来，而不是描述怎么做或给模板。"
+        )
+        content = ("# 接口联调通知\n\n联调时间：11 月 4 日 14:00 至 16:00\n\n"
+                   "## 待确认事项\n- 线上会议室 A 的会议链接与入会方式：待确认。\n"
+                   "- 通知发出方与落款日期：待确认。\n")
+        cleaned = forge._strip_unrequested_docx_placeholders(content, spec)
+        self.assertNotIn("待确认", cleaned)
+        self.assertNotIn("待确认事项", cleaned)
+        self.assertIn("11 月 4 日 14:00 至 16:00", cleaned)
+        upload_spec = (
+            "用户上传了附件素材，要求基于附件加工改造产出新成品。\n附件内容：\n需求：以附件为准\n\n"
+            "加工需求：生成接口联调通知，说明联调安排。\n"
+            "团队各环节的产出（请吸收其中的实质内容）：\n未知信息保持待确认。"
+        )
+        self.assertNotIn("待确认", forge._strip_unrequested_docx_placeholders(content, upload_spec))
+
+    def test_word_review_claims_must_match_actual_table_and_workflow_scope(self):
+        path = self.root / "通知.docx"
+        forge._build_docx(
+            "# 接口联调通知\n\n请准时参会。\n\n"
+            "| 角色 | 职责与截止时间 |\n|---|---|\n"
+            "| 前端 | 提交清单 |\n| 后端 | 准备环境 |\n| 测试 | 汇总问题 |",
+            str(path),
+        )
+        report = {"kind": "docx", "requirement": "生成通知。请由团队协作完成。"}
+        self.assertTrue(artifact_quality._review_issue_contradicted_by_word_file(
+            {"problem": "正文缺失角色-职责对照表，未整合表格"}, report, path))
+        self.assertTrue(artifact_quality._review_issue_contradicted_by_word_file(
+            {"problem": "正文未体现协作痕迹及交接"}, report, path))
+        self.assertFalse(artifact_quality._review_issue_contradicted_by_word_file(
+            {"problem": "日期与用户要求不一致"}, report, path))
+
     def test_pdf_is_searchable_and_all_pages_render(self):
         import pymupdf
         path = self.root / "报告.pdf"
@@ -114,6 +176,57 @@ class ArtifactEngineTest(unittest.TestCase):
         self.assertNotIn("自动生成", text)
         self.assertNotIn("谢谢观看", text)
 
+    def test_ppt_cover_is_included_in_footer_page_numbers(self):
+        from pptx import Presentation
+        path = self.root / "封面页码.pptx"
+        payload = {"title": "方案", "include_cover": True, "slides": [
+            {"heading": "结论", "bullets": ["先完成状态通知"], "table": None, "note": ""},
+        ]}
+        self.assertTrue(forge._build_pptx(payload, str(path)))
+        deck = Presentation(path)
+        self.assertEqual(len(deck.slides), 2)
+        content_text = "\n".join(shape.text for shape in deck.slides[1].shapes if shape.has_text_frame)
+        self.assertIn("第 2 页 / 共 2 页", content_text)
+
+    def test_pptx_quality_rejects_wrong_footer_total_and_non_native_chart(self):
+        payload = {"title": "三周汇报", "include_cover": True, "slides": [
+            {"heading": "趋势", "bullets": ["缺陷持续处理"], "table": None, "note": ""},
+        ]}
+        path = self.root / "错误页脚.pptx"
+        self.assertTrue(forge._build_pptx(payload, str(path)))
+        from pptx import Presentation
+        deck = Presentation(path)
+        footer = next(shape for shape in deck.slides[1].shapes
+                      if shape.has_text_frame and "共 2 页" in shape.text)
+        footer.text = "第 2 页 / 共 1 页"
+        deck.save(path)
+        with patch.object(office_runtime, "convert", side_effect=RuntimeError("renderer unavailable")):
+            report = artifact_quality.inspect(path, "pptx", "制作 2 页含封面的 PPT，包含原生图表", self.root)
+        checks = {item["label"]: item for item in report["checks"]}
+        self.assertFalse(checks["页脚总页数一致"]["ok"])
+        self.assertFalse(checks["需求中的原生图表"]["ok"])
+
+    def test_document_quality_rejects_a_date_missing_from_the_request(self):
+        path = self.root / "通知.docx"
+        forge._build_docx("# 接口联调通知\n\n联调时间：11 月 4 日。\n\n研发团队 / 2024 年 11 月", str(path))
+        with patch.object(office_runtime, "convert", side_effect=RuntimeError("renderer unavailable")):
+            report = artifact_quality.inspect(path, "docx", "写通知，时间为 11 月 4 日", self.root)
+        check = next(item for item in report["checks"] if item["label"] == "日期有来源依据")
+        self.assertFalse(check["ok"], check)
+        self.assertIn("2024年11月", check["detail"])
+
+    def test_quality_inspection_invalidates_old_schema_reports(self):
+        path = self.root / "缓存迁移.pdf"
+        path.write_bytes(b"candidate")
+        previous = {"schema": 2, "requirement": "same", "capabilities": office_runtime.capabilities(),
+                    "pages": []}
+        fresh = {"schema": 6, "status": "failed", "checks": []}
+        with patch.object(artifact_quality, "load_report", return_value=previous), \
+             patch.object(artifact_quality, "_inspect", return_value=fresh) as inspect:
+            report = artifact_quality.inspect(path, "pdf", "same", self.root)
+        inspect.assert_called_once()
+        self.assertEqual(report["schema"], 6)
+
     def test_code_review_flags_handoff_in_readme(self):
         (self.root / "app.py").write_text("print('ok')", encoding="utf-8")
         (self.root / "README.md").write_text("以上为示例代码，可直接复制到 Word 中使用。", encoding="utf-8")
@@ -175,6 +288,8 @@ class ArtifactEngineTest(unittest.TestCase):
     def test_explicit_requirements_are_not_replaced_by_fixed_minimum_size(self):
         self.assertEqual(artifact_quality.contract("写约200字的通知", "docx")["count"], 200)
         self.assertEqual(artifact_quality.contract("制作6页PPT", "pptx")["count"], 6)
+        self.assertEqual(artifact_quality.contract("生成5页含封面的PPT", "pptx")["count_scope"], "total")
+        self.assertEqual(artifact_quality.contract("生成5页内容并加封面的PPT", "pptx")["count_scope"], "content")
         self.assertNotIn("不少于 1500", forge._docx_content_prompt("一段简短通知"))
 
     def test_content_feedback_causes_a_revised_real_document(self):

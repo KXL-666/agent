@@ -13,6 +13,7 @@ import { OfficeViewPanel } from '@/components/OfficeViews'
 import { ensureAgentConfigsLoaded } from '@/store/officeAgentConfigStore'
 import { initTheme } from '@/store/officeThemeStore'
 import { getActiveView, subscribeView } from '@/store/officeViewStore'
+import { primeAudio } from '@/services/officeSound'
 import './App.css'
 
 function App() {
@@ -22,6 +23,21 @@ function App() {
   useEffect(() => {
     initTheme()
     ensureAgentConfigsLoaded()
+    // 首次用户手势预热音频上下文，避免 Sprint 结束提示音被浏览器自动播放策略拦截
+    let primed = false
+    const prime = () => {
+      if (primed) return
+      primed = true
+      primeAudio()
+      window.removeEventListener('pointerdown', prime)
+      window.removeEventListener('keydown', prime)
+    }
+    window.addEventListener('pointerdown', prime)
+    window.addEventListener('keydown', prime)
+    return () => {
+      window.removeEventListener('pointerdown', prime)
+      window.removeEventListener('keydown', prime)
+    }
   }, [])
 
   return (

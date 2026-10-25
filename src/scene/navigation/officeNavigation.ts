@@ -209,28 +209,6 @@ export function findDeskAtSeat(x: number, y: number): Desk | undefined {
   )
 }
 
-const SEAT_SIDE_DEADZONE = 10
-
-/** 根据参考点相对工位的水平位置选左侧或右侧入席/离席 */
-export function pickDeskApproachSide(
-  desk: Desk,
-  referenceX: number,
-): DeskApproachSide {
-  const dx = referenceX - desk.seatX
-  if (dx < -SEAT_SIDE_DEADZONE) return 'left'
-  if (dx > SEAT_SIDE_DEADZONE) return 'right'
-
-  const meta = ensureGraph().deskMeta.get(desk.id)
-  if (!meta) return 'left'
-
-  const g = ensureGraph()
-  const left = g.nodes.get(meta.leftAisleId)!
-  const right = g.nodes.get(meta.rightAisleId)!
-  const dL = Math.abs(referenceX - left.x)
-  const dR = Math.abs(referenceX - right.x)
-  return dL <= dR ? 'left' : 'right'
-}
-
 const SAME_ROW_SEAT_Y_THRESH = 14
 
 function deskIdsForLateralMoveCheck(

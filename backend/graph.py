@@ -10,7 +10,6 @@ set_state（状态/任务牌）、desk_visit（起身找某人说话）、emote�
 import asyncio
 import os
 import json
-import random
 import zipfile
 import hashlib
 from pathlib import Path
@@ -182,31 +181,15 @@ def mock_plan() -> dict:
     }
 
 
-def mock_develop_result(title: str) -> str:
-    return f"完成「{title}」，已提交代码"
-
-
-def mock_test_report(tasks: list, first_pass: bool) -> dict:
-    if first_pass:
-        dev_tasks = [t for t in tasks if t["assignee_roster"] in (DEV_BE, DEV_FE)]
-        buggy = random.choice(dev_tasks) if dev_tasks else None
-        return {
-            "verdict": "有缺陷",
-            "bug_task": buggy["id"] if buggy else None,
-            "note": f"发现缺陷：{buggy['title']} 边界条件未覆盖" if buggy else "全部通过",
-        }
-    return {"verdict": "通过", "bug_task": None, "note": "回归测试全部通过"}
-
-
-def mock_review(first_pass: bool) -> str:
-    return "存在缺陷，打回修复" if first_pass else "评审通过，同意交付"
-
-
 # ---------- 角色分派 ----------
 
 def detect_final_kind(requirement: str) -> str:
-    """关键词兜底：判断需求最终要交付什么（LLM 不可用时使用）"""
+    """关键词兜底：判断需求最终要交付什么（LLM 不可用时使用）。
+    注意：只有明确的软件/代码需求才返回 code，其余兜底为 docx，
+    避免模糊需求误入 code 路径触发 Docker 沙箱长时间运行。"""
     text = requirement.lower()
+    if any(w in text for w in ("html", "网页", "svg", "canvas", "前端页面", "h5")):
+        return "html"
     if "pdf" in text and any(word in text for word in ("word", "docx")):
         return "docx"
     if "pdf" in text:
@@ -220,7 +203,15 @@ def detect_final_kind(requirement: str) -> str:
         "方案", "总结", "计划书", "信", "稿", "文案", "申请书", "简历",
     )):
         return "docx"
-    return "code"
+    if any(w in text for w in (
+        "代码包", "代码项目", "源代码", "编程", "写一个程序", "写个程序",
+        "开发一个", "开发个", "python脚本", "python 脚本", "软件系统",
+        "接口开发", "后端", "前端", "数据库", "api", "应用", "网站",
+        "命令行", "cli", "小工具", "脚本",
+    )):
+        return "code"
+    # 兜底为 docx：模糊需求不应走 code 路径触发 Docker
+    return "docx"
 
 
 def pick_assignee(title: str, index: int) -> int:
@@ -275,6 +266,35 @@ def compact_short_document_tasks(planned: list[dict], contract: dict) -> list[di
             continue
         merged.append(item)
     return merged
+
+
+def ensure_file_collaboration_tasks(planned: list[dict], contract: dict) -> list[dict]:
+    """A file Sprint needs distinct fact, composition, and QA contributions."""
+    if contract.get("target_kind") == "code":
+        return planned
+    aliases = {"后端": {"后端", "backend", "be"},
+               "前端": {"前端", "frontend", "fe", "写作", "设计"},
+               "测试": {"测试", "qa"}}
+    present = {role for role, names in aliases.items()
+               if any(str(item.get("role_hint") or "").strip().lower() in names
+                      for item in planned)}
+    requirement_ids = [str(item.get("requirement_id")) for item in contract.get("requirements", [])
+                       if item.get("requirement_id")]
+    templates = {
+        "后端": ("核对事实、来源与约束", "逐条核对用户原话与附件，提交可追溯的事实核对材料"),
+        "前端": ("撰写正文并完成版式", "依据已核实材料完成可直接交付的正文和版式"),
+        "测试": ("按条款测试验收", "对真实候选文件逐条检查内容、事实与格式"),
+    }
+    result = list(planned)
+    for role in ("后端", "前端", "测试"):
+        if role in present:
+            continue
+        title, story = templates[role]
+        result.append({"title": title, "role_hint": role, "user_story": story,
+                       "priority": "P0", "story_points": 2,
+                       "requirement_ids": requirement_ids,
+                       "acceptance_criteria": [story, "产出引用对应需求条款和实际文件/来源"]})
+    return result
 
 
 def compact_code_tasks(planned: list[dict]) -> list[dict]:
@@ -422,6 +442,7 @@ async def kickoff(state: SprintState) -> dict:
         planned = compact_code_tasks(planned)
     else:
         planned = compact_short_document_tasks(planned, contract)
+        planned = ensure_file_collaboration_tasks(planned, contract)
     for i, item in enumerate(planned):
         title = str(item.get("title", f"任务 {i + 1}")).strip()[:40]
         tasks.append(
@@ -481,8 +502,8 @@ async def kickoff(state: SprintState) -> dict:
 
     # The PO contract already records the intended output format.
     deliver_kind = contract.get("target_kind") or detect_final_kind(state["requirement"])
-    if deliver_kind not in ("docx", "pptx", "xlsx", "pdf", "code"):
-        deliver_kind = "code"
+    if deliver_kind not in ("docx", "pptx", "xlsx", "pdf", "code", "html"):
+        deliver_kind = "docx"
     if state.get("task_kind") == "software":
         deliver_kind = "code"
     elif "pdf" in state["requirement"].lower() and any(word in state["requirement"].lower() for word in ("word", "docx")):
@@ -514,7 +535,9 @@ async def assign(state: SprintState) -> dict:
         title = t["title"]
         hinted = {"测试": QA, "前端": DEV_FE, "后端": DEV_BE,
                   "写作": DEV_FE, "设计": DEV_FE}.get(hint)
-        if file_route and any(word in title for word in ("测试", "验收", "校核", "检查", "验证")):
+        if hinted is not None:
+            t["assignee_roster"] = hinted
+        elif file_route and any(word in title for word in ("测试", "验收", "校核", "检查", "验证")):
             t["assignee_roster"] = QA
         elif file_route and any(word in title for word in ("资料", "来源", "数据", "计算", "事实", "要素", "调研")):
             t["assignee_roster"] = DEV_BE
@@ -598,7 +621,7 @@ async def develop(state: SprintState) -> dict:
                 return
             # 产物：开发说明（LLM 生成实现要点，未配 LLM 时用模板兜底）
             note_meta: dict = {}
-            if state.get("deliver_kind", "code") == "code":
+            if state.get("deliver_kind", "docx") == "code":
                 summary = ""
             else:
                 role_instruction = (
@@ -623,17 +646,17 @@ async def develop(state: SprintState) -> dict:
 
             # 真实代码产出：仅软件类需求由 LLM 为该任务编写真实代码文件
             written: list[str] = []
-            if state.get("deliver_kind", "code") == "code":
+            if state.get("deliver_kind", "docx") == "code":
                 dev_requirement = state["requirement"]
                 dev_requirement += f"\n本任务用户故事：{t.get('user_story', '')}\n验收条件：{'；'.join(t.get('acceptance_criteria', []))}"
                 role_boundaries = {
-                    DEV_BE: "只实现核心业务逻辑、公开接口和输入/领域校验；不要生成 CLI/界面、测试、README 或另一份完整项目。",
-                    DEV_FE: "只实现命令行/用户入口、参数交互和 README；遵循 BE 贡献的模块/函数接口，不要重写核心逻辑或生成测试。",
+                    DEV_BE: "只实现核心业务逻辑、公开接口和输入/领域校验；不要生成 CLI/界面、测试、README 或另一份完整项目。文件类任务须把已知事实、来源与待确认项分开，未知信息保持待确认。",
+                    DEV_FE: "只实现命令行/用户入口、参数交互和 README；遵循 BE 贡献的模块/函数接口，不要重写核心逻辑或生成测试。文件类任务只能使用用户原话和 BE 明确核实的事实；未知日期、署名、渠道、链接、原因等必须标为待确认，不得补造具体信息。",
                     QA: "只生成测试文件（tests/ 下或 test_*.py），覆盖成功路径和错误路径；必须实际测试 CLI 成功与失败退出码；禁止 skip/xfail/跳过测试；禁止生成或修改生产代码、README、依赖文件。测试必须针对共享计划中的 BE 接口。",
                 }
                 dev_requirement += (f"\n角色文件边界：{role_boundaries.get(no, '只提交本任务职责范围内的文件，不要复制其他任务的实现。')}"
                                     "\n禁止复刻其他任务已负责的模块；如依赖接口尚未明确，以最少可检查的调用假设编写，并将问题写入测试。")
-                if state.get("deliver_kind", "code") == "code" and no in (DEV_FE, QA):
+                if state.get("deliver_kind", "docx") == "code" and no in (DEV_FE, QA):
                     backend_material = []
                     for backend_task in tasks:
                         if backend_task.get("assignee_roster") != DEV_BE:
@@ -669,7 +692,7 @@ async def develop(state: SprintState) -> dict:
             source_refs += [f"attachment:{src['name']}:{src.get('location') or 'unknown'}"
                             for src in state.get("requirement_contract", {}).get("attachment_sources", [])]
         if sprint_id and storage.get_sprint(sprint_id):
-            if state.get("deliver_kind", "code") == "code":
+            if state.get("deliver_kind", "docx") == "code":
                 manifest = contributions.save_code(
                     sprint_id, t["id"], no, t.get("role_scope", ""), written,
                     t.get("requirement_ids", []), source_refs, generation_meta=note_meta,
@@ -684,7 +707,7 @@ async def develop(state: SprintState) -> dict:
             t["contribution_ref"] = f"contribution:{t['id']}"
         else:
             manifest = {}
-        task_has_deliverable = bool(written) if state.get("deliver_kind", "code") == "code" else bool(summary.strip()) and not note_meta.get("fallback_reason")
+        task_has_deliverable = bool(written) if state.get("deliver_kind", "docx") == "code" else bool(summary.strip()) and not note_meta.get("fallback_reason")
         t["status"] = "待测试" if task_has_deliverable else "打回"
         t["summary"] = summary[:1500]
         t["code_files"] = written
@@ -721,7 +744,7 @@ async def develop(state: SprintState) -> dict:
             )
         emote(no, "emotes/idea", "灵感")
 
-    if state.get("deliver_kind", "code") == "code":
+    if state.get("deliver_kind", "docx") == "code":
         # BE owns the shared production interface. FE and QA receive its actual
         # source before they generate their dependent files, while FE and QA
         # remain parallel with each other.
@@ -829,6 +852,13 @@ async def test(state: SprintState) -> dict:
         verification.verify, item or {}, state.get("requirement_contract", {}),
         state.get("candidate_sha256", ""), workflow_evidence,
     )
+    # The QA contribution is a submitted checklist/report. Once verification
+    # has produced its evidence artifact, its contribution lifecycle is closed;
+    # QA pass/fail remains in the separate verification report.
+    if sprint_id:
+        for task in state.get("tasks", []):
+            if task.get("assignee_roster") == QA and task.get("contribution_ref"):
+                contributions.mark_completed(sprint_id, task["id"])
     companion_reports = []
     for companion in state.get("companion_candidates", []):
         extra = storage.get_artifact(companion["id"]) if sprint_id and storage.get_sprint(sprint_id) else None
@@ -980,20 +1010,27 @@ async def fix(state: SprintState) -> dict:
             import project_agent
             preview = project_agent.snapshot(Path(project_dir), limit=20000)
         meta = {}
-        patch = await asyncio.to_thread(
-            chat_json,
-            system=(
-                f"你是{roster_name(owner)}，只修复指定位置的缺陷。"
-                '输出 JSON {"location":"第N页/第N段/工作表!A1/文件路径",'
-                '"old_text":"文档或PPT中的精确旧文本","replacement":"完整替换文本/公式/代码文件内容",'
-                '"path":"代码相对路径（代码任务必填）"}。'
-                "Word/PPT 必须给精确旧文本；Excel 给精确单元格；代码只给一个既有文件的完整新内容。"
-                "不删除测试、功能或无关内容。无法定位则返回空 JSON。"
-            ),
-            user=json.dumps({"kind": kind, "issue": issue, "candidate_sha256": state.get("candidate_sha256"),
-                             "actual_content": preview, "requirement": state["requirement"]}, ensure_ascii=False),
-            fallback={}, roster=owner, meta=meta, max_tokens=6500, timeout=180,
-        )
+        problem_text = f"{issue.get('problem') or ''} {issue.get('location') or ''}"
+        if kind in ("docx", "pdf") and re.search(r"字数|篇幅", problem_text):
+            # 篇幅是全文约束，逐段替换无法收敛；走确定性整篇压缩。
+            patch = {"operation": "refit_length", "location": "全文", "requirement": state["requirement"]}
+        else:
+            patch = await asyncio.to_thread(
+                chat_json,
+                system=(
+                    f"你是{roster_name(owner)}，只修复指定位置的缺陷。"
+                    '输出 JSON {"location":"第N页/第N段/工作表!A1/文件路径",'
+                    '"operation":"replace|delete（仅 Word 完整段落允许 delete）",'
+                    '"old_text":"文档或PPT中的精确旧文本","replacement":"完整替换文本/公式/代码文件内容",'
+                    '"path":"代码相对路径（代码任务必填）"}。'
+                    "Word/PPT 必须给精确旧文本；Excel 给精确单元格；代码只给一个既有文件的完整新内容。"
+                    "若 Word 中整段是需求未提供的占位字段，可用 operation=delete，old_text 填完整段落原文。"
+                    "不删除测试、功能或无关内容。无法定位则返回空 JSON。"
+                ),
+                user=json.dumps({"kind": kind, "issue": issue, "candidate_sha256": state.get("candidate_sha256"),
+                                 "actual_content": preview, "requirement": state["requirement"]}, ensure_ascii=False),
+                fallback={}, roster=owner, meta=meta, max_tokens=6500, timeout=180,
+            )
         if meta.get("fallback_reason") or not isinstance(patch, dict):
             continue
         new_file, reason, detail = await asyncio.to_thread(
@@ -1185,7 +1222,7 @@ def _sha256_file(file_name: str | None) -> str:
 
 async def candidate(state: SprintState) -> dict:
     """Build one traceable candidate before QA and LEAD see the file."""
-    kind = state.get("deliver_kind", "code") or "code"
+    kind = state.get("deliver_kind", "docx") or "docx"
     tasks = state["tasks"]
     set_stage("形成候选成品")
     sprint_id = sprint_meta.get("id", "")
@@ -1283,11 +1320,13 @@ async def candidate(state: SprintState) -> dict:
     if up:
         spec = (
             f"用户上传了附件素材，要求基于附件加工改造产出新成品。\n"
-            f"附件内容：\n{up[:4000]}\n\n"
+            f"附件内容：\n{up[:12000]}\n\n"
             f"加工需求：{state['requirement']}。\n"
             f"团队各环节的产出（请吸收其中的实质内容）：\n{team_digest}\n\n"
             "重要：成品必须真实体现附件内容与团队产出（改写、提炼、转换格式、补充扩展都算），"
             "把实际内容完整做出来，而不是描述怎么做或给模板。"
+            "日期、数字、名称、状态只能取自附件原文或用户需求；正文已给出具体数字时，"
+            "不得再写“数据待确认/待补充”。"
         )
     else:
         spec = (

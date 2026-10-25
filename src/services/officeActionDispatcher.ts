@@ -1,7 +1,4 @@
-import {
-  OFFICE_DISPATCH_MODE,
-  type OfficeDispatchMode,
-} from '@/config/officeMode'
+import { OFFICE_DISPATCH_MODE } from '@/config/officeMode'
 import {
   requestDeskVisit,
   requestDeskVisitTour,
@@ -200,32 +197,4 @@ export function hasPendingVisitQueue(): boolean {
   return visitQueue.length > 0
 }
 
-export function getDispatchStats(): {
-  mode: OfficeDispatchMode
-  queueDepth: number
-  executing: boolean
-  skippedCount: number
-  invalidCount: number
-  completedCount: number
-} {
-  const agents = getOfficeAgents()
-  return {
-    mode: OFFICE_DISPATCH_MODE,
-    queueDepth: visitQueue.length,
-    executing: isDispatchBusy(agents),
-    skippedCount,
-    invalidCount,
-    completedCount,
-  }
-}
 
-export function dispatchModeLabel(mode: OfficeDispatchMode): string {
-  switch (mode) {
-    case 'queue':
-      return '队列（不丢）'
-    case 'skip':
-      return '省略（繁忙丢弃）'
-    case 'hybrid':
-      return '混合（繁忙丢/空闲串行）'
-  }
-}

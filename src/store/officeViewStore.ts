@@ -2,7 +2,7 @@
 
 import { OFFICE_API_BASE } from '@/config/officeMode'
 import { setArtifacts } from '@/store/officeArtifactStore'
-import { applyTaskSnapshot } from '@/store/officeTaskStore'
+import { applyTaskSnapshot, type SprintMetaState } from '@/store/officeTaskStore'
 import { showToast } from '@/store/officeUiStore'
 
 export type OfficeView =
@@ -128,12 +128,18 @@ export type SprintHistoryEntry = {
 
 /** 正在查看的 Sprint id：'' 表示当前 Sprint；切换后任务/产物 store 会同步替换 */
 let viewedSprint = ''
+/** 正在查看的历史 Sprint 元信息（阶段/耗时/花费），用于顶部还原那一轮的进度条 */
+let viewedMeta: SprintMetaState | null = null
 let sprintHistory: SprintHistoryEntry[] = []
 /** 切换竞态令牌：慢响应返回时若已再次切换则丢弃 */
 let switchToken = 0
 
 export function getViewedSprint(): string {
   return viewedSprint
+}
+
+export function getViewedSprintMeta(): SprintMetaState | null {
+  return viewedMeta
 }
 
 export function getSprintHistory(): SprintHistoryEntry[] {
@@ -160,6 +166,7 @@ export async function refreshSprintHistory(): Promise<void> {
 export async function setViewedSprint(id: string): Promise<void> {
   if (viewedSprint === id) return
   viewedSprint = id
+  viewedMeta = null
   notify()
   const token = ++switchToken
   try {
@@ -171,10 +178,27 @@ export async function setViewedSprint(id: string): Promise<void> {
     const payload = (await res.json()) as {
       tasks?: Parameters<typeof applyTaskSnapshot>[0]
       artifacts?: Parameters<typeof setArtifacts>[0]
+      sprint?: Record<string, unknown>
     }
     if (token !== switchToken) return
     applyTaskSnapshot(payload.tasks ?? [])
     setArtifacts(payload.artifacts ?? [])
+    const sprint = payload.sprint
+    if (id && sprint?.id) {
+      viewedMeta = {
+        id: String(sprint.id),
+        requirement: String(sprint.requirement ?? ''),
+        stage: String(sprint.stage ?? ''),
+        stageStarted: Number(sprint.stage_started ?? 0) || 0,
+        startedAt: Number(sprint.started_at ?? 0) || 0,
+        finishedAt: Number(sprint.finished_at ?? 0) || 0,
+        status: String(sprint.status ?? ''),
+        fast: sprint.execution_style === 'fast',
+        cost: Number(sprint.usage_cost ?? 0) || 0,
+        budget: Number(sprint.budget ?? 0) || 0,
+      }
+      notify()
+    }
   } catch {
     showToast('加载历史 Sprint 失败，请确认后端已启动')
   }

@@ -158,9 +158,9 @@ function TaskCenterView() {
 
       {viewedSprint ? (
         <div className="view-history-banner">
-          正在查看历史 Sprint（只读），实时进展请
+          正在查看历史记录（只读），实时进展请
           <button type="button" onClick={() => void setViewedSprint('')}>
-            返回当前 Sprint
+            返回本轮任务
           </button>
         </div>
       ) : null}
@@ -442,7 +442,7 @@ function qualityLabel(artifact: OfficeArtifact): string {
 }
 
 function canPreviewFile(artifact: OfficeArtifact): boolean {
-  return /\.(docx|pptx|xlsx|pdf)$/i.test(artifact.file_name ?? '')
+  return /\.(docx|pptx|xlsx|pdf|html)$/i.test(artifact.file_name ?? '')
 }
 
 function ArtifactCard({ artifact }: { artifact: OfficeArtifact }) {

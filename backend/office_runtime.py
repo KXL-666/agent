@@ -24,11 +24,12 @@ def find_office() -> str | None:
 
 
 def capabilities() -> dict:
+    import project_agent
     return {"office_renderer": bool(find_office()),
             "pdf_renderer": importlib.util.find_spec("pymupdf") is not None,
             "pdf_writer": importlib.util.find_spec("reportlab") is not None,
             "formula_recalculation": bool(find_office()),
-            "code_sandbox": bool(shutil.which("docker"))}
+            "code_sandbox": bool(project_agent.docker_executable())}
 
 
 def convert(source: str | Path, directory: str | Path, target: str = "pdf") -> Path:

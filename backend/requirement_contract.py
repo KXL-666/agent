@@ -9,13 +9,28 @@ import re
 
 _SPLIT = re.compile(r"[。；;，,\n]+")
 _SOURCE = re.compile(r"📎《([^》]+)》([^：\n]*)：")
-_KINDS = {"docx", "pdf", "pptx", "xlsx", "code"}
+_KINDS = {"docx", "pdf", "pptx", "xlsx", "code", "html"}
 _AUTHORIZED_ASSUMPTION = re.compile(r"(?:允许|可以|可)(?:自行|由你)?(?:合理)?(?:假设|虚构|编造)")
 
 
 def _inferred_acceptance_method(fragment: str, kind: str) -> str:
     """Infer executable checks only where the user's wording makes them concrete."""
     text = fragment.strip()
+    if kind == "pptx":
+        pages = re.search(r"(?:生成|制作|交付)?\s*(\d+)\s*页(?:含封面|包含封面|带封面)?", text)
+        if pages:
+            cover = "，并确认首页为封面" if any(word in text for word in ("含封面", "包含封面", "带封面")) else ""
+            return f"检查最终 PPTX 的实际幻灯片数为 {pages.group(1)} 页{cover}，并核对文件语言和主题要求。"
+        if "原生" in text and "图表" in text:
+            return "检查 PPTX 中有原生图表对象及内嵌图表数据工作簿，确认图表可编辑。"
+        if "图表" in text and any(word in text for word in ("附件数值", "附件数据", "来源数值")):
+            return "逐项读取图表系列、分类和数值，与附件原始记录核对；不一致标记 failed。"
+        if any(word in text for word in ("不能自行猜测", "不可猜测", "不得猜测")):
+            return "核对原因分析是否有附件或用户原话依据；无依据的原因必须明确标为待确认。"
+        if "待确认" in text:
+            return "检查成品对应缺失信息明确写为待确认，且未写成已确定事实。"
+        if "三周" in text or "3 周" in text:
+            return "核对成品的三周进展内容与附件记录逐项一致，并确认面向项目负责人的汇报目的。"
     if re.search(r"(?:控制在|不超过|最多)\s*(?:一|1)\s*页|(?:一|1)\s*页以内", text):
         return "检查最终文件的真实页数，要求不超过 1 页；分页能力不可用时标记 unchecked。"
     page_count = re.search(r"(?:恰好|正好|共)\s*(\d+)\s*页", text)
@@ -64,6 +79,18 @@ def _attachment_has_quote(context: str, name: str, location: str, quote: str) ->
         if quote in context[marker.end():end]:
             return True
     return False
+
+
+def _attachment_fragments(context: str):
+    """Yield exact, located source sentences for deterministic coverage fallback."""
+    markers = list(_SOURCE.finditer(context or ""))
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(context)
+        body = context[marker.end():end].strip()
+        for part in re.split(r"(?<=[。；;])\s*|\n+", body):
+            quote = part.strip()
+            if quote:
+                yield marker.group(1).strip(), marker.group(2).strip(), quote
 
 
 def build_contract(
@@ -121,6 +148,23 @@ def build_contract(
             "source": {"type": "attachment", "name": name, "location": location, "quote": quote},
             "status": "ready" if method else "unchecked",
         })
+    uncovered_attachment = False
+    for name, location, quote in _attachment_fragments(attachment_context):
+        if any(c["source"]["type"] == "attachment"
+               and c["source"].get("name") == name
+               and c["source"].get("location") == location
+               and quote in c["source"]["quote"]
+               for c in clauses):
+            continue
+        if len(quote) > 500 or len(clauses) >= 60:
+            uncovered_attachment = True
+            continue
+        method = ("逐项核对最终产物引用的该附件片段中的数值、名称、状态和统计口径；"
+                  "图表数据须与原文一致，未提供的信息不得补造。")
+        clauses.append({"requirement_id": f"R{len(clauses) + 1}", "text": quote,
+                        "priority": "P1", "acceptance_method": method,
+                        "source": {"type": "attachment", "name": name, "location": location,
+                                   "quote": quote}, "status": "ready"})
     missing = model.get("missing_info") if isinstance(model.get("missing_info"), list) else []
     assumptions = model.get("allowed_assumptions") if isinstance(model.get("allowed_assumptions"), list) else []
     authorized_assumptions = [str(x).strip() for x in assumptions
@@ -143,6 +187,8 @@ def build_contract(
         reasons.append("附件文本缺少可定位的文件来源")
     if attached and not any(c["source"]["type"] == "attachment" for c in clauses):
         reasons.append("附件条款尚未逐条标注")
+    if uncovered_attachment:
+        reasons.append("部分附件片段过长或数量超限，尚未逐条标注")
     kind = model.get("target_kind") if model.get("target_kind") in _KINDS else deliver_kind
     if kind not in _KINDS:
         reasons.append("目标产物类型尚未确定")

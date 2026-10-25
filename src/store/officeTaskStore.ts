@@ -44,7 +44,10 @@ export function statusMeta(status: string) {
 export function displayTaskMeta(status: string, running: boolean) {
   const meta = statusMeta(status)
   if (running || meta.done) return meta
-  return { ...meta, label: '未完成', tone: 'gray', progress: 0, done: true }
+  // 结束后不再用「进行中」口径：没通过验收的任务直接标成未验收/未通过，避免与进度条矛盾
+  const label =
+    status === '打回' ? '未通过' : status === '待测试' || status === '待评审' ? '未验收' : '未完成'
+  return { ...meta, label, tone: 'gray', progress: 0, done: true }
 }
 
 export function assigneeName(rosterNo: number | null | undefined) {
@@ -52,7 +55,7 @@ export function assigneeName(rosterNo: number | null | undefined) {
   return AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
 }
 
-/** 任务完成度只统计真正通过的任务；已取消任务不计入分母。 */
+/** 任务完成度只统计真正通过验收的任务；已取消任务不计入分母。 */
 export function computeSprintProgress(tasks: SprintTask[]): {
   percent: number
   done: number
@@ -63,8 +66,42 @@ export function computeSprintProgress(tasks: SprintTask[]): {
   const total = active.length
   if (total === 0) return { percent: 0, done: 0, total: 0, hasTasks: false }
   const done = active.filter((t) => t.status === '通过').length
-  const percent = Math.round((done / total) * 100)
-  return { percent, done, total, hasTasks: true }
+  return { percent: Math.round((done / total) * 100), done, total, hasTasks: true }
+}
+
+/** 各任务状态对应的推进权重：只在任务"通过"时才计分会让进度条长时间卡在 0%。 */
+const STATUS_WEIGHT: Record<string, number> = {
+  待分派: 0,
+  待开发: 0.15,
+  待测试: 0.6,
+  待评审: 0.85,
+  打回: 0.4,
+  通过: 1,
+}
+
+/**
+ * 加权任务推进度：开发中/测试中/待评审都能体现为部分完成，
+ * 让顶部进度条随每个任务状态变化持续前进，而不是只在通过时跳一下。
+ */
+export function weightedSprintProgress(tasks: SprintTask[]): {
+  percent: number
+  done: number
+  total: number
+  cancelled: number
+  hasTasks: boolean
+} {
+  const active = tasks.filter((t) => t.status !== '已取消')
+  const total = active.length
+  if (total === 0)
+    return { percent: 0, done: 0, total: 0, cancelled: tasks.length, hasTasks: false }
+  const score = active.reduce((sum, task) => sum + (STATUS_WEIGHT[task.status] ?? 0), 0)
+  return {
+    percent: Math.round((score / total) * 100),
+    done: active.filter((t) => t.status === '通过').length,
+    total,
+    cancelled: tasks.length - total,
+    hasTasks: true,
+  }
 }
 
 const ACTIVITY_LIMIT = 8
@@ -176,10 +213,6 @@ export function setSprintRunning(running: boolean) {
   sprintRunning = running
   if (!running) sprintPaused = false
   notify()
-}
-
-export function isSprintPaused(): boolean {
-  return sprintPaused
 }
 
 export function setSprintPaused(paused: boolean) {

@@ -128,7 +128,7 @@ def inspect(sprint_id: str, task_id: str) -> tuple[bool, str, dict]:
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         return False, "贡献清单缺少实际文件", manifest
-    if manifest.get("status", "ready") != "ready":
+    if manifest.get("status", "ready") not in ("ready", "completed"):
         details = manifest.get("scope_issues")
         return False, ("角色文件范围违规：" + json.dumps(details, ensure_ascii=False)
                        if details else "贡献生成未完成，不能作为有效交付"), manifest
@@ -152,6 +152,18 @@ def inspect(sprint_id: str, task_id: str) -> tuple[bool, str, dict]:
         if _digest(candidate.read_bytes()) != digest:
             return False, "贡献文件已被改动，旧交接失效", manifest
     return True, "", manifest
+
+
+def mark_completed(sprint_id: str, task_id: str) -> bool:
+    """Mark a submitted contribution complete after its owning workflow step ran."""
+    valid, _, manifest = inspect(sprint_id, task_id)
+    if not valid:
+        return False
+    if manifest.get("status") == "completed":
+        return True
+    manifest["status"] = "completed"
+    _save_manifest(sprint_id, task_id, manifest)
+    return True
 
 
 def scan_conflicts(sprint_id: str) -> list[dict]:

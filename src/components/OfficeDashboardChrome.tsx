@@ -28,9 +28,12 @@ import {
   getTasksSnapshot,
   isSprintRunning,
   subscribeSprintData,
+  weightedSprintProgress,
   type SprintTask,
 } from '@/store/officeTaskStore'
 import {
+  clearArtifactPulse,
+  getArtifactPulseAt,
   getToastKind,
   getToastSnapshot,
   showToast,
@@ -48,6 +51,7 @@ import {
   getActiveWorkspace,
   getSprintHistory,
   getViewedSprint,
+  getViewedSprintMeta,
   isSprintDialogOpen,
   openSprintDialog,
   refreshSprintHistory,
@@ -60,12 +64,12 @@ import {
   type OfficeView,
 } from '@/store/officeViewStore'
 
-const NAV_ITEMS: { label: string; view: OfficeView }[] = [
-  { label: '概览', view: 'home' },
-  { label: '任务', view: 'tasks' },
-  { label: '交付', view: 'artifacts' },
-  { label: '团队', view: 'agents' },
-  { label: '对话', view: 'chat' },
+const NAV_ITEMS: { label: string; view: OfficeView; hint: string }[] = [
+  { label: '概览', view: 'home', hint: '办公室全景与实时动态' },
+  { label: '任务', view: 'tasks', hint: '任务看板：进度、负责人与任务详情' },
+  { label: '交付', view: 'artifacts', hint: '最终交付物、过程文件与验收结果' },
+  { label: '团队', view: 'agents', hint: '六位成员的名册、API 配置与技能' },
+  { label: '对话', view: 'chat', hint: '与团队对话，可直接发起新任务' },
 ]
 
 function SidebarIcon({ view }: { view: OfficeView }) {
@@ -110,8 +114,11 @@ export function OfficeSidebar() {
   const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
   const unread = useSyncExternalStore(subscribeNotifications, getUnreadSnapshot)
   const activeView = useSyncExternalStore(subscribeView, getActiveView)
+  const pulseAt = useSyncExternalStore(subscribeToast, getArtifactPulseAt)
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const [importing, setImporting] = useState(false)
+  // 产物落地后「交付」闪一下「新」徽标；6 秒自动熄灭，点开「交付」立即熄灭
+  const showNewArtifacts = pulseAt > 0 && activeView !== 'artifacts'
 
   /** 导入备份 zip：成功后需重启后端并刷新页面才能看到恢复的数据 */
   async function importBackup(file: File) {
@@ -147,15 +154,20 @@ export function OfficeSidebar() {
 
   const navItems = NAV_ITEMS.map((item) => {
     if (item.view === 'tasks') {
-      return { ...item, badge: running && !viewedSprint && tasks.length > 0 ? tasks.length : undefined }
+      return { ...item, badge: running && !viewedSprint && tasks.length > 0 ? tasks.length : undefined, fresh: false }
+    }
+    if (item.view === 'artifacts') {
+      return { ...item, badge: showNewArtifacts ? '新' : undefined, fresh: showNewArtifacts }
     }
     if (item.view === 'notifications') {
-      return { ...item, badge: unread > 0 ? unread : undefined }
+      return { ...item, badge: unread > 0 ? unread : undefined, fresh: false }
     }
-    return { ...item, badge: undefined }
+    return { ...item, badge: undefined, fresh: false }
   })
 
   function handleNav(item: (typeof NAV_ITEMS)[number]) {
+    // 点开「交付」即视为已看过新产物，提醒立即熄灭
+    if (item.view === 'artifacts') clearArtifactPulse()
     setActiveView(item.view)
   }
 
@@ -170,6 +182,7 @@ export function OfficeSidebar() {
         type="button"
         className="sidebar-search"
         onClick={() => setSearchOpen(true)}
+        title="全局搜索：功能、历史任务、产物与员工（⌘K）"
       >
         <span>⌕</span>
         <span>搜索功能、任务、员工…</span>
@@ -183,13 +196,15 @@ export function OfficeSidebar() {
             type="button"
             className={`nav-item ${NAV_GROUPS[item.view]?.includes(activeView) ? 'active' : ''}`}
             onClick={() => handleNav(item)}
+            title={item.view === 'artifacts' && item.badge ? `${item.hint}（有新产物）` : item.hint}
+            aria-label={`${item.label}：${item.hint}`}
           >
             <span className="nav-main">
               <span className="nav-icon"><SidebarIcon view={item.view} /></span>
               <span>{item.label}</span>
             </span>
             {item.badge ? (
-              <span className="nav-badge">{item.badge}</span>
+              <span className={`nav-badge ${item.fresh ? 'is-new' : ''}`}>{item.badge}</span>
             ) : null}
           </button>
         ))}
@@ -197,22 +212,23 @@ export function OfficeSidebar() {
 
       <div className="sidebar-footer">
         <div className="sidebar-utility-row">
-          <button type="button" className={`sidebar-utility ${activeView === 'notifications' ? 'active' : ''}`} onClick={() => setActiveView('notifications')} aria-label={`通知${unread ? `，${unread} 条未读` : ''}`}>
+          <button type="button" className={`sidebar-utility ${activeView === 'notifications' ? 'active' : ''}`} onClick={() => setActiveView('notifications')} aria-label={`通知${unread ? `，${unread} 条未读` : ''}`} title="通知中心：Sprint 与任务的状态提醒">
             <SidebarIcon view="notifications" /> 通知 {unread > 0 ? <span className="nav-badge">{unread}</span> : null}
           </button>
           <details className="sidebar-more">
-            <summary>⋯ 更多工具</summary>
-            <button type="button" onClick={() => setActiveView('browser')}>浏览器助手</button>
+            <summary title="浏览器助手与数据备份/恢复">⋯ 更多工具</summary>
+            <button type="button" onClick={() => setActiveView('browser')} title="浏览器助手：打开网页并在站内浏览">浏览器助手</button>
             <details className="sidebar-data">
-              <summary>数据管理</summary>
+              <summary title="导出整个工作区备份，或从备份恢复">数据管理</summary>
               <div className="sidebar-backup-row">
-                <a href={`${OFFICE_API_BASE}/api/backup/export`} download>
+                <a href={`${OFFICE_API_BASE}/api/backup/export`} download title="打包下载 office.db 与产物目录">
                   💾 导出备份
                 </a>
                 <button
                   type="button"
                   disabled={importing}
                   onClick={() => importInputRef.current?.click()}
+                  title="导入备份 zip，导入后需重启后端并刷新页面"
                 >
                   {importing ? '导入中…' : '📥 导入备份'}
                 </button>
@@ -325,7 +341,11 @@ export function OfficeHeaderStats() {
   const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
   const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
   const meta = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
-  const showCurrent = running && !viewedSprint
+  const history = useSyncExternalStore(subscribeView, getSprintHistory)
+  const viewedMeta = useSyncExternalStore(subscribeView, getViewedSprintMeta)
+  // 本轮 Sprint 结束后仍保留进度条与花费，避免一结束就全部消失。
+  const hasCurrent = Boolean(meta.id) && !viewedSprint
+  const lastSprint = history[0]
   // 定时器驱动重渲染，让 AI 员工卡实时反映场景里的真实状态
   const [, forceTick] = useState(0)
   useEffect(() => {
@@ -333,9 +353,9 @@ export function OfficeHeaderStats() {
     return () => clearInterval(timer)
   }, [])
 
-  const total = showCurrent ? tasks.length : 0
-  const done = showCurrent ? tasks.filter((task) => task.status === '通过').length : 0
-  const pending = showCurrent ? tasks.filter((task) => !['通过', '已取消'].includes(task.status)).length : 0
+  const total = hasCurrent ? tasks.length : 0
+  const done = hasCurrent ? tasks.filter((task) => task.status === '通过').length : 0
+  const pending = hasCurrent ? tasks.filter((task) => !['通过', '已取消'].includes(task.status)).length : 0
 
   const agents = getOfficeAgents()
   const busy = agents.filter(
@@ -346,13 +366,15 @@ export function OfficeHeaderStats() {
     {
       label: '本轮任务',
       value: String(total),
-      hint: running ? 'Sprint 进行中' : '等待新任务',
-      online: false,
+      hint: running
+        ? `Sprint 进行中${busy > 0 ? ` · ${busy} 人工作中` : ' · 全员待命'}`
+        : '本轮已结束',
+      online: busy > 0,
     },
     {
       label: '已完成',
       value: String(done),
-      hint: '本轮 Sprint',
+      hint: running ? '本轮 Sprint' : '本轮最终结果',
       online: false,
     },
     {
@@ -362,17 +384,17 @@ export function OfficeHeaderStats() {
       online: false,
     },
     {
-      label: 'AI 员工',
-      value: `${busy}/${agents.length || 6}`,
-      hint: busy > 0 ? `${busy} 人工作中` : '全员待命',
-      online: true,
+      label: '本轮花费',
+      value: `¥${meta.cost.toFixed(2)}`,
+      hint: meta.budget > 0 ? `上限 ¥${meta.budget.toFixed(2)}` : '按 tokens 估算',
+      online: false,
     },
   ]
 
   return (
     <>
       <header className="office-header-stats">
-        {showCurrent ? stats.map((stat) => (
+        {hasCurrent ? stats.map((stat) => (
           <section key={stat.label} className="stat-card">
             <span className="stat-label">{stat.label}</span>
             <strong className="stat-value">{stat.value}</strong>
@@ -385,12 +407,22 @@ export function OfficeHeaderStats() {
           <section className="stat-card idle-stat-card">
             <span className="stat-label">当前状态</span>
             <strong className="stat-value">{viewedSprint ? '正在查看历史记录' : '暂无进行中的任务'}</strong>
-            <span className="stat-hint">{viewedSprint ? '切回当前 Sprint 可查看实时状态' : '上轮任务可在「任务」中查看'}</span>
+            <span className="stat-hint">
+              {viewedSprint
+                ? '在顶部「查看记录」选择「当前 Sprint」即可切回实时状态'
+                : lastSprint
+                  ? `上一轮：${lastSprint.artifact_count} 个产物${lastSprint.usage_cost ? `，花费 ¥${lastSprint.usage_cost.toFixed(2)}` : ''}，可在顶部「查看记录」回看`
+                  : '发起第一个 Sprint 后，这里会显示进度、完成度与花费'}
+            </span>
           </section>
         )}
         <OfficeSystemResources />
         <ThemeToggle />
-        {meta.id && showCurrent ? <SprintProgress meta={meta} running={running} /> : null}
+        {hasCurrent ? (
+          <SprintProgress meta={meta} running={running} />
+        ) : viewedMeta ? (
+          <SprintProgress meta={viewedMeta} running={false} />
+        ) : null}
       </header>
       <SprintHistoryPicker />
     </>
@@ -413,7 +445,7 @@ function SprintHistoryPicker() {
   async function removeSprint() {
     if (!current || deleting) return
     const ok = window.confirm(
-      `确定删除 Sprint「${current.requirement.slice(0, 30) || current.id}」？\n` +
+      `确定删除这条记录「${current.requirement.slice(0, 30) || current.id}」？\n` +
         `将一并删除其任务、产物、事件记录与磁盘文件（约 ${current.artifact_count} 个产物），不可恢复。`,
     )
     if (!ok) return
@@ -427,7 +459,7 @@ function SprintHistoryPicker() {
         showToast(detail?.detail ?? '删除失败')
         return
       }
-      showToast('历史 Sprint 已删除')
+      showToast('历史记录已删除')
       await setViewedSprint('')
       await refreshSprintHistory()
     } catch {
@@ -444,7 +476,7 @@ function SprintHistoryPicker() {
         value={viewedSprint}
         onChange={(event) => void setViewedSprint(event.target.value)}
       >
-        <option value="">当前 Sprint（实时）</option>
+        <option value="">本轮任务（实时）</option>
         {history.map((item) => (
           <option key={item.id} value={item.id}>
             {new Date(item.started_at * 1000).toLocaleString()} ·{' '}
@@ -455,13 +487,13 @@ function SprintHistoryPicker() {
       </select>
       {viewedSprint ? (
         <>
-          <span className="sprint-picker-viewing">正在查看历史 Sprint（只读）</span>
+          <span className="sprint-picker-viewing">正在查看历史记录（只读）</span>
           <button
             type="button"
             className="sprint-picker-btn"
             onClick={() => void setViewedSprint('')}
           >
-            返回当前
+            返回本轮
           </button>
           <button
             type="button"
@@ -469,7 +501,7 @@ function SprintHistoryPicker() {
             disabled={deleting}
             onClick={() => void removeSprint()}
           >
-            {deleting ? '删除中…' : '删除该 Sprint'}
+            {deleting ? '删除中…' : '删除这条记录'}
           </button>
         </>
       ) : null}
@@ -477,16 +509,18 @@ function SprintHistoryPicker() {
   )
 }
 
+/** 阶段在整个 Sprint 里的位置：必须与后端 graph.py 的真实阶段名一致，未知阶段会退回 0%。 */
 const STAGE_PROGRESS: Record<string, number> = {
-  准备开工: 5,
-  需求拆解: 20,
-  任务分派: 32,
-  并行开发: 55,
-  测试验证: 70,
-  技术评审: 82,
-  缺陷修复: 88,
-  交付成品: 94,
+  准备开工: 3,
+  需求拆解: 12,
+  任务分派: 22,
+  并行开发: 45,
+  测试验证: 66,
+  技术评审: 80,
+  定点返工: 88,
+  形成候选成品: 94,
   复盘收尾: 97,
+  发布或保留候选: 99,
   已完成: 100,
   已归档: 100,
   已手动结束: 100,
@@ -494,6 +528,9 @@ const STAGE_PROGRESS: Record<string, number> = {
   交付待验证: 100,
   交付待修正: 100,
   直接生成成品: 100,
+  // 兼容旧阶段名
+  缺陷修复: 88,
+  交付成品: 94,
 }
 
 function formatDuration(seconds: number): string {
@@ -503,7 +540,7 @@ function formatDuration(seconds: number): string {
   return m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`
 }
 
-/** 顶部进度条：阶段进度 + 任务完成度（百分比）、已耗时、本次花费 */
+/** 顶部进度条：整体进度（阶段位置 + 任务推进加权）、已耗时、本次花费 */
 function SprintProgress({
   meta,
   running,
@@ -521,46 +558,83 @@ function SprintProgress({
   }, [running, meta.stage])
 
   const stageProgress = STAGE_PROGRESS[meta.stage] ?? 0
-  const taskProgress = computeSprintProgress(tasks)
+  const weighted = weightedSprintProgress(tasks)
+  const passed = computeSprintProgress(tasks)
   const clock = now || meta.finishedAt || meta.startedAt
   const elapsed = (meta.finishedAt || clock) - (meta.startedAt || clock)
   const stageElapsed = meta.stageStarted ? clock - meta.stageStarted : 0
+  const completed = !running && meta.status === 'completed'
+  const allPassed = !passed.hasTasks || passed.done === passed.total
+  // 运行中：阶段位置 40% + 任务推进 60%（按状态加权，进度能持续前进）；
+  // 已结束：只看真正通过验收的任务数，与每张任务卡、已完成统计保持同一口径。
+  const taskPercent = running ? weighted.percent : passed.percent
+  const overall = running
+    ? !weighted.hasTasks
+      ? stageProgress
+      : Math.round(stageProgress * 0.4 + weighted.percent * 0.6)
+    : passed.hasTasks
+      ? passed.percent
+      : completed
+        ? 100
+        : stageProgress
+  const outcome = running
+    ? meta.stage || '进行中'
+    : meta.status === 'completed'
+      ? allPassed
+        ? '本轮已完成'
+        : '本轮已结束 · 验收未完成'
+      : ({ failed: '本轮未通过验收', stopped: '本轮已手动结束',
+           budget: '已达预算上限' }[meta.status] ?? '本轮已结束')
+  const remaining = meta.budget > 0 ? Math.max(0, meta.budget - meta.cost) : 0
+  const barHint = !passed.hasTasks && !weighted.hasTasks
+    ? `整体 ${overall}%：当前处于「${outcome}」阶段，尚无任务明细`
+    : running
+      ? `整体 ${overall}% = 阶段「${outcome}」${stageProgress}% × 40% + 任务推进 ${weighted.percent}% × 60%`
+      : `整体 ${overall}%：按通过验收的任务计（${passed.done}/${passed.total}），未验收/打回的任务不计入`
 
   return (
-    <section className="sprint-progress">
+    <section className={`sprint-progress ${running ? '' : 'is-finished'}`}>
       <div className="sprint-progress-head">
-        <strong>{running ? meta.stage || '进行中' : '本轮已结束'}</strong>
+        <strong>整体进度 {overall}%</strong>
         <span>
-          总用时 {formatDuration(elapsed)}
+          {outcome}
+          {` · 总用时 ${formatDuration(elapsed)}`}
           {running && meta.stageStarted
             ? ` · 本阶段 ${formatDuration(stageElapsed)}`
             : ''}
           {meta.fast ? ' · 极速模式' : ''}
         </span>
-        <em>
-          当前 Sprint 预计花费 ¥{meta.cost.toFixed(3)}
-          {meta.budget > 0 ? ` / 上限 ¥${meta.budget.toFixed(2)}` : ''}
+        <em title="按 tokens 估算，可在「用量」页查看明细">
+          本轮花费 ¥{meta.cost.toFixed(3)}
+          {meta.budget > 0 ? ` / 上限 ¥${meta.budget.toFixed(2)} · 余 ¥${remaining.toFixed(2)}` : ''}
         </em>
       </div>
-      <div className="sprint-progress-bar">
-        <span style={{ width: `${stageProgress}%` }} />
+      <div
+        className="sprint-progress-bar"
+        role="progressbar"
+        aria-valuenow={overall}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label="本轮整体进度"
+        title={barHint}
+      >
+        <span style={{ width: `${overall}%` }} />
       </div>
       <div className="sprint-task-progress">
         <div className="sprint-task-progress-head">
-          <span>任务完成度</span>
-          <strong>
-            {taskProgress.hasTasks ? `${taskProgress.percent}%` : '—'}
-          </strong>
+          <span>{running ? '任务推进' : '验收通过率'}</span>
+          <strong>{passed.hasTasks || weighted.hasTasks ? `${taskPercent}%` : '—'}</strong>
           <em>
-            {taskProgress.hasTasks
-              ? `已完成 ${taskProgress.done}/${taskProgress.total}`
+            {weighted.hasTasks
+              ? `通过 ${passed.done}/${passed.total}`
               : '暂无任务'}
+            {weighted.cancelled ? ` · 已取消 ${weighted.cancelled}` : ''}
           </em>
         </div>
         <div className="sprint-task-progress-bar">
           <span
-            style={{ width: `${taskProgress.percent}%` }}
-            className={taskProgress.percent >= 100 ? 'is-done' : ''}
+            style={{ width: `${taskPercent}%` }}
+            className={taskPercent >= 100 ? 'is-done' : ''}
           />
         </div>
       </div>
@@ -579,6 +653,7 @@ export function TaskDetailDialog({
   onClose: () => void
 }) {
   const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
+  const sprintMeta = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
   const meta = displayTaskMeta(task.status, running)
   const artifacts = useSyncExternalStore(subscribeArtifacts, getArtifactsSnapshot)
   const related = artifacts.filter((a) => a.task_id === task.id)
@@ -707,6 +782,11 @@ export function TaskDetailDialog({
           <h4>用户故事</h4>
           <p>{task.user_story || '历史任务未记录用户故事'}</p>
           <p>优先级：{task.priority ?? '未记录'} · 工作量：{task.story_points ?? '未记录'} 故事点</p>
+          <p>
+            本轮累计花费：¥{sprintMeta.cost.toFixed(3)}
+            {sprintMeta.budget > 0 ? ` / 上限 ¥${sprintMeta.budget.toFixed(2)}` : ''}
+            <span className="view-card-meta">（整轮 Sprint 合计，按 tokens 估算）</span>
+          </p>
           <h4>验收标准</h4>
           {task.acceptance_criteria?.length ? (
             <ul>{task.acceptance_criteria.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul>
@@ -795,6 +875,7 @@ export function OfficeRightPanel() {
     getActivitiesSnapshot,
   )
   const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
+  const meta = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
   const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
   const showCurrent = running && !viewedSprint
   const activeWorkspace = useSyncExternalStore(
@@ -811,24 +892,36 @@ export function OfficeRightPanel() {
   return (
     <aside className="office-right-panel">
       <section className="panel-section">
-        <h2>
-          当前任务{showCurrent ? ' · 进行中' : ''}
-          {activeWorkspace > 0 ? ` · ${workspaceLabel}` : ''}
-        </h2>
+        <div className="panel-head">
+          <h2>
+            {viewedSprint
+              ? '历史任务 · 只读'
+              : `当前任务${showCurrent ? ' · 进行中' : tasks.length ? ' · 本轮结果' : ''}`}
+            {activeWorkspace > 0 ? ` · ${workspaceLabel}` : ''}
+          </h2>
+          {meta.id ? (
+            <span className="panel-cost" title="本轮 Sprint 累计花费（按 tokens 估算）">
+              ¥{meta.cost.toFixed(3)}
+              {meta.budget > 0 ? ` / ¥${meta.budget.toFixed(2)}` : ''}
+            </span>
+          ) : null}
+        </div>
         <div className="task-list">
-          {!showCurrent ? (
+          {filteredTasks.length === 0 ? (
             <div className="task-idle-state">
-              <p>{viewedSprint ? '正在查看历史记录。' : '当前没有进行中的任务。'}</p>
+              <p>
+                {viewedSprint
+                  ? '正在查看历史记录。'
+                  : tasks.length === 0
+                    ? '当前没有进行中的任务。'
+                    : '当前筛选条件下没有任务，可切换到「全部」查看。'}
+              </p>
               {tasks.length > 0 ? (
-                <button type="button" onClick={() => setActiveView('tasks')}>查看任务记录</button>
+                <button type="button" onClick={() => setActiveView('tasks')}>
+                  查看任务记录
+                </button>
               ) : null}
             </div>
-          ) : filteredTasks.length === 0 ? (
-            <p style={EMPTY_PANEL_STYLE}>
-              {tasks.length === 0
-                ? '暂无任务，发起 Sprint 后这里实时显示进展'
-                : '当前筛选条件下没有任务，可切换到「全部」查看'}
-            </p>
           ) : (
             filteredTasks.map((task) => (
               <TaskCard key={task.id} task={task} onOpen={() => setDetailTask(task)} />

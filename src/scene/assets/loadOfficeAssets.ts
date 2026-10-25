@@ -24,10 +24,6 @@ export function getOfficeChairTexture(): Texture | null {
   return chairTexture
 }
 
-export function isOfficeAssetsReady(): boolean {
-  return deskTexture != null && chairTexture != null
-}
-
 export async function loadOfficeAssets(): Promise<boolean> {
   let deskOk = false
 

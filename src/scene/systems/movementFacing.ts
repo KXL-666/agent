@@ -45,7 +45,3 @@ export function talkFacingToward(
   const viewFacing = resolveTalkViewFacing(fromX, fromY, targetX, targetY)
   return { viewFacing, facing: viewFacingToLR(viewFacing) }
 }
-
-export function isHorizontalWalk(dx: number, dy: number): boolean {
-  return Math.abs(dx) >= Math.abs(dy)
-}

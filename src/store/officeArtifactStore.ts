@@ -1,7 +1,5 @@
 /** 产物（PRD/开发说明/测试报告/评审记录/总结）的轻量响应式 store */
 
-import { OFFICE_API_BASE } from '@/config/officeMode'
-
 export type OfficeArtifact = {
   id: string
   kind: 'prd' | 'dev' | 'test' | 'review' | 'summary' | 'custom' | 'final'
@@ -39,14 +37,8 @@ export function subscribeArtifacts(listener: () => void) {
   }
 }
 
-const EMPTY: OfficeArtifact[] = []
-
 export function getArtifactsSnapshot(): OfficeArtifact[] {
   return items
-}
-
-export function getArtifactsEmpty(): OfficeArtifact[] {
-  return EMPTY
 }
 
 /** 全量替换（文件中心拉取时用） */
@@ -93,32 +85,4 @@ export function getViewedSprint(): string {
   return viewedSprintId
 }
 
-/** 从后端加载指定 Sprint 的产物（历史记录浏览） */
-export async function loadSprintArtifacts(sprintId: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${OFFICE_API_BASE}/api/sprints/${sprintId}`)
-    if (!res.ok) return false
-    const payload = (await res.json()) as {
-      tasks?: unknown[]
-      artifacts?: OfficeArtifact[]
-    }
-    setArtifacts(payload.artifacts ?? [])
-    viewedSprintId = sprintId
-    notify()
-    return true
-  } catch {
-    return false
-  }
-}
 
-/**
- * 真产物判定：最终交付物、老板直接生成的成品，或带真实可下载文件的产物。
- * 过程性内容（开发说明等纯 Markdown 记录）不算产物，只在文件中心展示。
- */
-export function isRealArtifact(artifact: OfficeArtifact): boolean {
-  return (
-    artifact.kind === 'final' ||
-    artifact.kind === 'custom' ||
-    Boolean(artifact.file_name)
-  )
-}

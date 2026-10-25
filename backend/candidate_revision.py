@@ -34,6 +34,33 @@ def _replace_once(texts: list[tuple[object, str]], old: str, new: str) -> bool:
     return True
 
 
+def _refit_length(kind: str, source: Path, target: Path, spec: str) -> tuple[str | None, str, dict]:
+    """整篇篇幅返工：按统一字数口径确定性压缩同源正文，不做逐段替换。"""
+    source_markdown = artifact_quality.report_directory(source, forge.WORKSPACE_DIR) / "source.md"
+    if kind not in ("docx", "pdf") or not source_markdown.is_file():
+        return None, "篇幅返工需要 Word/PDF 的同源正文", {}
+    content = source_markdown.read_text(encoding="utf-8")
+    before = artifact_quality.counted_length(forge._docx_prose(content))
+    updated = forge._fit_docx_length(forge._reconcile_pending_claims(content), spec)
+    after = artifact_quality.counted_length(forge._docx_prose(updated))
+    if after == before:
+        return None, f"篇幅 {before} 字未能继续压缩（缺少可删减的完整句子）", {"before": before, "after": after}
+    if kind == "pdf":
+        from pdf_builder import build_pdf
+        if not build_pdf(forge._parse_docx_markdown(updated), str(target)):
+            return None, "PDF 篇幅返工生成失败", {}
+    else:
+        cover = artifact_quality.contract(spec, "docx")["cover"]
+        if not forge._build_docx(updated, str(target), cover=cover):
+            return None, "Word 篇幅返工生成失败", {}
+    target_quality = artifact_quality.report_directory(target, forge.WORKSPACE_DIR)
+    target_quality.mkdir(parents=True, exist_ok=True)
+    (target_quality / "source.md").write_text(updated, encoding="utf-8")
+    budget = artifact_quality.length_budget(spec, "docx") or {}
+    detail = {"location": "全文", "before": before, "after": after, "target": budget.get("target")}
+    return str(target), f"篇幅按统一口径压缩 {before}→{after} 字（目标 {budget.get('target', '未指定')}）", detail
+
+
 def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
           project_dir: str = "") -> tuple[str | None, str, dict]:
     source_name = forge.safe_deliverable_path(source_file)
@@ -43,7 +70,15 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
     target = _destination(sprint_id, source)
     location = str(patch.get("location") or "").strip()
     replacement = patch.get("replacement")
-    if replacement is None or replacement == "":
+    operation = str(patch.get("operation") or "replace").strip().lower()
+    if operation == "refit_length":
+        try:
+            return _refit_length(kind, source, target, str(patch.get("requirement") or ""))
+        except (OSError, RuntimeError, ValueError) as error:
+            return None, f"篇幅返工失败：{error}", {}
+    if operation == "delete" and kind != "docx":
+        return None, "仅 Word 完整段落支持删除修订", {}
+    if operation != "delete" and (replacement is None or replacement == ""):
         return None, "缺少具体替换内容", {}
     detail = {}
     try:
@@ -52,12 +87,19 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
             if not old:
                 return None, "Word 修订需要精确旧文本", {}
             doc = Document(source)
-            candidates = [(p, p.text) for p in doc.paragraphs]
-            candidates += [(cell, cell.text) for table in doc.tables for row in table.rows for cell in row.cells]
-            if not _replace_once(candidates, old, str(replacement)):
-                return None, "Word 目标文字不存在或匹配不唯一", {}
+            if operation == "delete":
+                matches = [p for p in doc.paragraphs if p.text.strip() == old.strip()]
+                if len(matches) != 1 or len(doc.paragraphs) <= 1:
+                    return None, "Word 删除需要唯一的完整段落，且不能删除全部正文", {}
+                element = matches[0]._element
+                element.getparent().remove(element)
+            else:
+                candidates = [(p, p.text) for p in doc.paragraphs]
+                candidates += [(cell, cell.text) for table in doc.tables for row in table.rows for cell in row.cells]
+                if not _replace_once(candidates, old, str(replacement)):
+                    return None, "Word 目标文字不存在或匹配不唯一", {}
             doc.save(target)
-            detail = {"location": location or old, "old_text": old}
+            detail = {"location": location or old, "old_text": old, "operation": operation}
         elif kind == "pdf":
             old = str(patch.get("old_text") or "")
             source_markdown = artifact_quality.report_directory(source, forge.WORKSPACE_DIR) / "source.md"

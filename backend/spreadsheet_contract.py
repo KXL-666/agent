@@ -13,6 +13,8 @@ def budget_records(source: str) -> list[dict]:
         label = match.group(1).strip()
         # Attachment wrappers may precede the line; use the last logical label.
         label = re.split(r"[\n。；;]", label)[-1].strip()
+        # Markdown 表格行（"| 1 | 界面设计"）只保留最后一段名称，避免把行号当成项目名。
+        label = re.split(r"[|｜]", label)[-1].strip()
         budget, actual = float(match.group(2).replace(",", "")), float(match.group(3).replace(",", ""))
         result.append({"project": label, "budget": budget,
                        "actual": actual,

@@ -43,3 +43,33 @@ export function showToast(
     opts?.durationMs ?? (kind === 'success' ? 6000 : 2600),
   )
 }
+
+/** 产物就绪脉冲：Sprint 收尾/成品落地时点亮左侧「交付」，6 秒后自动熄灭 */
+let artifactPulseAt = 0
+let artifactPulseTimer: ReturnType<typeof setTimeout> | null = null
+
+export function getArtifactPulseAt(): number {
+  return artifactPulseAt
+}
+
+export function pulseArtifacts() {
+  artifactPulseAt = Date.now()
+  if (artifactPulseTimer) clearTimeout(artifactPulseTimer)
+  artifactPulseTimer = setTimeout(() => {
+    artifactPulseTimer = null
+    artifactPulseAt = 0
+    notify()
+  }, 6000)
+  notify()
+}
+
+/** 用户已经点开「交付」看过：立即结束提醒，不再显示徽标 */
+export function clearArtifactPulse() {
+  if (artifactPulseTimer) {
+    clearTimeout(artifactPulseTimer)
+    artifactPulseTimer = null
+  }
+  if (!artifactPulseAt) return
+  artifactPulseAt = 0
+  notify()
+}

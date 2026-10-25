@@ -1,6 +1,7 @@
 """LEAD always sees QA evidence and cannot approve a different file version."""
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,48 @@ class ReviewDecisionTest(unittest.TestCase):
         self.assertIn("25 C 输出错误", calls[0])
         self.assertEqual(decision["status"], "failed")
         self.assertEqual(decision["candidate_sha256"], self.digest)
+
+    def test_current_candidate_handoffs_only_and_low_advice_does_not_fail(self):
+        qa = {"candidate_sha256": self.digest, "status": "passed", "companion_hashes": []}
+        captured = []
+        def fake_chat(_system, user, **_kwargs):
+            captured.append(json.loads(user))
+            return {"verdict": "passed", "note": "当前候选逐项满足要求", "issues": [
+                {"requirement_id": "R1", "severity": "low", "problem": "措辞可进一步压缩"}]}
+        handoffs = [{"input_refs": ["artifact:A0"], "output_refs": [], "to_roster": 5,
+                     "old": "旧版本问题"},
+                    {"input_refs": ["artifact:A0"], "output_refs": ["artifact:A1"],
+                     "to_roster": 4, "old_repair": "旧候选返工"},
+                    {"input_refs": ["artifact:A1"], "output_refs": [], "to_roster": 5,
+                     "current": "当前版本 QA 交接"}]
+        with (patch.object(review_decision.forge, "safe_deliverable_path", return_value=str(self.path)),
+              patch.object(review_decision.forge, "selected_project", return_value=self.scratch.name),
+              patch.object(review_decision.project_agent, "snapshot", return_value="源代码"),
+              patch.object(review_decision.llm, "chat_json", side_effect=fake_chat),
+              patch.object(review_decision.artifact_quality, "report_directory", return_value=Path(self.scratch.name))):
+            result = review_decision.decide(
+                self.candidate, {**self.contract, "status": "ready"}, qa, handoffs, self.digest,
+                workflow_evidence={"contributions": [{"task_id": "T1", "valid": True,
+                                                       "content": "旧草稿错误内容"}], "handoffs": handoffs},
+            )
+        self.assertEqual(result["status"], "passed", result)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(len(result["advisories"]), 1)
+        self.assertEqual(captured[0]["handoffs"], [handoffs[2]])
+        self.assertNotIn("content", captured[0]["workflow_evidence"]["contributions"][0])
+        self.assertEqual(captured[0]["workflow_evidence"]["handoffs"], [handoffs[2]])
+
+    def test_blocking_issue_still_fails_even_if_model_says_passed(self):
+        qa = {"candidate_sha256": self.digest, "status": "passed", "companion_hashes": []}
+        with (patch.object(review_decision.forge, "safe_deliverable_path", return_value=str(self.path)),
+              patch.object(review_decision.forge, "selected_project", return_value=self.scratch.name),
+              patch.object(review_decision.project_agent, "snapshot", return_value="源代码"),
+              patch.object(review_decision.llm, "chat_json", return_value={
+                  "verdict": "passed", "note": "复核说明", "issues": [
+                      {"requirement_id": "R1", "severity": "high", "problem": "内容缺失"}]}),
+              patch.object(review_decision.artifact_quality, "report_directory", return_value=Path(self.scratch.name))):
+            result = review_decision.decide(self.candidate, {**self.contract, "status": "ready"}, qa, [], self.digest)
+        self.assertEqual(result["status"], "failed")
 
     def test_old_qa_hash_invalidates_review(self):
         qa = {"candidate_sha256": "old", "status": "passed"}

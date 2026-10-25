@@ -44,6 +44,20 @@ class RevisionTest(unittest.TestCase):
                          ["联调时间 15:00", "其他安排保持不变"])
         self.assertEqual(Document(source).paragraphs[0].text, "联调时间 14:00")
 
+    def test_word_can_delete_one_unrequested_placeholder_paragraph(self):
+        source = self._source("notice.docx")
+        doc = Document()
+        doc.add_paragraph("11 月 4 日联调")
+        doc.add_paragraph("会议链接：待补充")
+        doc.save(source)
+        revised, reason, detail = candidate_revision.apply(
+            "S1", "docx", "_process/source/notice.docx",
+            {"operation": "delete", "old_text": "会议链接：待补充", "location": "第2段"},
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(detail["operation"], "delete")
+        self.assertEqual([p.text for p in Document(forge.output_path(revised)).paragraphs], ["11 月 4 日联调"])
+
     def test_ppt_keeps_other_slide(self):
         source = self._source("deck.pptx")
         deck = Presentation()

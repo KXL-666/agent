@@ -17,9 +17,33 @@ W1 = ("生成一份给研发与测试同事的 Word 通知，说明 11 月 4 日
 C1 = ("生成可运行的 Python 项目，实现命令行温度换算：输入“25 C”输出“77.0 F”，"
       "输入“77 F”输出“25.0 C”。无效格式与不支持的单位返回清楚错误，并以非零状态退出。"
       "提供 README 和有实际断言的自动化测试。")
+P2 = ("根据附件生成 5 页含封面的中文 PPT，向项目负责人汇报三周缺陷处理进展。"
+      "至少一页原生可编辑图表，图表只使用附件数值。"
+      "解释第三周未关闭缺陷增加的原因不能自行猜测，应列为待确认。")
 
 
 class ContractTest(unittest.TestCase):
+    def test_ppt_source_and_editability_constraints_get_checkable_methods(self):
+        model = {"target_kind": "pptx", "audience": "项目负责人", "purpose": "三周缺陷汇报",
+                 "requirements": [], "missing_info": [], "allowed_assumptions": []}
+        contract = contracts.build_contract(P2, deliver_kind="pptx", model_contract=model)
+        self.assertEqual(contract["status"], "ready", contract["unchecked_reasons"])
+        methods = "\n".join(c["acceptance_method"] for c in contract["requirements"])
+        self.assertIn("内嵌图表数据工作簿", methods)
+        self.assertIn("实际幻灯片数为 5 页", methods)
+        self.assertIn("待确认", methods)
+
+    def test_located_attachment_gets_exact_source_clauses_when_po_omits_them(self):
+        source = "📎《缺陷记录.txt》正文 · 片段 1：\n第 1 周：新增缺陷 12，关闭缺陷 8。 第 2 周：新增缺陷 9，关闭缺陷 11。"
+        model = {"target_kind": "pptx", "audience": "负责人", "purpose": "缺陷汇报",
+                 "requirements": [], "missing_info": [], "allowed_assumptions": []}
+        contract = contracts.build_contract(P2, source, model, deliver_kind="pptx")
+        self.assertEqual(contract["status"], "ready", contract["unchecked_reasons"])
+        attachment = [c for c in contract["requirements"] if c["source"]["type"] == "attachment"]
+        self.assertEqual(len(attachment), 2)
+        self.assertIn("新增缺陷 12", attachment[0]["source"]["quote"])
+        self.assertEqual(attachment[0]["source"]["location"], "正文 · 片段 1")
+
     def test_code_requirements_receive_executable_acceptance_methods(self):
         contract = contracts.build_contract(C1, deliver_kind="code", model_contract={
             "target_kind": "code", "audience": "终端用户", "purpose": "温度换算",

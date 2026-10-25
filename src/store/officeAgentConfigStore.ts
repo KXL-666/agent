@@ -60,16 +60,6 @@ export function getAgentConfigsSnapshot(): Record<number, AgentConfig> {
   return configs
 }
 
-/** 成员显示名：有自定义配置时覆盖名册原名 */
-export function agentDisplayName(roster: number, fallback: string): string {
-  return configs[roster]?.name || fallback
-}
-
-/** 成员自定义头像 emoji：未设置时返回空串（渲染端保持默认头像） */
-export function agentAvatarEmoji(roster: number): string {
-  return configs[roster]?.avatar || ''
-}
-
 export async function fetchAgentConfigs(): Promise<void> {
   try {
     const res = await fetch(`${OFFICE_API_BASE}/api/agents`)

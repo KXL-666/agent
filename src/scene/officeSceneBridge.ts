@@ -15,10 +15,6 @@ export function setNightMode(on: boolean) {
   scene?.setNightMode(on)
 }
 
-export function isNightMode() {
-  return nightMode
-}
-
 /** 全局暂停状态：场景重建后依然保持，WS 动作指令据此拦截 */
 export function setOfficePaused(paused: boolean) {
   officePaused = paused
@@ -166,10 +162,6 @@ export function requestDeskVisitTour(
     return
   }
   scene.requestDeskVisitTour(visitorRosterNo, hostRosterNos, messageFn)
-}
-
-export function isOfficeSceneReady() {
-  return scene != null
 }
 
 /** 自定义成员姓名：场景就绪直接改名牌，否则先改 officeStore 并排队等场景绑定 */

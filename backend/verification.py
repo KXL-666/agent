@@ -11,6 +11,15 @@ import project_agent
 from roles import QA
 
 
+def source_material(contract: dict) -> str:
+    """验收依据 = 用户需求 + 附件原文，与生成端使用同一份来源，避免把附件事实判成无依据。"""
+    raw = str(contract.get("raw_requirement") or "").strip()
+    attachment = str(contract.get("attachment_context") or "").strip()
+    if not attachment or attachment in raw:
+        return raw
+    return f"{raw}\n\n附件原文：\n{attachment}"
+
+
 def _items(clauses: list[dict], model_items: list[dict] | None,
            workflow_evidence: dict | None = None) -> list[dict]:
     by_id = {str(item.get("requirement_id")): item for item in model_items or [] if isinstance(item, dict)}
@@ -115,7 +124,7 @@ def verify(candidate: dict, contract: dict, candidate_sha256: str,
             '输出 JSON {"verification":[{"requirement_id":"R1","status":"passed|failed|unchecked",'
             '"evidence":"文件/测试证据","location":"文件:行","problem":"问题","fix":"修复建议","owner_roster":2}]}。'
             "未执行的功能测试必须是 unchecked，不能把语法正确当功能通过。",
-            json.dumps({"requirement": contract.get("raw_requirement"), "clauses": clauses,
+            json.dumps({"requirement": source_material(contract), "clauses": clauses,
                         "actual_source": source, "checks": base["checks"],
                         "workflow_evidence": workflow_evidence or {}}, ensure_ascii=False),
             fallback={}, roster=QA, meta=meta, max_tokens=3000, timeout=150,
@@ -129,13 +138,18 @@ def verify(candidate: dict, contract: dict, candidate_sha256: str,
                     item["status"] = "unchecked"
                     item["problem"] = "未完成隔离环境功能测试"
     else:
-        report = artifact_quality.inspect(path, kind, contract.get("raw_requirement", ""), forge.WORKSPACE_DIR)
-        reviewed = artifact_quality.model_review(report, path, forge.WORKSPACE_DIR, QA, clauses=clauses)
+        report = artifact_quality.inspect(path, kind, source_material(contract), forge.WORKSPACE_DIR)
+        # 本地自检全通过时跳过模型评审，节省一次 LLM 调用；直接用本地检查结果
+        has_failed = any(c.get("ok") is False for c in report.get("checks", []))
+        if has_failed:
+            reviewed = artifact_quality.model_review(report, path, forge.WORKSPACE_DIR, QA, clauses=clauses)
+        else:
+            reviewed = report
         base["checks"] = reviewed.get("checks", [])
-        model_items = reviewed.get("review", {}).get("verification")
+        model_items = reviewed.get("review", {}).get("verification") if has_failed else None
         base["items"] = _items(clauses, model_items, workflow_evidence)
         _apply_mechanical_page_checks(base["items"], clauses, reviewed.get("metrics", {}))
-        base["visual"] = reviewed.get("review", {}).get("visual", False)
+        base["visual"] = reviewed.get("review", {}).get("visual", False) if has_failed else False
         base["pages"] = reviewed.get("pages", [])
         if not base["visual"] and reviewed.get("pages"):
             base["reason"] = "页面视觉输入未成功送达 QA，视觉检查未核验"

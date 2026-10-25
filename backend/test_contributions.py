@@ -55,6 +55,14 @@ class ContributionTest(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("未完成", reason)
 
+    def test_completed_contribution_remains_valid_and_traceable(self):
+        manifest = contributions.save_text("S1", "T1", 4, "验收", "QA 检查记录", ["R1"], ["requirement:R1"])
+        self.assertTrue(contributions.mark_completed("S1", "T1"))
+        valid, _, restored = contributions.inspect("S1", "T1")
+        self.assertTrue(valid)
+        self.assertEqual(restored["status"], "completed")
+        self.assertEqual(restored["files"], manifest["files"])
+
     def test_empty_code_output_is_blocked_instead_of_marked_ready(self):
         manifest = contributions.save_code("S1", "T1", 2, "核心逻辑", [], ["R1"], ["requirement:R1"])
         self.assertEqual(manifest["status"], "blocked")

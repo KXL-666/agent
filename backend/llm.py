@@ -186,9 +186,6 @@ def _save_usage() -> None:
         print(f"[Usage] 写入持久化文件失败：{error}")
 
 
-_load_usage()
-
-
 def _record_usage(roster: int, model: str, usage: dict) -> None:
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
@@ -196,8 +193,15 @@ def _record_usage(roster: int, model: str, usage: dict) -> None:
         return
     with _usage_lock:
         entry = _usage.setdefault(
-            str(roster), {"model": model, "calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+            str(roster), {"model": model, "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                          "estimated_cost": 0.0}
         )
+        if "estimated_cost" not in entry:
+            entry["estimated_cost"] = estimate_cost(
+                entry.get("model", model), int(entry.get("prompt_tokens", 0)),
+                int(entry.get("completion_tokens", 0)),
+            )
+        entry["estimated_cost"] += estimate_cost(model, prompt_tokens, completion_tokens)
         entry["model"] = model
         entry["calls"] += 1
         entry["prompt_tokens"] += prompt_tokens
@@ -211,6 +215,9 @@ def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> flo
     return (prompt_tokens * price[0] + completion_tokens * price[1]) / 1_000_000
 
 
+_load_usage()
+
+
 def usage_report() -> dict:
     """返回每位成员的累计用量与估算成本（元）"""
     with _usage_lock:
@@ -218,7 +225,9 @@ def usage_report() -> dict:
     members = []
     total_cost = 0.0
     for roster_key, entry in sorted(snapshot.items(), key=lambda kv: int(kv[0])):
-        cost = estimate_cost(entry["model"], entry["prompt_tokens"], entry["completion_tokens"])
+        cost = float(entry.get("estimated_cost", estimate_cost(
+            entry["model"], entry["prompt_tokens"], entry["completion_tokens"]
+        )))
         total_cost += cost
         members.append(
             {
@@ -239,7 +248,9 @@ def usage_total_cost() -> float:
         snapshot = {k: dict(v) for k, v in _usage.items()}
     return round(
         sum(
-            estimate_cost(entry["model"], entry["prompt_tokens"], entry["completion_tokens"])
+            float(entry.get("estimated_cost", estimate_cost(
+                entry["model"], entry["prompt_tokens"], entry["completion_tokens"]
+            )))
             for entry in snapshot.values()
         ),
         4,

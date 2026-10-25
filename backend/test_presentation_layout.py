@@ -2,12 +2,15 @@
 
 import tempfile
 import unittest
+import re
 from pathlib import Path
 from unittest.mock import patch
 
 from pptx import Presentation
 
 import forge
+import artifact_quality
+import office_runtime
 
 
 P1 = "生成一份 6 页、不带封面的中文 PPT，没有用户量、节省时间或预算数据，不要编造统计。"
@@ -15,6 +18,27 @@ P2 = "根据附件生成 5 页含封面的中文 PPT。第 1 周新增缺陷 12�
 
 
 class PresentationLayoutTest(unittest.TestCase):
+    def test_qa_receives_every_page_of_five_page_deck(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            for number in range(1, 6):
+                (Path(directory) / f"page-{number}.png").write_bytes(b"page-image")
+            report = {"requirement": "5 页 PPT", "text": "内容", "checks": [], "metrics": {},
+                      "pages": [f"page-{number}.png" for number in range(1, 6)]}
+            seen = {}
+            def fake_review(_system, _user, **kwargs):
+                seen["images"] = kwargs["images"]
+                return {"passed": True, "issues": [], "verification": [
+                    {"requirement_id": "R1", "status": "passed", "evidence": "逐页", "location": "全稿"}]}
+            with (patch.object(artifact_quality, "report_directory", return_value=Path(directory)),
+                  patch.object(artifact_quality, "save_report"),
+                  patch("llm.chat_json", side_effect=fake_review)):
+                reviewed = artifact_quality.model_review(
+                    report, Path(directory) / "deck.pptx", directory, 4,
+                    clauses=[{"requirement_id": "R1"}],
+                )
+            self.assertEqual(len(seen["images"]), 5)
+            self.assertEqual(reviewed["review"]["sampled_pages"], [1, 2, 3, 4, 5])
+
     def test_p1_exact_six_pages_without_fake_chart(self):
         payload = {"title": "校园预约系统", "slides": [
             {"heading": f"结论 {i}", "claim": f"第 {i} 页主张", "layout": layout,
@@ -51,6 +75,12 @@ class PresentationLayoutTest(unittest.TestCase):
             charts = [shape.chart for slide in deck.slides for shape in slide.shapes if shape.has_chart]
             self.assertEqual(len(charts), 1)
             self.assertEqual(list(charts[0].series[0].values), [12.0, 9.0, 14.0])
+            with patch.object(office_runtime, "convert", side_effect=RuntimeError("renderer unavailable")):
+                report = artifact_quality.inspect(path, "pptx", P2 + "至少一页原生可编辑图表。", directory)
+            check = next(item for item in report["checks"] if item["label"] == "原生图表数据表")
+            self.assertTrue(check["ok"], check)
+            self.assertEqual(report["metrics"]["chart_data"][0]["slide"], 2)
+            self.assertEqual(report["metrics"]["chart_data"][0]["series"][0]["values"], [12.0, 9.0, 14.0])
         invented = {**payload, "slides": [{**payload["slides"][0],
                     "chart": {**chart, "series": [{"name": "新增", "values": [12, 9, 999]}]}}]}
         self.assertIsNone(forge._sanitize_pptx(invented, P2)["slides"][0]["chart"])
@@ -60,7 +90,13 @@ class PresentationLayoutTest(unittest.TestCase):
 
         def fake_json(system, user, **kwargs):
             prompts.append(user)
-            return {"title": "测试", "slides": [{"heading": "结论", "bullets": ["事实"]}]}
+            match = re.search(r"只生成 (\d+) 个 slides", user)
+            if not match:
+                match = re.search(r"明确要求 (\d+) 张内容页", user)
+            count = int(match.group(1)) if match else 1
+            return {"title": "测试", "slides": [
+                {"heading": f"结论{i}", "bullets": ["事实"]} for i in range(count)
+            ]}
 
         with patch.object(forge, "chat_json", side_effect=fake_json):
             no_cover = forge._gen_pptx(P1, 3)
@@ -69,6 +105,27 @@ class PresentationLayoutTest(unittest.TestCase):
         self.assertTrue(with_cover["include_cover"])
         self.assertIn("只生成 6 个 slides", prompts[0])
         self.assertIn("只生成 4 个 slides", prompts[1])
+
+    def test_explicit_page_count_mismatch_gets_one_correction_attempt(self):
+        prompts = []
+
+        def fake_json(system, user, **kwargs):
+            prompts.append(user)
+            if "只生成 4 个 slides" in user:
+                return {"title": "测试", "slides": [
+                    {"heading": f"初稿{i}", "bullets": ["事实"]} for i in range(5)
+                ]}
+            if "首次结果有 5 张内容页，但用户明确要求 4 张内容页" in user:
+                return {"title": "测试", "slides": [
+                    {"heading": f"修订{i}", "bullets": ["事实"]} for i in range(4)
+                ]}
+            self.fail(f"unexpected prompt: {user[:160]}")
+
+        with patch.object(forge, "chat_json", side_effect=fake_json):
+            payload = forge._gen_pptx(P2, 3)
+        self.assertEqual(len(payload["slides"]), 4)
+        self.assertTrue(payload["include_cover"])
+        self.assertEqual(len(prompts), 2)
 
     def test_long_table_keeps_bottom_evidence_inside_slide(self):
         payload = {"title": "任务清单", "include_cover": False, "slides": [{

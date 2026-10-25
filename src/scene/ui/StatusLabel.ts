@@ -4,7 +4,14 @@ const NAME_STYLE = {
   fontFamily: 'system-ui, -apple-system, sans-serif',
   fontSize: 11,
   fontWeight: '600' as const,
-  fill: 0x333333,
+  fill: 0x1f2937,
+  // 透明背景：深色文字 + 白色柔光，压在浅色墙面或深色显示器上都读得清
+  dropShadow: {
+    color: 0xffffff,
+    alpha: 0.95,
+    blur: 3,
+    distance: 0,
+  },
 }
 
 const TASK_STYLE = {
@@ -50,7 +57,7 @@ export class StatusLabel extends Container {
     this.stateDot = new Graphics()
     this.addChild(this.taskBg, this.nameText, this.taskText, this.stateDot)
     this.taskBg.visible = false
-    this.paintStateDot()
+    this.renderName()
   }
 
   setName(name: string) {
@@ -87,8 +94,9 @@ export class StatusLabel extends Container {
     const padY = 3
     const w = this.taskText.width + padX * 2
     const h = this.taskText.height + padY * 2
-    const nameH = this.nameText.height
-    const taskTop = -(nameH + NAME_TASK_GAP + h)
+    // 任务框叠在名字上方，两者不重叠
+    const nameTop = -this.nameText.height
+    const taskTop = nameTop - NAME_TASK_GAP - h
 
     this.taskBg.clear()
     this.taskBg.roundRect(-w / 2, taskTop, w, h, 3)
@@ -109,11 +117,12 @@ export class StatusLabel extends Container {
   /** 名字/任务标签块顶边 Y（Agent 本地坐标） */
   getLabelTopY(crownTopY: number): number {
     const baselineY = crownTopY - CROWN_GAP
+    const nameBlockH = this.nameText.height
     if (!this.taskBg.visible) {
-      return baselineY - this.nameText.height
+      return baselineY - nameBlockH
     }
     const taskBoxH = this.taskText.height + 6
-    return baselineY - this.nameText.height - NAME_TASK_GAP - taskBoxH
+    return baselineY - nameBlockH - NAME_TASK_GAP - taskBoxH
   }
 
   private paintStateDot() {

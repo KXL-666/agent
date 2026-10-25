@@ -35,20 +35,12 @@ os.makedirs(CODE_DIR, exist_ok=True)
 
 # 统一视觉规范：三类产物共享同一套配色，保证交付物风格一致
 COLOR_PRIMARY = "1F4E79"   # 深蓝：封面/页眉带/表头
-COLOR_ACCENT = "2E75B6"    # 中蓝：二级标题/要点符号
 COLOR_ORANGE = "ED7D31"    # 点缀橙：装饰条
 COLOR_LIGHT = "DEEBF7"     # 浅蓝：副标题/隔行
-COLOR_TEXT = "333333"      # 正文深灰
 COLOR_GRAY = "808080"      # 辅助灰
 FONT_MAIN = "微软雅黑"
 
-# 内容深度门槛：低于该水平自动触发一次「扩写」调用
-_DOCX_MIN_CHARS = 1200   # Word 正文字符数（去 Markdown 符号）
-_PPTX_MIN_SLIDES = 6     # PPT 最少页数
-_PPTX_MIN_CHARS = 400    # PPT 全部要点字符数
-_XLSX_MIN_ROWS = 8       # Excel 全部数据行数
-
-_CONTENT_KINDS = ("docx", "pptx", "xlsx", "pdf")
+_CONTENT_KINDS = ("docx", "pptx", "xlsx", "pdf", "html")
 _BUILD_ERROR = threading.local()
 _PUBLISH_LOCK = threading.Lock()
 
@@ -418,11 +410,6 @@ def _parse_docx_markdown(text: str) -> list[dict]:
     return blocks
 
 
-def _plain_len(text: str) -> int:
-    """去掉 Markdown 符号与空白后的正文字符数，用于衡量内容深度"""
-    return len(re.sub(r"\s+", "", _clean_inline(_strip_fences(text))))
-
-
 def _sanitize_table(table) -> dict | None:
     if not isinstance(table, dict):
         return None
@@ -559,6 +546,127 @@ def _sanitize_xlsx(payload) -> list[dict] | None:
 # 内容生成 Prompt：全部 token 预算都留给内容本身，不浪费在代码上
 # ===========================================================================
 
+def _length_rule(spec: str) -> str:
+    """按统一口径给出生成端的硬性字数预算。"""
+    import artifact_quality
+    budget = artifact_quality.length_budget(spec, "docx")
+    if not budget:
+        return ""
+    return (f"正文汉字数目标 {budget['target']} 字，必须落在 {budget['low']}～{budget['high']} 字之间"
+            "（按正文汉字计，不含标题、标点、空格与序号）；超出就压缩句子，不足就补充实质内容，"
+            "不得靠标点、空格、重复句子或自报字数凑数。")
+
+
+def _docx_prose(content: str) -> str:
+    """正文文本：不含标题行、表格、列表符号与代码块。"""
+    lines, fenced = [], False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced or not stripped or stripped.startswith(("#", "|")):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _fit_docx_length(content: str, spec: str) -> str:
+    """正文超过目标上限时按句确定性压缩；只减不增，优先压缩最长段落。"""
+    import artifact_quality
+    budget = artifact_quality.length_budget(spec, "docx")
+    if not budget:
+        return content
+    lines = content.splitlines()
+
+    def measure() -> int:
+        return artifact_quality.counted_length(_docx_prose("\n".join(lines)))
+
+    if measure() <= budget["high"]:
+        return content
+
+    def is_prose(line: str) -> bool:
+        stripped = line.strip()
+        return bool(stripped) and not stripped.startswith(("#", "|", "```")) \
+            and not re.match(r"^(?:[-*+>]|\d+[.、])\s*", stripped)
+
+    for _ in range(200):
+        if measure() <= budget["high"]:
+            break
+        prose = [(index, line) for index, line in enumerate(lines) if is_prose(line)]
+        if len(prose) <= 1:
+            break
+        prose.sort(key=lambda item: (-len(item[1]), item[0]))
+        trimmed = False
+        for index, line in prose:
+            sentences = [part for part in re.split(r"(?<=[。！？!?…])", line.strip()) if part]
+            if len(sentences) < 2:
+                continue
+            sentences.pop()
+            lines[index] = "".join(sentences)
+            trimmed = True
+            break
+        if not trimmed:
+            break
+    return "\n".join(lines)
+
+
+_NUMERIC_STAT = re.compile(r"(?<![\w.])\d{1,4}\s*(?:条|项|个|例|次|人|页|天|%|％|小时|分钟)")
+
+
+def _pending_data_claim(sentence: str) -> bool:
+    """该句没有具体数字，却声称数据待附件/待确认，与正文已给出的统计矛盾。"""
+    if re.search(r"\d", sentence):
+        return False
+    return bool(re.search(r"(?:待|需|须|尚待|尚未)[^。；]{0,20}(?:确认|提供|核验|附件)", sentence)) \
+        and bool(re.search(r"数据|信息|情况|结果|分布|统计|附件", sentence))
+
+
+def _drop_pending_clauses(sentence: str) -> str:
+    """删除句中“数据待确认”的分句，保留同一句的结论部分。"""
+    clauses = [part for part in re.split(r"([；;])", sentence)]
+    # 偶数位是正文分句，奇数位是分隔符
+    bodies = clauses[0::2]
+    separators = clauses[1::2]
+    kept = [part for part in bodies if not _pending_data_claim(part)]
+    if not kept:
+        return ""
+    if not kept[-1].endswith(("。", "！", "？", "!", "?", "…")):
+        kept[-1] = kept[-1].rstrip("，, ") + "。"
+    rebuilt = kept[0]
+    for index in range(1, len(kept)):
+        separator = separators[index - 1] if index - 1 < len(separators) else "；"
+        rebuilt += separator + kept[index]
+    return rebuilt
+
+
+def _reconcile_pending_claims(content: str) -> str:
+    """正文已给出具体数量时，删除“数据需待附件确认”这类自相矛盾表述。"""
+    if len(set(_NUMERIC_STAT.findall(_docx_prose(content)))) < 2:
+        return content
+    kept = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "|", "```")):
+            kept.append(line)
+            continue
+        sentences = [part for part in re.split(r"(?<=[。！？!?…])", stripped) if part]
+        updated, changed = [], False
+        for part in sentences:
+            if not _pending_data_claim(part):
+                updated.append(part)
+                continue
+            changed = True
+            remaining = _drop_pending_clauses(part)
+            if remaining:
+                updated.append(remaining)
+        if not changed:
+            kept.append(line)
+        elif updated:
+            kept.append("".join(updated))
+    return "\n".join(kept)
+
+
 def _docx_content_prompt(spec: str, feedback: str = "") -> str:
     return (
         "根据用户需求完成可直接使用的正文，用 Markdown 输出。先判断它是作文、故事、信函、简报、报告、方案、手册还是论文，采用合适结构。"
@@ -566,12 +674,57 @@ def _docx_content_prompt(spec: str, feedback: str = "") -> str:
         "先给读者最需要的结论、决定或说明，再展开依据和实施细节。"
         "如果提供上一版正文，保留已正确的内容和结构，只修复明确指出的问题，不要重新构思一篇新文档。"
         "不要把所有文档写成六章报告，不要强行凑字数或增加封面；明确要求的字数、章节和受众优先。"
+        f"{_length_rule(spec)}"
         "对比、重复记录、数值用表格；长论述保留自然段。步骤可用列表。"
         "保留用户素材、数字、单位、口径和不确定性；不编造来源、统计或完成事项。作文和故事允许合理的虚构情节，直接写成作品，不在正文解释素材是否真实。其他文档中必要的假设应在对应内容旁标明。"
         "不能为了凑字数添加事实或绝对化结论；计算指标可从给定数据推导并注明口径，建议必须写成建议。"
+        "正文已经给出具体数字时，不得再写“数据需待附件确认/待补充”这类自相矛盾的表述；数字没有来源就不要写数字。"
+        "用户未提供且未要求收集的会议链接、报名方式、日期、署名等信息不要添加字段或待填写占位。"
+        "确需说明缺失信息时，在相应事实旁写‘待确认’，不要增设空白表单。"
         "必要的引用在文中使用可识别的来源名称与真实链接。只给成品正文，不附加字数统计、写作说明、复制提示、示例免责声明、工作计划或自评。\n"
         f"需修正的问题：{feedback}\n需求与素材：{spec}"
     )
+
+
+def _strip_unrequested_docx_placeholders(content: str, spec: str) -> str:
+    """Drop invented blank fields in deliverables, preserving requested forms."""
+    # 协作汇编 spec 的前缀（"根据需求与团队各环节的实际产出……"）和团队产出正文都可能
+    # 含“待确认”，不能把整段 spec 当作需求范围；只截取用户原始需求文本来判定严格清理。
+    request_scope = spec.split("团队各环节的产出", 1)[0].split("任务完成情况", 1)[0]
+    requirement_match = (
+        re.search(r"加工需求[:：]\s*(.+)", request_scope, re.S)
+        or re.search(r"需求[:：]\s*(.+)", request_scope, re.S)
+    )
+    if requirement_match:
+        request_scope = requirement_match.group(1)
+    if re.search(r"模板|表单|空白表|待填写|请填写|预留填写", request_scope):
+        return content
+    lines = content.splitlines()
+    strict_notice = "通知" in request_scope and "待确认" not in request_scope
+    kept = []
+    skip_unrequested_section = False
+    for line in lines:
+        if strict_notice and re.match(r"^\s*#{1,3}\s*(?:[一二三四五六七八九十]+[、.．]\s*)?"
+                                      r"(?:需说明的信息|待确认事项|待确认信息)\s*$", line):
+            skip_unrequested_section = True
+            continue
+        if skip_unrequested_section and re.match(r"^\s*#{1,3}\s+", line):
+            skip_unrequested_section = False
+        if skip_unrequested_section:
+            continue
+        if strict_notice:
+            line = re.sub(r"[（(][^（）()\n]{0,100}待确认[）)]", "", line)
+        blank_words = "待补充|待填写|请填写|TBD|TODO" + ("|待确认" if strict_notice else "")
+        if re.fullmatch(r"\s*(?:[-*]\s*)?[^：:\n]{1,24}[：:]\s*"
+                        rf"(?:{blank_words})\s*", line, re.I):
+            continue
+        # 独立成行的空白占位（如整行只有“待补充”“待确认”）不是正文。
+        if re.fullmatch(rf"\s*(?:[-*]\s*)?(?:{blank_words})[。．.]?\s*", line, re.I):
+            continue
+        if strict_notice and "待确认" in line:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _pptx_content_prompt(spec: str, feedback: str = "") -> str:
@@ -838,8 +991,10 @@ def _build_pptx(payload: dict, output_path: str) -> bool:
             )
 
     # ---------- 内容页 ----------
-    total = len(payload["slides"])
-    for index, item in enumerate(payload["slides"], 1):
+    has_cover = bool(payload.get("include_cover", True))
+    total = len(payload["slides"]) + int(has_cover)
+    for content_index, item in enumerate(payload["slides"], 1):
+        page_number = content_index + int(has_cover)
         slide = prs.slides.add_slide(blank)
         # 顶部标题带 + 点缀条
         _ppt_rect(slide, 0, 0, width, Inches(1.0), COLOR_PRIMARY)
@@ -860,7 +1015,7 @@ def _build_pptx(payload: dict, output_path: str) -> bool:
         )
         _ppt_text(
             slide, width - Inches(2.6), height - Inches(0.45), Inches(2.1), Inches(0.35),
-            [f"第 {index} 页 / 共 {total} 页"], 10, COLOR_GRAY, align=PP_ALIGN.RIGHT,
+            [f"第 {page_number} 页 / 共 {total} 页"], 10, COLOR_GRAY, align=PP_ALIGN.RIGHT,
         )
 
     try:
@@ -869,33 +1024,6 @@ def _build_pptx(payload: dict, output_path: str) -> bool:
     except OSError as error:
         print(f"[Forge] pptx 保存失败：{error}")
         return False
-
-
-def _xlsx_number(value):
-    """把纯数字字符串转成数值类型，保证 Excel 里可求和排序"""
-    if isinstance(value, (int, float)):
-        return value
-    text = str(value).strip().replace(",", "")
-    if re.fullmatch(r"-?\d+", text):
-        try:
-            return int(text)
-        except ValueError:
-            return value
-    if re.fullmatch(r"-?\d*\.\d+%?", text):
-        try:
-            return float(text.rstrip("%")) / (100 if text.endswith("%") else 1)
-        except ValueError:
-            return value
-    return value
-
-
-def _xlsx_col_width(values) -> float:
-    """按显示宽度估算列宽（CJK 字符按 2 计）"""
-    def display_len(text) -> int:
-        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in str(text))
-
-    widest = max((display_len(v) for v in values), default=8)
-    return float(min(42, max(10, widest + 2)))
 
 
 def _build_xlsx(sheets: list[dict], output_path: str) -> bool:
@@ -941,11 +1069,12 @@ def _gen_docx(spec: str, roster: int | None, feedback: str = "", generation_meta
                 return "# " + title + "\n\n" + "\n\n".join(
                     f"## {part['heading']}\n\n{part['body']}" for part in pieces
                 )
-    return _strip_fences(chat_text(
+    draft = _strip_fences(chat_text(
         "你是专业文档作者，完成实际内容并遵守用户的格式和篇幅要求。",
         [{"role": "user", "content": _docx_content_prompt(spec, feedback)}],
         fallback="", temperature=.5, max_tokens=12000, timeout=300, roster=roster,
         meta=generation_meta, fallback_roster=1 if roster == 6 else None))
+    return draft
 
 
 def _gen_pptx(spec: str, roster: int | None, feedback: str = "",
@@ -954,17 +1083,36 @@ def _gen_pptx(spec: str, roster: int | None, feedback: str = "",
     requested = artifact_quality.contract(spec, "pptx")
     prompt = _pptx_content_prompt(spec, feedback)
     explicit = requested.get("unit") == "页"
-    no_cover = bool(re.search(r"不要封面|不带封面|不含封面|无封面", spec[:500]))
-    wants_cover = bool(re.search(r"含封面|带封面|需要封面|包含封面", spec[:500]))
-    include_cover = not no_cover and (wants_cover or not explicit)
+    scope = artifact_quality.requirement_scope(spec)
+    include_cover = requested["cover"] or (not explicit and "封面" not in scope)
+    content_pages = None
     if explicit:
-        amount = requested["count"] - (1 if include_cover and "内容" not in spec[:300] else 0)
+        is_content_page_count = bool(re.search(r"\d{1,5}\s*页(?:内容页|内容)", scope[:300]))
+        amount = requested["count"] if is_content_page_count else requested["count"] - int(include_cover)
+        amount = max(1, amount)
+        content_pages = amount
         prompt = prompt.replace("8~12 页内容页（不含标题页）", f"{max(1, amount)} 页内容页")
         prompt += f"\n用户明确指定页数；只生成 {max(1, amount)} 个 slides 元素。不要自行扩展页数。"
-    payload = _sanitize_pptx(chat_json(
+    first_payload = chat_json(
         "你是演示文稿设计师，只输出完整 JSON。", prompt,
         fallback={}, temperature=.5, max_tokens=10000, timeout=300, roster=roster,
-        meta=generation_meta, fallback_roster=1 if roster != 1 else None), spec)
+        meta=generation_meta, fallback_roster=1 if roster != 1 else None)
+    payload = _sanitize_pptx(first_payload, spec)
+    if content_pages is not None and payload and len(payload["slides"]) != content_pages:
+        correction_prompt = (
+            f"首次结果有 {len(payload['slides'])} 张内容页，但用户明确要求 {content_pages} 张内容页。"
+            "请修订以下 JSON，严格输出指定数量的 slides；合并重复或次要内容，保留所有关键结论、用户数据、"
+            "来源和必要风险，不得添加虚构内容，也不要增加封面（封面由渲染器单独处理）。"
+            f"\n需求：{spec}\n首次结果：{json.dumps(first_payload, ensure_ascii=False)}"
+        )
+        corrected = chat_json(
+            "你是演示文稿编辑，按精确页数修订 JSON。", correction_prompt,
+            fallback={}, temperature=.25, max_tokens=10000, timeout=300, roster=roster,
+            meta=generation_meta, fallback_roster=1 if roster != 1 else None,
+        )
+        corrected_payload = _sanitize_pptx(corrected, spec)
+        if corrected_payload and len(corrected_payload["slides"]) == content_pages:
+            payload = corrected_payload
     if payload:
         payload["include_cover"] = include_cover
     return payload
@@ -983,6 +1131,35 @@ def _gen_xlsx(spec: str, roster: int | None, feedback: str = "",
         meta=generation_meta, fallback_roster=1 if roster != 1 else None))
 
 
+def _gen_html(spec: str, roster: int | None, feedback: str = "",
+              generation_meta: dict | None = None) -> str:
+    """让 LLM 直接产出完整可运行的 HTML 文件（含内联 CSS/JS/SVG）。"""
+    prompt = (
+        "你是资深前端工程师。根据需求输出一个完整、可直接在浏览器打开运行的 HTML 文件。"
+        "要求：\n"
+        "1. 只输出 HTML 源码本身，不要用 ```html 代码块包裹，不要写任何解释文字；\n"
+        "2. 所有 CSS 和 JavaScript 必须内联在同一个 HTML 文件中，不依赖外部资源；\n"
+        "3. 如涉及 SVG/Canvas 动画，必须确保动画能正常运行，代码完整无缺；\n"
+        "4. 页面要有合理的视觉样式，居中布局，适配常见屏幕；\n"
+        "5. 不得包含 TODO、占位符、生成说明或模型对话痕迹。"
+    )
+    user_content = spec
+    if feedback:
+        user_content += f"\n\n上一轮反馈（请针对性修改）：\n{feedback}"
+    raw = chat_text(
+        prompt,
+        [{"role": "user", "content": user_content}],
+        fallback="", temperature=.5, max_tokens=16000, timeout=300, roster=roster,
+        meta=generation_meta, fallback_roster=1 if roster != 1 else None,
+    )
+    text = (raw or "").strip()
+    # 去掉模型可能添加的 markdown 代码围栏
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:html)?\s*\n", "", text)
+        text = re.sub(r"\n```\s*$", "", text)
+    return text.strip()
+
+
 def _forge_once(kind: str, spec: str, output_path: str,
                 roster: int | None, feedback: str = "", generation_meta: dict | None = None) -> bool:
     """单轮「生成内容 → 渲染」；失败返回 False（不残留半成品文件）"""
@@ -990,6 +1167,9 @@ def _forge_once(kind: str, spec: str, output_path: str,
     try:
         if kind in ("docx", "pdf"):
             content = strip_document_meta(_gen_docx(spec, roster, feedback, generation_meta))
+            content = _strip_unrequested_docx_placeholders(content, spec)
+            content = _reconcile_pending_claims(content)
+            content = _fit_docx_length(content, spec)
             leaks = meta_leaks(content)
             if leaks:
                 _BUILD_ERROR.message = "成品正文含生成说明或字数自报，请只返回正文：" + "；".join(leaks[:3])
@@ -1037,6 +1217,27 @@ def _forge_once(kind: str, spec: str, output_path: str,
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "source.json").write_text(json.dumps({"sheets": sheets}, ensure_ascii=False), encoding="utf-8")
             return built
+        if kind == "html":
+            content = _gen_html(spec, roster, feedback, generation_meta)
+            if not content or not content.strip():
+                _BUILD_ERROR.message = "HTML 内容为空"
+                return False
+            if meta_leaks(content):
+                _BUILD_ERROR.message = "HTML 含生成说明或模型对话痕迹，请只返回可直接运行的 HTML"
+                return False
+            try:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                built = True
+            except OSError as error:
+                _BUILD_ERROR.message = f"HTML 落盘失败：{error}"
+                built = False
+            if built:
+                import artifact_quality
+                directory = artifact_quality.report_directory(output_path, WORKSPACE_DIR)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "source.html").write_text(content, encoding="utf-8")
+            return built
     except Exception as error:  # noqa: BLE001 —— 单类产物失败不影响整体流程
         _BUILD_ERROR.message = str(error)[:2000]
         print(f"[Forge] {kind} 生成异常：{error}")
@@ -1044,14 +1245,18 @@ def _forge_once(kind: str, spec: str, output_path: str,
 
 
 def forge_file(kind: str, spec: str, filename: str, roster: int | None = None,
-               generation_meta: dict | None = None) -> str | None:
-    """制作 -> 真实文件检查 -> 成品评审 -> 按问题修订；保留最佳候选。"""
+               generation_meta: dict | None = None, *, quick: bool = False) -> str | None:
+    """制作 -> 真实文件检查 -> 成品评审 -> 按问题修订；保留最佳候选。
+
+    quick=True 时跳过模型评审（model_review）并减少重试次数，用于快速生成模式。
+    """
     import artifact_quality
     if kind not in _CONTENT_KINDS:
         return None
     best_name, best_report, feedback = None, None, ""
     attempts = []
-    for attempt in range(3):
+    max_attempts = 2 if quick else 3
+    for attempt in range(max_attempts):
         candidate = _unique_name(filename)
         candidate_path = output_path(candidate)
         attempt_meta = {}
@@ -1068,7 +1273,8 @@ def forge_file(kind: str, spec: str, filename: str, roster: int | None = None,
             continue
         # 保存完整需求，检查的是实际文件而不是模型自述。
         report = artifact_quality.inspect(candidate_path, kind, spec, WORKSPACE_DIR)
-        if not any(c["ok"] is False for c in report["checks"]):
+        # 快速模式或本地自检全通过时，跳过模型评审以节省一次 LLM 调用
+        if not quick and not any(c["ok"] is False for c in report["checks"]):
             report = artifact_quality.model_review(report, candidate_path, WORKSPACE_DIR, roster)
         attempts.append({"attempt": attempt + 1, "stage": "review", "status": report["status"]})
         def score_of(result):
@@ -1195,21 +1401,6 @@ def begin_sprint(sprint_id: str) -> str:
 def sprint_code_dir(sprint_id: str) -> str:
     safe_id = re.sub(r"[^\w-]", "", sprint_id or "") or "current"
     return os.path.join(CODE_ROOT, safe_id)
-
-
-def clear_code_dir() -> None:
-    """兼容旧调用：只清理当前目录内的文件，不删除历史 Sprint"""
-    if os.path.isdir(CODE_DIR):
-        for name in os.listdir(CODE_DIR):
-            path = os.path.join(CODE_DIR, name)
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-    os.makedirs(CODE_DIR, exist_ok=True)
 
 
 def verify_generated_code(code_dir: str | None = None) -> list[str]:

@@ -11,7 +11,96 @@ from unittest.mock import patch
 import project_agent
 
 
+class DockerDiscoveryTest(unittest.TestCase):
+    def test_falls_back_to_env_override_and_windows_install_dir(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            fake_cli = Path(directory) / "docker.exe"
+            fake_cli.write_text("", encoding="utf-8")
+            with patch.object(project_agent.shutil, "which", return_value=None), \
+                 patch.dict("os.environ", {"OFFICE_DOCKER_PATH": str(fake_cli)}):
+                self.assertEqual(project_agent.docker_executable(), str(fake_cli))
+            with patch.object(project_agent.shutil, "which", return_value=None), \
+                 patch.dict("os.environ", {"OFFICE_DOCKER_PATH": str(fake_cli.parent / "missing.exe")}):
+                with patch.object(project_agent.os, "name", "nt"), \
+                     patch.dict("os.environ", {"ProgramFiles": directory, "ProgramW6432": directory}):
+                    install = Path(directory) / "Docker" / "Docker" / "resources" / "bin"
+                    install.mkdir(parents=True)
+                    (install / "docker.exe").write_text("", encoding="utf-8")
+                    self.assertEqual(project_agent.docker_executable(), str(install / "docker.exe"))
+                    (install / "docker.exe").unlink()
+                    self.assertIsNone(project_agent.docker_executable())
+        with patch.object(project_agent.shutil, "which", return_value="/usr/bin/docker"):
+            self.assertEqual(project_agent.docker_executable(), "/usr/bin/docker")
+
+    def test_docker_available_uses_discovered_executable(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command[0])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(project_agent, "docker_executable", return_value=r"C:\Docker\docker.exe"), \
+             patch.object(project_agent.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(project_agent.docker_available())
+        self.assertEqual(calls, [r"C:\Docker\docker.exe"])
+
+
 class ProjectMergeTest(unittest.TestCase):
+    def test_pytest_imports_feed_sandbox_requirements_and_declaration_gate(self):
+        # C1 Sprint S1792907192082：测试 import pytest 但无任何依赖清单，
+        # 沙箱退回 unittest 后 import 失败被误判为测试错误；README 也无法复现。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            (root / "tests" / "conftest.py").write_text("import pytest\n", encoding="utf-8")
+            (root / "tests" / "test_cli.py").write_text("def test_cli(): assert True\n", encoding="utf-8")
+            (root / "cli.py").write_text("import sys\n", encoding="utf-8")
+            (root / "README.md").write_text("# CLI\n\n运行：`python cli.py 25 C`。\n测试：`python -m pytest -q`。\n",
+                                            encoding="utf-8")
+            self.assertIn("pytest", project_agent.declared_python_test_requirements(root))
+            report = {c["label"]: c for c in project_agent.static_check(root)}
+            self.assertFalse(report["pytest 依赖声明"]["ok"])
+            (root / "requirements-dev.txt").write_text("pytest\n", encoding="utf-8")
+            report = {c["label"]: c for c in project_agent.static_check(root)}
+            self.assertTrue(report["pytest 依赖声明"]["ok"], report["pytest 依赖声明"]["detail"])
+            self.assertIn("pytest", project_agent.declared_python_test_requirements(root))
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_core.py").write_text("import unittest\n", encoding="utf-8")
+            self.assertNotIn("pytest", project_agent.declared_python_test_requirements(root))
+            labels = [c["label"] for c in project_agent.static_check(root)]
+            self.assertNotIn("pytest 依赖声明", labels)
+
+    def test_static_check_blocks_module_package_name_shadowing(self):
+        # C1 Sprint S1792902305434：顶层模块与同名包并存、根目录 __init__.py 相对导入。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "temperature_converter.py").write_text("def convert(v, u): return v\n", encoding="utf-8")
+            package = root / "temperature_converter"
+            package.mkdir()
+            (package / "__init__.py").write_text("from .core import convert\n", encoding="utf-8")
+            (package / "core.py").write_text("def convert(v, u): return v\n", encoding="utf-8")
+            (root / "__init__.py").write_text("from .temperature_converter import convert\n", encoding="utf-8")
+            (root / "README.md").write_text("# 温度换算\n\n运行：`python -m temperature_converter 25 C`。\n",
+                                            encoding="utf-8")
+            (root / "test_core.py").write_text("def test_convert(): assert True\n", encoding="utf-8")
+            report = {c["label"]: c for c in project_agent.static_check(root)}
+            naming = report["模块与包命名"]
+            self.assertFalse(naming["ok"])
+            self.assertIn("temperature_converter.py", naming["detail"])
+            self.assertIn("__init__.py", naming["detail"])
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            package = root / "temperature_converter"
+            package.mkdir()
+            (package / "__init__.py").write_text("from .core import convert\n", encoding="utf-8")
+            (package / "core.py").write_text("def convert(v, u): return v\n", encoding="utf-8")
+            (root / "README.md").write_text("# 温度换算\n\n运行：`python -m temperature_converter 25 C`。\n",
+                                            encoding="utf-8")
+            (root / "test_core.py").write_text("def test_convert(): assert True\n", encoding="utf-8")
+            report = {c["label"]: c for c in project_agent.static_check(root)}
+            self.assertTrue(report["模块与包命名"]["ok"], report["模块与包命名"]["detail"])
+
     def test_missing_requirements_manifest_is_created_for_known_imports(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
@@ -53,6 +142,17 @@ class ProjectMergeTest(unittest.TestCase):
                          if item["label"] == "自动化测试无跳过")
         self.assertFalse(check["ok"], check)
 
+    def test_test_docstring_todo_does_not_claim_runtime_is_incomplete(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_cli.py").write_text(
+                '"""TODO: update entrypoint if it ever changes."""\n'
+                'def test_result(): assert 25 * 9 / 5 + 32 == 77\n', encoding="utf-8")
+            check = next(item for item in project_agent.static_check(root, [])
+                         if item["label"] == "未完成的实现")
+            self.assertTrue(check["ok"], check)
+
     def test_static_check_rejects_incomplete_readme_setup_and_package_commands(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
@@ -85,6 +185,54 @@ class ProjectMergeTest(unittest.TestCase):
                          if item["label"] == "README命令与依赖说明")
         self.assertTrue(check["ok"], check)
 
+    def test_literal_setup_test_extra_is_available_to_container_installer(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "setup.py").write_text(
+                "from setuptools import setup\nsetup(name='demo', extras_require={'test': ['pytest>=7']})\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(project_agent.declared_python_test_requirements(root), ["pytest>=7"])
+
+    def test_dev_test_dependency_and_readme_are_reconciled(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_cli.py").write_text("import pytest\ndef test_ok(): assert 2 == 2\n", encoding="utf-8")
+            (root / "requirements-dev.txt").write_text("# tests\npytest>=7.0\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "The test suite uses only the standard library's `unittest`, so no extra packages are required.\n"
+                "```bash\npython -m unittest discover -s tests -v\n```\n", encoding="utf-8")
+            self.assertEqual(project_agent.declared_python_test_requirements(root), ["pytest>=7.0"])
+            self.assertTrue(project_agent.reconcile_python_test_docs(root))
+            readme = (root / "README.md").read_text(encoding="utf-8")
+            self.assertIn("pip install -r requirements-dev.txt", readme)
+            self.assertIn("python -m pytest -q", readme)
+            self.assertNotIn("python -m unittest", readme)
+
+    def test_static_check_rejects_undocumented_bare_command_entrypoint(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "README.md").write_text("```bash\ntemp-convert \"25 C\"\n```\n", encoding="utf-8")
+            check = next(item for item in project_agent.static_check(root, [])
+                         if item["label"] == "README命令与依赖说明")
+            self.assertFalse(check["ok"], check)
+            self.assertIn("temp-convert", check["detail"])
+
+    def test_readme_output_text_is_not_treated_as_bare_command(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "README.md").write_text(
+                "```bash\n$ python -m temperature.cli 25 K\n"
+                "Error: unsupported unit K\nSupported units: C or F\n```\n",
+                encoding="utf-8",
+            )
+            check = next(item for item in project_agent.static_check(root, [])
+                         if item["label"] == "README命令与依赖说明")
+            self.assertTrue(check["ok"], check)
+
+
     def test_static_check_rejects_unittest_command_for_pytest_tests(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
@@ -96,6 +244,23 @@ class ProjectMergeTest(unittest.TestCase):
                          if item["label"] == "README命令与依赖说明")
         self.assertFalse(check["ok"], check)
         self.assertIn("使用 pytest", check["detail"])
+
+    def test_static_check_rejects_cli_test_module_that_differs_from_readme(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            tests = root / "tests"
+            tests.mkdir()
+            (root / "README.md").write_text(
+                "运行 `python -m temperature.cli \"25 C\"`。\n测试 `python -m pytest -q`。\n",
+                encoding="utf-8",
+            )
+            (tests / "test_cli.py").write_text(
+                'CLI_MODULE = "temperature_cli"\ndef test_entrypoint(): assert True\n', encoding="utf-8")
+            check = next(item for item in project_agent.static_check(root, [])
+                         if item["label"] == "README命令与依赖说明")
+        self.assertFalse(check["ok"], check)
+        self.assertIn("temperature_cli", check["detail"])
+        self.assertIn("temperature.cli", check["detail"])
 
     def test_verbatim_merge_and_conflict(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:

@@ -794,6 +794,11 @@ export class OfficeScene {
     layer.sortableChildren = true
     this.officeLayer = layer
 
+    // 姓名/任务标签单独一层，压在桌椅之上：坐下办公时显示器会盖住人物本体，标签不能跟着被挡住
+    const labelLayer = new Container()
+    labelLayer.label = 'labels'
+    labelLayer.sortableChildren = true
+
     for (const desk of DESKS) {
       const entity = new DeskEntity(desk)
       this.deskEntities.set(desk.id, entity)
@@ -806,7 +811,7 @@ export class OfficeScene {
     }
 
     for (const agent of this.agents) {
-      const entity = new AgentEntity(agent)
+      const entity = new AgentEntity(agent, labelLayer)
       this.agentEntities.set(agent.id, entity)
       entity.zIndex = agent.y
       entity.on('pointertap', (event: FederatedPointerEvent) => {
@@ -824,7 +829,7 @@ export class OfficeScene {
     }
 
     this.sortOfficeDepth()
-    parent.addChild(layer)
+    parent.addChild(layer, labelLayer)
   }
 
   private drawMap(parent: Container) {

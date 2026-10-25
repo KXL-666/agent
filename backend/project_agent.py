@@ -4,12 +4,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import uuid
 import hashlib
+import tomllib
 from artifact_content import meta_leaks
 
 from llm import chat_json, chat_text
@@ -158,7 +160,13 @@ def static_check(root: Path, planned: list[str] | None = None) -> list[dict]:
     errors, stubs = [], []
     for source in sources:
         content = source.read_text(encoding="utf-8", errors="replace")
-        if re.search(r"raise\s+NotImplementedError|\bTODO\b|Your code here|此处实现", content):
+        # Test docstrings may describe a hypothetical TODO even when their
+        # assertions and CLI calls are complete; runtime tests decide whether
+        # that test is valid. Production-code TODOs remain blocking.
+        is_test = source in test_files
+        stub_pattern = (r"raise\s+NotImplementedError|Your code here|此处实现" if is_test else
+                        r"raise\s+NotImplementedError|\bTODO\b|Your code here|此处实现")
+        if re.search(stub_pattern, content):
             stubs.append(source.relative_to(root).as_posix())
         if source.suffix == ".py":
             try:
@@ -172,6 +180,17 @@ def static_check(root: Path, planned: list[str] | None = None) -> list[dict]:
                 errors.append(f"{source.relative_to(root)}: {checked.stderr.decode(errors='replace')[-700:]}")
     add("语法与解析", not errors, "\n".join(errors) or "Python / JavaScript 语法检查通过；TS/JSX 需后续构建验证")
     add("未完成的实现", not stubs, "、".join(stubs) or "未发现常见未实现标记")
+    # 顶层模块与同名包并存时导入解析不确定；根目录 __init__.py 的相对导入在
+    # 项目根不可导入时同样阻断（C1 Sprint S1792902305434 首候选回归）。
+    naming = []
+    for path in [p for p in sources if p.suffix == ".py" and p.parent == root]:
+        if (root / path.stem / "__init__.py").is_file():
+            naming.append(f"顶层模块 {path.name} 与同名包 {path.stem}/ 并存，导入路径不确定")
+    root_init = root / "__init__.py"
+    if root_init.is_file() and re.search(r"(?:^|\n)\s*(?:from|import)\s+\.",
+                                         root_init.read_text(encoding="utf-8", errors="replace")):
+        naming.append("项目根目录 __init__.py 使用相对导入，根目录不是可导入的包")
+    add("模块与包命名", not naming, "；".join(naming) or "未发现顶层模块与同名包冲突")
     handoff = [(p.relative_to(root).as_posix(), issue) for p in files
                if p.suffix.lower() in (".md", ".txt", ".html", ".py", ".js", ".ts", ".tsx", ".jsx")
                for issue in meta_leaks(p.read_text(encoding="utf-8", errors="replace"))]
@@ -192,9 +211,43 @@ def static_check(root: Path, planned: list[str] | None = None) -> list[dict]:
             readme_issues.append("requirements.txt 有依赖，但 README 未说明 pip install -r requirements.txt")
         tests_for_docs = [p for p in files if p.name.startswith("test_") and p.suffix == ".py"]
         test_sources = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in tests_for_docs)
-        pytest_style = bool(re.search(r"(?:^|\n)\s*import pytest|pytest\.mark\.", test_sources))
+        pytest_style = bool(re.search(r"(?:^|\n)\s*(?:import pytest|from pytest import)|pytest\.mark\.", test_sources))
         if pytest_style and re.search(r"python(?:3)?\s+-m\s+unittest\b", readme):
             readme_issues.append("测试文件使用 pytest，但 README 仍提供 unittest 运行命令")
+        documented_cli = {
+            module for module in re.findall(
+                r"\bpython(?:3)?\s+-m\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\b", readme, re.I
+            ) if module.split(".", 1)[0].lower() not in {"pytest", "unittest", "pip"}
+        }
+        tested_cli = set(re.findall(r"\bCLI_MODULE\s*=\s*[\"']([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[\"']", test_sources))
+        mismatched_cli = sorted(tested_cli - documented_cli) if documented_cli else []
+        if mismatched_cli:
+            readme_issues.append(
+                "CLI 集成测试调用 " + "、".join(mismatched_cli) +
+                "，与 README 的启动模块 " + "、".join(sorted(documented_cli)) + " 不一致"
+            )
+
+        # A bare command shown as runnable in README needs an installed entry point.
+        entrypoint_manifests = "\n".join(
+            (root / name).read_text(encoding="utf-8", errors="replace")
+            for name in ("pyproject.toml", "setup.cfg", "setup.py") if (root / name).is_file()
+        )
+        for block in re.findall(r"```[^\n]*\n(.*?)```", readme, re.S):
+            for raw_line in block.splitlines():
+                line = raw_line.strip().lstrip("$ ")
+                command = re.match(r"^([A-Za-z][\w-]+)(?:\s|$)", line)
+                if not command or command.group(1).lower() in {
+                        "python", "python3", "py", "pip", "pytest", "cd", "npm", "node", "npx",
+                        "uv", "poetry", "git", "docker", "curl", "echo", "export", "set", "source"}:
+                    continue
+                name = command.group(1)
+                # Captured stdout/stderr is often included in an examples block.
+                # Program names are case-sensitive in the target shell; a capitalized
+                # sentence such as "Supported units: ..." is not a runnable command.
+                if name != name.lower():
+                    continue
+                if not re.search(rf"(?<![\w-]){re.escape(name)}\s*=", entrypoint_manifests):
+                    readme_issues.append(f"README 展示命令 {name}，但项目未配置对应的可安装入口")
 
         # A package cannot normally be imported with `python -m package` after
         # changing into that package directory; the command must run at its parent.
@@ -226,6 +279,20 @@ def static_check(root: Path, planned: list[str] | None = None) -> list[dict]:
     add("测试中的功能断言", bool(assertions), f"发现 {len(assertions)} 处断言或异常期望")
     if re.search(r"assert\s+(?:True\b|1\s*==\s*1)", test_text):
         add("无效测试断言", False, "测试包含恒真断言，不能据此证明功能正确")
+    # pytest 风格测试必须在依赖清单中声明 pytest，否则用户按 README 操作无法运行
+    #（C1 S1792907192082：README 写“无需额外依赖”，测试却 import pytest）。
+    pytest_import = re.compile(r"(?:^|\n)\s*(?:import pytest|from pytest\s+import)|pytest\.mark\.")
+    pytest_tests = [p for p in files if p.suffix == ".py"
+                    and (p.name.startswith("test_") or p.name == "conftest.py")
+                    and pytest_import.search(p.read_text(encoding="utf-8", errors="replace"))]
+    if pytest_tests:
+        manifests = "\n".join((root / name).read_text(encoding="utf-8", errors="replace")
+                              for name in ("requirements.txt", "requirements-dev.txt", "pyproject.toml",
+                                           "setup.cfg", "setup.py") if (root / name).is_file())
+        declared = bool(re.search(r"(?<![\w-])pytest(?![\w-])", manifests))
+        add("pytest 依赖声明", declared,
+            "pytest 已在依赖清单中声明" if declared else
+            "测试使用 pytest，但 requirements/pyproject 等依赖清单未声明 pytest")
     if any(p.suffix in (".ts", ".tsx", ".jsx") for p in sources):
         add("前端依赖与构建配置", (root / "package.json").is_file(), "TypeScript/JSX 项目必须提供 package.json")
     for manifest in ("package.json", "tsconfig.json"):
@@ -237,8 +304,29 @@ def static_check(root: Path, planned: list[str] | None = None) -> list[dict]:
     return checks
 
 
+def docker_executable() -> str | None:
+    """定位 Docker CLI：优先 PATH，其次环境变量与 Windows 默认安装目录。
+
+    后端服务进程的 PATH 可能不包含 Docker Desktop 的安装目录（例如从旧 shell
+    启动的常驻进程），不能因此把已安装的沙箱误判为不可用。
+    """
+    found = shutil.which("docker")
+    if found:
+        return found
+    override = os.getenv("OFFICE_DOCKER_PATH")
+    if override and Path(override).is_file():
+        return override
+    if os.name == "nt":
+        for base in dict.fromkeys(filter(None, [os.getenv("ProgramFiles"), os.getenv("ProgramW6432")])):
+            for candidate in (Path(base) / "Docker" / "Docker" / "resources" / "bin" / "docker.exe",
+                              Path(base) / "Docker" / "Docker" / "resources" / "docker.exe"):
+                if candidate.is_file():
+                    return str(candidate)
+    return None
+
+
 def docker_available() -> bool:
-    executable = shutil.which("docker")
+    executable = docker_executable()
     if not executable:
         return False
     try:
@@ -249,6 +337,72 @@ def docker_available() -> bool:
         return False
 
 
+def declared_python_test_requirements(root: Path) -> list[str]:
+    """Read literal test extras without executing generated setup code on the host."""
+    found = []
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            project = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
+            optional = project.get("optional-dependencies", {})
+            for extra in ("test", "dev"):
+                found.extend(optional.get(extra, []) or [])
+        except (OSError, ValueError, TypeError):
+            pass
+    setup = root / "setup.py"
+    if setup.is_file():
+        try:
+            tree = ast.parse(setup.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "setup":
+                    continue
+                extras = next((keyword.value for keyword in node.keywords if keyword.arg == "extras_require"), None)
+                if extras is not None:
+                    values = ast.literal_eval(extras)
+                    if isinstance(values, dict):
+                        found.extend(values.get("test", []) or [])
+        except (OSError, SyntaxError, ValueError, TypeError):
+            pass
+    dev_requirements = root / "requirements-dev.txt"
+    if dev_requirements.is_file():
+        found.extend(line.strip() for line in dev_requirements.read_text(encoding="utf-8").splitlines()
+                     if line.strip() and not line.lstrip().startswith(("#", "-")))
+    # pytest 风格测试必须有可安装的 pytest，与模型是否声明无关：漏声明时
+    # 沙箱会退回 unittest 并把 import pytest 误判为测试失败（C1 S1792907192082 回归）。
+    pytest_style = re.compile(r"(?:^|\n)\s*(?:import pytest|from pytest\s+import)|pytest\.mark\.")
+    test_sources = [p for p in project_files(root)
+                    if p.suffix == ".py" and (p.name.startswith("test_") or p.name == "conftest.py")]
+    base_names = {re.split(r"[<>=!~]", value, 1)[0].strip().lower() for value in found if isinstance(value, str)}
+    if "pytest" not in base_names and any(
+            pytest_style.search(p.read_text(encoding="utf-8", errors="replace")) for p in test_sources):
+        found.append("pytest")
+    # Limit shell arguments to ordinary Python package requirement syntax.
+    safe = re.compile(r"[A-Za-z0-9_.-]+(?:[<>=!~]{1,2}[A-Za-z0-9_.+-]+(?:,[<>=!~]{1,2}[A-Za-z0-9_.+-]+)*)?")
+    return list(dict.fromkeys(value for value in found if isinstance(value, str) and safe.fullmatch(value)))
+
+
+def reconcile_python_test_docs(root: Path) -> bool:
+    """Align README test commands with actual pytest-style test sources."""
+    readme_path = root / "README.md"
+    if not readme_path.is_file():
+        return False
+    tests = [p for p in project_files(root) if p.name.startswith("test_") and p.suffix == ".py"]
+    if not any(re.search(r"(?:^|\n)\s*(?:import pytest|from pytest import)|pytest\.mark\.",
+                         p.read_text(encoding="utf-8", errors="replace")) for p in tests):
+        return False
+    readme = readme_path.read_text(encoding="utf-8", errors="replace")
+    updated = re.sub(r"\bpython(?:3)?[ \t]+-m[ \t]+unittest[^\n`]*",
+                     "python -m pytest -q", readme)
+    if updated == readme:
+        return False
+    updated = re.sub(r"[Tt]he test suite uses only the standard library's `unittest`, so no extra\s+packages are required\.",
+                     "The test suite uses pytest.", updated)
+    if (root / "requirements-dev.txt").is_file() and "pip install -r requirements-dev.txt" not in updated:
+        updated = updated.replace("python -m pytest -q", "python -m pip install -r requirements-dev.txt\npython -m pytest -q", 1)
+    readme_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 def sandbox_check(root: Path, runtime: str) -> dict:
     """只向容器暴露成品源码，不传递 API Key、宿主环境、Docker socket 或用户目录。"""
     if runtime not in ("python", "node"):
@@ -256,6 +410,8 @@ def sandbox_check(root: Path, runtime: str) -> dict:
     if not docker_available():
         return {"label": "隔离安装与运行测试", "ok": None, "detail": "执行沙箱不可用；未执行依赖安装、构建与功能测试"}
     runtime = "node" if runtime == "node" else "python"
+    wheel_dir = None
+    wheel_mount = []
     if runtime == "node":
         image = os.getenv("OFFICE_NODE_IMAGE", "node:22-bookworm-slim")
         install = "npm install --ignore-scripts --no-audit --no-fund"
@@ -263,15 +419,36 @@ def sandbox_check(root: Path, runtime: str) -> dict:
     else:
         image = os.getenv("OFFICE_PYTHON_IMAGE", "python:3.12-slim")
         install = "if [ -f requirements.txt ]; then python -m pip install --only-binary=:all: --disable-pip-version-check --target /work/.python-deps -r requirements.txt; fi"
+        test_requirements = declared_python_test_requirements(root)
+        if test_requirements:
+            # Docker Desktop's VM may lack a working TLS path even when the
+            # host can download wheels. Download archives only on the host;
+            # installation and all generated-code execution stay in Docker.
+            wheel_dir = tempfile.TemporaryDirectory(prefix="office-test-wheels-")
+            try:
+                download = subprocess.run(
+                    [sys.executable, "-m", "pip", "download", "--only-binary=:all:",
+                     "--disable-pip-version-check", "--dest", wheel_dir.name, *test_requirements],
+                    capture_output=True, timeout=180,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                offline = download.returncode == 0 and any(Path(wheel_dir.name).glob("*.whl"))
+            except (OSError, subprocess.TimeoutExpired):
+                offline = False
+            if offline:
+                wheel_mount = ["--mount", f"type=bind,source={Path(wheel_dir.name).resolve()},target=/wheelhouse,readonly"]
+            install += " && python -m pip install --only-binary=:all: --disable-pip-version-check --target /work/.python-deps " + (
+                "--no-index --find-links=/wheelhouse " if offline else "") + " ".join(
+                shlex.quote(value) for value in test_requirements)
         test = "if python -c 'import pytest' 2>/dev/null; then python -m pytest -q; elif [ -d tests ]; then python -m unittest discover -s tests -v; else python -m unittest discover -v; fi"
     name = "office-check-" + uuid.uuid4().hex[:12]
     volume = name + "-files"
-    executable = shutil.which("docker")
+    executable = docker_executable()
     common = [executable, "run", "--rm", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=128",
               "--memory=1536m", "--cpus=2", "--read-only", "--tmpfs=/tmp:rw,exec,size=384m,mode=1777",
               "--mount", f"type=volume,source={volume},target=/work", "--env", "HOME=/tmp",
               "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONPATH=/work/.python-deps:/work"]
-    stages = [common + ["--name", name + "-install", "--mount", f"type=bind,source={root.resolve()},target=/src,readonly",
+    stages = [common + ["--name", name + "-install", "--mount", f"type=bind,source={root.resolve()},target=/src,readonly", *wheel_mount,
                         image, "/bin/sh", "-lc", "cp -R /src/. /work/ && cd /work && " + install + " && chmod -R a+rwX /work"],
               common + ["--name", name + "-test", "--network=none", "--user=65534:65534", image, "/bin/sh", "-lc", "cd /work && " + test]]
     try:
@@ -288,6 +465,11 @@ def sandbox_check(root: Path, runtime: str) -> dict:
                 return {"label": "隔离安装与运行测试", "ok": False, "detail": output[-14000:], "runtime": runtime}
         empty = bool(re.search(r"Ran 0 tests|no tests ran|No tests found", output, re.I))
         evidence = bool(re.search(r"Ran\s+[1-9]\d*\s+tests?|\b[1-9]\d*\s+(?:passed|passing)|\btests?\s+[1-9]\d*", output, re.I))
+        # pytest with project addopts=-q and the runner's -q may omit the
+        # numeric summary; a successful process plus completed progress dots
+        # still proves nonzero executed tests.
+        if not evidence and result.returncode == 0:
+            evidence = bool(re.search(r"(?m)^\.{1,}\s+\[100%\]\s*$", output))
         return {"label": "隔离安装与运行测试", "ok": not empty and evidence,
                 "detail": output[-14000:] + ("\n未找到非零测试数量的执行证据。" if not evidence else ""), "runtime": runtime}
     except subprocess.TimeoutExpired:
@@ -295,6 +477,8 @@ def sandbox_check(root: Path, runtime: str) -> dict:
     except OSError as error:
         return {"label": "隔离安装与运行测试", "ok": None, "detail": str(error)}
     finally:
+        if wheel_dir is not None:
+            wheel_dir.cleanup()
         for suffix in ("-install", "-test"):
             subprocess.run([executable, "rm", "-f", name + suffix], capture_output=True, timeout=20,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -356,8 +540,14 @@ def assemble(requirement: str, contributions: Path, destination: Path, roster: i
         '返回 JSON {"runtime":"python|node|unsupported","files":[{"path":"相对路径","purpose":"具体职责"}]}。'
         "尊重用户指定语言与框架；当前执行器未支持的语言标记为 unsupported，不得擅自换语言。"
         "根据任务使用合适栈，必须规划 README.md、依赖清单、入口和真正断言功能的测试。"
+        "README 展示的裸命令必须配置可安装入口；否则使用 python -m 包名/模块名。"
+        "命令行无参数及非法输入须向 stderr 报错并以非零状态退出。"
         "测试必须真实执行成功与失败路径；禁止 pytest.skip/xfail、unittest.skip 或其他跳过方式。"
-        "前后端接口要统一，不能把每个成员的示例脚本拼在一起。最多40个文件。",
+        "前后端接口要统一，不能把每个成员的示例脚本拼在一起。"
+        "同一名称只能保留一种形态：顶层模块 foo.py 或包 foo/ 目录二选一，禁止并存；"
+        "项目根目录不放 __init__.py，根目录不是可导入的包。"
+        "测试使用 pytest 时，必须在 requirements-dev.txt 或 pyproject.toml 中声明 pytest 依赖。"
+        "最多40个文件。",
         f"需求：{requirement}\n已有成果：\n{evidence}", fallback={}, roster=roster, max_tokens=3500, timeout=180,
     )
     if not isinstance(plan, dict) or not isinstance(plan.get("files"), list):
@@ -386,6 +576,24 @@ def assemble(requirement: str, contributions: Path, destination: Path, roster: i
         write_response(destination, raw, set(batch) - existing)
     runtime = plan.get("runtime", "python")
     ensure_python_dependency_manifest(destination, planned, runtime)
+    missing_planned = [name for name in planned if not safe_path(destination, name).is_file()]
+    if missing_planned:
+        # Models sometimes ignore paths in a four-file batch. Give each missing
+        # file one focused chance before quality evaluation; never overwrite a
+        # teammate's submitted file in this completion pass.
+        for name in missing_planned:
+            raw = chat_text(
+                "补全项目规划中缺失的一个文件。只输出 ===FILE: 路径\\n完整内容\\n===END。"
+                "文件须与已有代码、入口和测试一致，禁止跳过测试、占位实现和生成说明。",
+                [{"role": "user", "content": json.dumps({"requirement": requirement,
+                    "path": name, "purpose": next((item.get("purpose", "") for item in plan["files"]
+                        if isinstance(item, dict) and item.get("path") == name), ""),
+                    "project": snapshot(destination)}, ensure_ascii=False)}],
+                fallback="", roster=roster, max_tokens=7000, timeout=180, temperature=.2,
+            )
+            write_response(destination, raw, {name})
+    if runtime == "python":
+        reconcile_python_test_docs(destination)
     report = evaluate(destination, planned, runtime)
     rounds = [{"attempt": 1, "status": report["status"]}]
     for attempt in range(2):
@@ -399,11 +607,15 @@ def assemble(requirement: str, contributions: Path, destination: Path, roster: i
             "修复实际检查发现的问题，仅输出需要替换或新增的完整文件，使用 ===FILE: 路径\\n内容\\n===END。"
             "不能删除测试、跳过测试、把断言改成恒真或移除用户功能来让检查通过。"
             "README 的启动和测试命令必须从正确工作目录运行；requirements.txt 有依赖时明确给出 python -m pip install -r requirements.txt。"
+            "README 展示的裸命令必须配置可安装入口；否则改用 python -m 包名/模块名。"
+            "命令行无参数及非法输入须向 stderr 报错并以非零状态退出。"
             "不要在代码或 README 中加入生成说明、示例免责声明或 AI 水印。",
             [{"role": "user", "content": json.dumps({"requirement": requirement, "errors": failures, "files": snapshot(destination)}, ensure_ascii=False)}],
             fallback="", roster=roster, max_tokens=14000, timeout=300, temperature=.25,
         )
         write_response(candidate, raw)
+        if runtime == "python":
+            reconcile_python_test_docs(candidate)
         repaired = evaluate(candidate, planned, runtime)
         rounds.append({"attempt": attempt + 2, "status": repaired["status"]})
         if sum(c["ok"] is False for c in repaired["checks"]) <= len(failures):

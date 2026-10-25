@@ -11,9 +11,6 @@ const remoteOrigin = typeof window !== 'undefined' && !['localhost', '127.0.0.1'
   ? window.location.origin : null
 const remoteWebSocket = remoteOrigin ? `${remoteOrigin.replace(/^http/, 'ws')}/ws/office` : null
 
-export const OFFICE_HTTP_ACTIONS_URL =
-  import.meta.env.VITE_OFFICE_HTTP_ACTIONS_URL ?? (remoteOrigin ? `${remoteOrigin}/actions` : 'http://localhost:8765/actions')
-
 /** LangGraph 后端 WebSocket 地址（实时动作事件） */
 export const OFFICE_WS_URL =
   import.meta.env.VITE_OFFICE_WS_URL ?? remoteWebSocket ?? 'ws://localhost:8000/ws/office'

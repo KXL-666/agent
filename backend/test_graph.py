@@ -250,6 +250,18 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged["requirement_ids"], ["R1", "R2", "R3"])
         self.assertEqual(merged["acceptance_criteria"], ["正文完整", "不超过一页"])
 
+    def test_file_plan_adds_missing_fact_and_qa_roles(self):
+        contract = {"target_kind": "docx", "requirements": [
+            {"requirement_id": "R1"}, {"requirement_id": "R2"}]}
+        planned = [{"title": "撰写通知正文", "role_hint": "前端",
+                    "requirement_ids": ["R1", "R2"]}]
+        result = graph.ensure_file_collaboration_tasks(planned, contract)
+        self.assertEqual({item["role_hint"] for item in result}, {"后端", "前端", "测试"})
+        self.assertEqual(len(result), 3)
+        self.assertEqual(next(item for item in result if item["role_hint"] == "后端")["requirement_ids"],
+                         ["R1", "R2"])
+        self.assertEqual(graph.ensure_file_collaboration_tasks(result, contract), result)
+
 
 if __name__ == "__main__":
     unittest.main()

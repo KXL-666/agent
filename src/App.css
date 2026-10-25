@@ -70,6 +70,7 @@
 }
 
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -121,6 +122,37 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+/* 有新产物时「交付」出现「新」徽标并持续闪动，6 秒后或点开后消失 */
+.nav-badge.is-new {
+  background: #e3f2e6;
+  color: #2f6f3e;
+  font-weight: 600;
+  animation: nav-badge-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes nav-badge-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(47, 111, 62, 0.4);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 5px rgba(47, 111, 62, 0);
+  }
+}
+
+[data-theme="dark"] .nav-badge.is-new {
+  background: #2c3a30;
+  color: #8fd39b;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nav-badge.is-new {
+    animation: none;
+  }
 }
 
 .sidebar-section {
@@ -510,6 +542,41 @@
   font-size: 12px;
 }
 
+/* 右面板标题行：标题 + 本轮花费胶囊 */
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel-head h2 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-cost {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #f6f1e2;
+  color: #8a6414;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
+[data-theme="dark"] .panel-cost {
+  background: #33373d;
+  color: #e6c979;
+}
+
+[data-theme="dark"] .panel-head h2 {
+  color: #e3e5e1;
+}
+
 .panel-grow {
   /* 不参与压缩：内容条数在组件层截断，避免溢出叠到快捷工具上 */
   flex-shrink: 0;
@@ -705,7 +772,8 @@
 .office-zoom-controls {
   position: absolute;
   right: 14px;
-  bottom: 14px;
+  /* 抬到工具栏上方：底部工具栏占 bottom 18px 起约 50px 高，同高度会与其右端重叠 */
+  bottom: 78px;
   z-index: 6;
   display: flex;
   align-items: center;
@@ -1956,7 +2024,8 @@
 
 .sprint-progress-head strong {
   color: #2f6f3e;
-  font-size: 12.5px;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
 }
 
 .sprint-progress-head em {
@@ -1966,7 +2035,7 @@
 }
 
 .sprint-progress-bar {
-  height: 4px;
+  height: 8px;
   margin-top: 7px;
   border-radius: 999px;
   background: #f0efeb;
@@ -1978,6 +2047,25 @@
   height: 100%;
   background: linear-gradient(90deg, #2f6f3e, #6aa86f);
   transition: width 0.5s ease;
+}
+
+/* 本轮结束后的弱化样式：仍保留结果，但不再显得"还在跑" */
+.sprint-progress.is-finished {
+  background: #fbfbf8;
+  border-style: dashed;
+}
+
+.sprint-progress.is-finished .sprint-progress-head strong {
+  color: #6d6a63;
+}
+
+[data-theme="dark"] .sprint-progress.is-finished {
+  background: #262a2f;
+  border-color: #3a3e45;
+}
+
+[data-theme="dark"] .sprint-progress.is-finished .sprint-progress-head strong {
+  color: #b9bec7;
 }
 
 /* 任务完成度进度条 */
@@ -4799,6 +4887,12 @@ button.sidebar-search:hover {
   .office-canvas {
     width: 720px;
     height: 100%;
+  }
+
+  /* 移动端底栏更高（约 56px），缩放控件再抬高一点避免重叠 */
+  .office-zoom-controls {
+    right: 8px;
+    bottom: 86px;
   }
 
   .view-page {
