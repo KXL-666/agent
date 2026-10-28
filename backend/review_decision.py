@@ -58,21 +58,8 @@ def decide(candidate: dict, contract: dict, qa_report: dict, handoff_records: li
             image = directory / name
             if image.is_file() and image.stat().st_size < 2 * 1024 * 1024:
                 images.append("data:image/png;base64," + base64.b64encode(image.read_bytes()).decode())
-    # 非 code 类型快速通道：QA 全通过且本地检查非空且无失败时，跳过 LEAD 的 LLM 复核
-    qa_passed = qa_report.get("status") == "passed"
-    local_ok = bool(actual_checks) and not any(c.get("ok") is False for c in actual_checks)
-    if kind != "code" and qa_passed and local_ok:
-        result.update(
-            status="passed",
-            reason="QA 逐条验证通过且本地自检无失败，LEAD 快速放行",
-            note="快速放行：QA 全通过 + 本地自检通过",
-            model="fast-path",
-        )
-        directory = artifact_quality.report_directory(path, forge.WORKSPACE_DIR)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "lead-decision.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return result
     meta = {}
+    from verification import source_material
     candidate_ref = f"artifact:{candidate.get('id')}"
     current_handoffs = [record for record in handoff_records
                         if candidate_ref in (record.get("input_refs") or [])
@@ -99,6 +86,7 @@ def decide(candidate: dict, contract: dict, qa_report: dict, handoff_records: li
         "字数判定只认 qa_report.metrics.counted_characters（唯一权威，统一口径=汉字+英文/数字词、剔除标题段），"
         "禁止自行重新估算或改写该数值。『恰好/正好 N 字』须 actual==N 才算通过；『约 N 字』允许 ±20%。",
         json.dumps({"raw_requirement": contract.get("raw_requirement"),
+                    "source_material": source_material(contract),
                     "clauses": contract.get("requirements", []), "candidate_sha256": expected_sha256,
                     "actual_content": actual, "companion_content": companion_text, "actual_checks": actual_checks,
                     "qa_report": qa_report, "handoffs": current_handoffs[-30:],

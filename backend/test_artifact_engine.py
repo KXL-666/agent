@@ -12,6 +12,7 @@ from unittest.mock import patch
 os.environ.setdefault("OFFICE_DB_PATH", str(Path(tempfile.mkdtemp()) / "test.db"))
 
 import artifact_quality
+import deliverable_generator
 import forge
 import main
 import office_runtime
@@ -120,7 +121,7 @@ class ArtifactEngineTest(unittest.TestCase):
         from docx import Document
         draft = "# 我的校园生活\n\n清晨的校园很安静。\n\n（全文约 800 字）\n\n说明：以上为作文正文，可直接复制到 Word 中使用。\n\n---"
         path = self.root / "作文.docx"
-        with patch.object(forge, "_gen_docx", return_value=draft):
+        with patch.object(deliverable_generator, "_gen_docx", return_value=draft):
             self.assertTrue(forge._forge_once("docx", "写800字作文", str(path), None))
         body = "\n".join(p.text for p in Document(path).paragraphs)
         self.assertIn("清晨的校园", body)
@@ -128,7 +129,7 @@ class ArtifactEngineTest(unittest.TestCase):
         self.assertNotIn("可直接复制", body)
         self.assertNotIn("全文约", (artifact_quality.report_directory(path, forge.WORKSPACE_DIR) / "source.md").read_text(encoding="utf-8"))
         pdf_path = self.root / "作文.pdf"
-        with patch.object(forge, "_gen_docx", return_value=draft):
+        with patch.object(deliverable_generator, "_gen_docx", return_value=draft):
             self.assertTrue(forge._forge_once("pdf", "写800字作文", str(pdf_path), None))
         import pymupdf
         with pymupdf.open(pdf_path) as document:
@@ -147,16 +148,16 @@ class ArtifactEngineTest(unittest.TestCase):
     def test_slides_and_sheets_reject_model_handoff_text(self):
         slides = {"title": "方案", "slides": [{"heading": "结论", "bullets": ["以上为示例内容，可直接复制到 Word 中使用。"]}]}
         sheets = [{"name": "汇总", "headers": ["项目", "值"], "rows": [["说明：以上为作文正文，可直接复制到 Word 中使用。", 1]]}]
-        with patch.object(forge, "_gen_pptx", return_value=slides):
+        with patch.object(deliverable_generator, "_gen_pptx", return_value=slides):
             self.assertFalse(forge._forge_once("pptx", "方案", str(self.root / "方案.pptx"), None))
-        with patch.object(forge, "_gen_xlsx", return_value=sheets):
+        with patch.object(deliverable_generator, "_gen_xlsx", return_value=sheets):
             self.assertFalse(forge._forge_once("xlsx", "统计", str(self.root / "统计.xlsx"), None))
 
     def test_pptx_generation_passes_traceable_cheap_fallback_to_json_model(self):
         meta = {}
         payload = {"title": "方案", "slides": [{"heading": "结论", "bullets": ["先完成状态通知"]}]}
-        with (patch.object(artifact_quality, "contract", return_value={"unit": "页", "count": 1}),
-              patch.object(forge, "chat_json", return_value=payload) as request):
+        with (patch.object(artifact_quality, "contract", return_value={"unit": "页", "count": 1, "cover": False}),
+              patch.object(deliverable_generator, "chat_json", return_value=payload) as request):
             result = forge._gen_pptx("生成 1 页方案", 6, generation_meta=meta)
         self.assertEqual(result["slides"][0]["heading"], "结论")
         self.assertIs(request.call_args.kwargs["meta"], meta)
@@ -301,7 +302,7 @@ class ArtifactEngineTest(unittest.TestCase):
             if len(drafts) == 1:
                 report.update(ok=False, status="failed", review={"status": "failed", "issues": [{"location": "正文", "problem": "缺少风险说明", "fix": "补充库存竞争与处理办法"}]})
             return report
-        with patch.object(forge, "_forge_once", side_effect=generate), patch.object(artifact_quality, "model_review", side_effect=review):
+        with patch.object(deliverable_generator, "_forge_once", side_effect=generate), patch.object(artifact_quality, "model_review", side_effect=review):
             name = forge.forge_file("docx", "补充风险说明", "风险.docx")
         self.assertEqual(len(drafts), 2)
         self.assertIn("缺少风险说明", drafts[1])

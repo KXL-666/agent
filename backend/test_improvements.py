@@ -16,9 +16,11 @@ import artifact_quality
 import archive_layout
 import artifacts
 import chat_context
+import deliverable_generator
 import events
 import forge
 import graph
+import workflow_nodes
 import main
 import storage
 
@@ -96,7 +98,7 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
         def generate(kind, spec, path, roster, feedback=""):
             Path(path).write_bytes(b"damaged" if feedback else b"first usable file")
             return not feedback
-        with patch.object(forge, "_forge_once", side_effect=generate), patch.object(forge, "self_check", return_value={"ok": False, "checks": [{"ok": False, "label": "正文", "detail": "不足"}]}):
+        with patch.object(deliverable_generator, "_forge_once", side_effect=generate), patch.object(forge, "self_check", return_value={"ok": False, "checks": [{"ok": False, "label": "正文", "detail": "不足"}]}):
             name = forge.forge_file("docx", "需求", "结果.docx")
         self.assertEqual(Path(forge.safe_deliverable_path(name)).read_bytes(), b"first usable file")
 
@@ -131,11 +133,11 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
                                "items": [{"requirement_id": "R1", "status": "failed"}]}}
         decision = {"status": "failed", "candidate_sha256": "hash", "issues": [{"requirement_id": "R1"}],
                     "reason": "验收条件未满足"}
-        with patch.object(graph.review_decision, "decide", return_value=decision), patch.object(graph, "pause"), patch.object(graph, "speak"):
-            result = await graph.review(state)
+        with patch.object(workflow_nodes.review_decision, "decide", return_value=decision), patch.object(workflow_nodes, "pause"), patch.object(workflow_nodes, "speak"):
+            result = await workflow_nodes.review(state)
             self.assertEqual(graph.route_review({**state, **result}), "rework")
             self.assertEqual(tasks[0]["status"], "打回")
-            await graph.publish({**state, **result})
+            await workflow_nodes.publish({**state, **result})
         final = next(a for a in artifacts.artifacts_store if a["kind"] == "final")
         self.assertTrue(final["degraded"])
         self.assertIsNone(final["file_name"])
@@ -148,10 +150,10 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
         report = {"status": "passed", "candidate_sha256": "hash",
                   "items": [{"requirement_id": "R1", "status": "passed"}]}
         decision = {"status": "passed", "candidate_sha256": "hash", "reason": "复核通过", "issues": []}
-        with patch.object(graph.verification, "verify", return_value=report), patch.object(graph.review_decision, "decide", return_value=decision), patch.object(graph, "pause"), patch.object(graph, "speak"):
-            state.update(await graph.test(state))
+        with patch.object(workflow_nodes.verification, "verify", return_value=report), patch.object(workflow_nodes.review_decision, "decide", return_value=decision), patch.object(workflow_nodes, "pause"), patch.object(workflow_nodes, "speak"):
+            state.update(await workflow_nodes.test(state))
             self.assertEqual(tasks[0]["status"], "待评审")
-            state.update(await graph.review(state))
+            state.update(await workflow_nodes.review(state))
             self.assertEqual(tasks[0]["status"], "通过")
 
     async def test_persistent_defects_cannot_loop_forever(self):
@@ -161,10 +163,10 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
                                "items": [{"requirement_id": "R1", "status": "failed"}]}}
         decision = {"status": "failed", "candidate_sha256": "hash", "reason": "缺陷仍在",
                     "issues": [{"requirement_id": "R1"}]}
-        with patch.object(graph.review_decision, "decide", return_value=decision), patch.object(graph, "pause"), patch.object(graph, "speak"):
-            for _ in range(graph.MAX_REWORK + 1):
-                state.update(await graph.review(state))
-        self.assertGreater(state["rework_count"], graph.MAX_REWORK)
+        with patch.object(workflow_nodes.review_decision, "decide", return_value=decision), patch.object(workflow_nodes, "pause"), patch.object(workflow_nodes, "speak"):
+            for _ in range(workflow_nodes.MAX_REWORK + 1):
+                state.update(await workflow_nodes.review(state))
+        self.assertGreater(state["rework_count"], workflow_nodes.MAX_REWORK)
         self.assertEqual(graph.route_review(state), "approved")
         # approved 是图中的结束返工路由；publish 仍会阻止未通过任务发布。
 
@@ -186,7 +188,7 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
             for i in range(8)]}
         sheets = [{"name": "测试用例", "headers": ["编号", "场景", "结果"],
                    "rows": [[i, "库存不足时拒绝借阅", "待执行"] for i in range(1, 9)]}]
-        with patch.object(forge, "_gen_docx", return_value=document), patch.object(forge, "_gen_pptx", return_value=slides), patch.object(forge, "_gen_xlsx", return_value=sheets):
+        with patch.object(deliverable_generator, "_gen_docx", return_value=document), patch.object(deliverable_generator, "_gen_pptx", return_value=slides), patch.object(deliverable_generator, "_gen_xlsx", return_value=sheets):
             for kind in ("docx", "pptx", "xlsx"):
                 name = forge.forge_file(kind, "系统说明", f"成品.{kind}")
                 self.assertIsNotNone(name)

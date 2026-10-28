@@ -14,6 +14,7 @@ import threading
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import Literal
 
 import agent_config
 import llm
@@ -41,6 +42,23 @@ class ChatRequest(BaseModel):
 
 class IntentRequest(BaseModel):
     message: str
+
+
+class ConversationRequest(ChatRequest):
+    session_id: str
+    mode: Literal["solo", "talk"] = "solo"
+    sprint_id: str = ""
+    artifact_id: str = ""
+
+
+@router.post("/turn")
+async def conversation_turn(req: ConversationRequest):
+    if req.roster not in ROSTER or (req.mode == "talk" and req.roster != 1):
+        raise HTTPException(400, "无效的对话角色")
+    if not req.message.strip() or not req.session_id.strip() or len(req.session_id) > 100:
+        raise HTTPException(400, "对话标识和消息不能为空")
+    import conversation_actions
+    return await conversation_actions.execute(req)
 
 
 # 明显闲聊的本地规则：问候/寒暄/无意义短输入，不调用模型直接判 chat

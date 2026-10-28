@@ -1,6 +1,7 @@
 /** 对话中心 store：每个成员的聊天线程（localStorage 持久化，刷新不丢） */
 
 import { useEffect } from 'react'
+import type { OfficeArtifact } from './officeArtifactStore'
 
 export type ChatMessage = {
   role: 'user' | 'assistant' | 'task'
@@ -14,6 +15,7 @@ export type ChatMessage = {
   taskId?: string
   taskStatus?: 'running' | 'done' | 'failed'
   artifactId?: string
+  artifacts?: OfficeArtifact[]
 }
 
 const STORAGE_KEY = 'office.chat.v1'
@@ -23,6 +25,8 @@ type Threads = Record<number, ChatMessage[]>
 let threads: Threads = {}
 let selectedRoster = 1
 let initialized = false
+let conversationIds: Record<number, string> = {}
+let artifactTargets: Record<number, string> = {}
 
 // 空线程必须是同一个引用：useSyncExternalStore 的快照不稳定会触发无限重渲染
 const EMPTY_THREAD: ChatMessage[] = []
@@ -60,8 +64,12 @@ function restore() {
     const parsed = JSON.parse(raw) as {
       threads?: Threads
       selectedRoster?: number
+      conversationIds?: Record<number, string>
+      artifactTargets?: Record<number, string>
     }
     threads = parsed.threads ?? {}
+    conversationIds = parsed.conversationIds ?? {}
+    artifactTargets = parsed.artifactTargets ?? {}
     if (typeof parsed.selectedRoster === 'number') {
       selectedRoster = parsed.selectedRoster
     }
@@ -74,7 +82,7 @@ function persist() {
   try {
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ threads, selectedRoster }),
+      JSON.stringify({ threads, selectedRoster, conversationIds, artifactTargets }),
     )
   } catch {
     // 存储空间不足时忽略
@@ -135,6 +143,30 @@ export function appendAssistantMessage(
   model?: string,
 ) {
   append(roster, { role: 'assistant', content, time: nowLabel(), via, model })
+}
+
+export function getConversationId(roster: number): string {
+  restore()
+  if (!conversationIds[roster]) {
+    conversationIds = { ...conversationIds, [roster]: crypto.randomUUID() }
+    persist()
+  }
+  return conversationIds[roster]
+}
+
+export function getArtifactTarget(roster: number): string {
+  restore()
+  return artifactTargets[roster] ?? ''
+}
+
+export function setArtifactTarget(roster: number, id: string) {
+  artifactTargets = { ...artifactTargets, [roster]: id }
+  persist()
+  notify()
+}
+
+export function appendConversationResult(roster: number, content: string, artifacts: OfficeArtifact[] = []) {
+  append(roster, { role: 'assistant', content, artifacts, time: nowLabel(), via: 'llm' })
 }
 
 /** 追加一条轻提示（渲染为小灰字，不参与气泡/模型标注） */
@@ -221,6 +253,8 @@ export function updateLastAssistantMessage(
 
 export function clearThread(roster: number) {
   threads = { ...threads, [roster]: [] }
+  conversationIds = { ...conversationIds, [roster]: crypto.randomUUID() }
+  artifactTargets = { ...artifactTargets, [roster]: '' }
   persist()
   notify()
 }

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import events
 import graph
+import workflow_nodes
 import handoffs
 import storage
 from requirement_contract import build_contract
@@ -76,8 +77,8 @@ class HandoffTest(unittest.IsolatedAsyncioTestCase):
                 {"id": "T1", "title": "资料核对", "role_hint": "其他", "requirement_ids": ["R1"]},
                 {"id": "T2", "title": "正文与界面", "role_hint": "写作" if kind == "docx" else "前端", "requirement_ids": ["R2"]},
             ]
-            with patch.object(graph, "pause", new_callable=AsyncMock), patch.object(graph, "speak", new_callable=AsyncMock):
-                result = await graph.assign({"tasks": tasks, "deliver_kind": kind})
+            with patch.object(workflow_nodes, "pause", new_callable=AsyncMock), patch.object(workflow_nodes, "speak", new_callable=AsyncMock):
+                result = await workflow_nodes.assign({"tasks": tasks, "deliver_kind": kind})
             self.assertEqual({task["assignee_roster"] for task in result["tasks"]}, {DEV_BE, DEV_FE})
             self.assertNotEqual(result["tasks"][0]["role_scope"], result["tasks"][1]["role_scope"])
             self.assertTrue(all(task.get("assignment_handoff_id") for task in result["tasks"]))

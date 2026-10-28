@@ -74,6 +74,7 @@ class GenerateRequest(BaseModel):
 
 class RevisionRequest(BaseModel):
     instruction: str
+    mode: str = "auto"
 
 
 class RollbackRequest(BaseModel):
@@ -285,16 +286,22 @@ async def artifact_quality_page(artifact_id: str, page: int):
 async def artifact_versions(artifact_id: str):
     """版本链：返回该产物所在链条的全部版本。"""
     artifact = _find_artifact(artifact_id)
+    import revision_outputs
+    artifact = revision_outputs.canonical(artifact)
+    artifact_id = artifact['id']
     sprint_id = artifact.get("sprint_id") or _current_sprint_id()
     root_id = storage.artifact_root(sprint_id, artifact_id)
     chain = storage.artifact_versions(sprint_id, root_id)
-    return {"root_id": root_id, "versions": chain}
+    return {"root_id": root_id, "versions": [item for item in chain if not (item.get('regen') or {}).get('bundle_anchor')]}
 
 
 @router.delete("/api/artifacts/{artifact_id}")
 async def delete_artifact(artifact_id: str):
     """删除单条产物及其磁盘文件（修订版本不连带删除）。"""
     artifact = _find_artifact(artifact_id)
+    root = storage.artifact_root(artifact.get('sprint_id', ''), artifact_id)
+    if storage.list_revision_sessions(root) or storage.artifact_used_by_revision(artifact_id):
+        raise HTTPException(409, '该版本链用于修订会话，暂不能删除，以免丢失编辑依据')
     file_name = storage.delete_artifact(artifact_id)
     if file_name:
         path = forge.safe_deliverable_path(file_name)
@@ -315,6 +322,10 @@ async def delete_artifact(artifact_id: str):
 async def retry_artifact(artifact_id: str):
     """重新生成单个产物（保留同一条记录并刷新内容）。"""
     artifact = _find_artifact(artifact_id)
+    if storage.revision_operations(active=True):
+        raise HTTPException(409, '产物修订仍在执行，请稍后重试')
+    if (artifact.get('regen') or {}).get('mode') in ('manual_revision', 'published_candidate'):
+        raise HTTPException(409, '请使用对话修改生成新版本，保留已有版本记录')
     if artifact.get("kind") == "final" and (storage.get_sprint(artifact.get("sprint_id") or "") or {}).get("execution_style") == "collaborative":
         raise HTTPException(status_code=409, detail="协作成品不能原地重试；请创建新修订版本并重新验收")
     fields = await _rebuild(artifact)
@@ -324,136 +335,33 @@ async def retry_artifact(artifact_id: str):
 
 @router.post("/api/artifacts/{artifact_id}/revise")
 async def revise_artifact(artifact_id: str, req: RevisionRequest):
-    """基于现有产物继续修改：生成一个新版本，旧版本保留可追溯。"""
-    instruction = req.instruction.strip()
-    if not instruction:
-        raise HTTPException(status_code=400, detail="修改要求不能为空")
+    from revision_service import revise
     artifact = _find_artifact(artifact_id)
-    sprint_id = artifact.get("sprint_id") or _current_sprint_id()
-    collaborative_final = (artifact.get("kind") == "final" and
-                           (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
-    if collaborative_final and runtime_state.running:
-        raise HTTPException(status_code=409, detail="当前协作 Sprint 仍在运行，结束后再修订")
-    if collaborative_final and artifact.get("file_name"):
-        import candidate_revision
-        kind = Path(artifact["file_name"]).suffix.lower().lstrip(".")
-        if kind == "zip":
-            kind = "code"
-        base_candidate = storage.get_artifact((artifact.get("regen") or {}).get("candidate_id") or "") or {}
-        contribution_refs = (base_candidate.get("regen") or {}).get("contribution_refs", [])
-        project_dir = ((artifact.get("regen") or {}).get("project_dir") or
-                       (base_candidate.get("regen") or {}).get("project_dir", ""))
-        actual = await asyncio.to_thread(forge.extract_preview, artifact["file_name"], 14000)
-        if kind == "code" and project_dir:
-            import project_agent
-            actual = project_agent.snapshot(Path(project_dir), limit=20000)
-        meta: dict = {}
-        from sprint_runner import _manual_call_guard, _persist_manual_usage_delta, _usage_snapshot
-        before_usage = _usage_snapshot()
-        call_token = _manual_call_guard(sprint_id)
-        try:
-            import main
-            patch_data = await asyncio.to_thread(
-                main.chat_json,
-                "按用户要求只修改一个明确位置，输出 JSON："
-                '{"location":"第N页/第N段/工作表!A1/文件路径",'
-                '"old_text":"需要替换的精确旧文本","replacement":"完整替换文本或公式或代码文件内容",'
-                '"path":"代码相对路径"}。找不到唯一位置时返回空对象。不得删除测试。',
-                json.dumps({"instruction": instruction, "kind": kind, "actual_content": actual}, ensure_ascii=False),
-                fallback={}, roster=2 if kind == "code" else 3, meta=meta, max_tokens=6500, timeout=180,
-            )
-        finally:
-            llm.reset_call_guard(call_token)
-            _persist_manual_usage_delta(sprint_id, before_usage)
-        if meta.get("fallback_reason") or not isinstance(patch_data, dict) or not patch_data:
-            raise HTTPException(status_code=502, detail="未能定位安全的定点修订位置，原成品未改动")
-        file_name, reason, detail = await asyncio.to_thread(
-            candidate_revision.apply, sprint_id, kind, artifact["file_name"], patch_data, project_dir
-        )
-        if not file_name:
-            raise HTTPException(status_code=422, detail=reason or "定点修订失败，原成品未改动")
-        path = forge.safe_deliverable_path(file_name)
-        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
-        fields = {"content": artifact.get("content", "") + f"\n\n修订要求：{instruction}\n修订位置：{detail}",
-                  "file_name": file_name, "quality_status": "unchecked", "source": "model",
-                  "regen": {"mode": "manual_revision", "file_kind": kind, "sha256": digest,
-                            "project_dir": detail.get("project_dir", project_dir),
-                            "contribution_refs": contribution_refs}}
-    else:
-        fields = await _rebuild(artifact, instruction)
-    root_id = storage.artifact_root(sprint_id, artifact_id)
-    version = storage.latest_artifact_version(sprint_id, root_id) + 1
-    created = add_artifact(
-        kind=artifact.get("kind", "custom"),
-        title=f"{artifact.get('title', '产物')}（修订 v{version}）",
-        author_roster=artifact.get("author_roster"),
-        content=fields.get("content", artifact.get("content", "")),
-        task_id=artifact.get("task_id"),
-        file_name=fields.get("file_name") or artifact.get("file_name"),
-        degraded=fields.get("degraded", False),
-        degraded_reason=fields.get("degraded_reason", ""),
-        source=fields.get("source", artifact.get("source", "unknown")),
-        quality_status="unchecked" if collaborative_final else fields.get("quality_status", "unchecked"),
-        regen=fields.get("regen", artifact.get("regen")),
-        parent_id=artifact_id,
-        version=version,
-        sprint_id=sprint_id,
-    )
-    if collaborative_final and not created.get("degraded"):
-        created = await _revalidate_manual_collaborative_version(created, sprint_id)
-    return {"ok": True, "artifact": created}
+    import revision_outputs
+    artifact = revision_outputs.canonical(artifact)
+    if (artifact.get('regen') or {}).get('bundle_members'):
+        import revision_jobs
+        return await revision_jobs.legacy_bundle_request(artifact, 'revise',
+            {'feedback': req.instruction, 'mode': req.mode, 'artifact_id': artifact_id})
+    return await revise(artifact_id, req.instruction, mode=req.mode)
 
 
 @router.post("/api/artifacts/{artifact_id}/rollback")
 async def rollback_artifact(artifact_id: str, req: RollbackRequest):
-    """回滚到版本链上的某个历史版本：以旧版内容/文件为蓝本生成一个新版本。"""
+    from revision_service import rollback
     artifact = _find_artifact(artifact_id)
-    target = _find_artifact(req.target_id)
-    sprint_id = artifact.get("sprint_id") or _current_sprint_id()
-    root_id = storage.artifact_root(sprint_id, artifact_id)
-    if storage.artifact_root(sprint_id, req.target_id) != root_id:
-        raise HTTPException(status_code=400, detail="目标版本不在同一版本链上")
-    version = storage.latest_artifact_version(sprint_id, root_id) + 1
-    file_name = None
-    degraded = False
-    degraded_reason = ""
-    if target.get("file_name"):
-        file_name = await asyncio.to_thread(
-            forge.duplicate_deliverable, target["file_name"]
-        )
-        if not file_name:
-            degraded = True
-            degraded_reason = "旧版文件已丢失，仅恢复文字内容"
-    collaborative_final = (artifact.get("kind") == "final" and
-                           (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
-    if collaborative_final and runtime_state.running:
-        raise HTTPException(status_code=409, detail="当前协作 Sprint 仍在运行，结束后再回滚")
-    rollback_regen = artifact.get("regen")
-    if collaborative_final:
-        path = forge.safe_deliverable_path(file_name or "")
-        file_kind = Path(file_name).suffix.lstrip(".").lower() if file_name else ""
-        rollback_regen = {"mode": "manual_revision", "file_kind": "code" if file_kind == "zip" else file_kind,
-                          "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else "",
-                          "contribution_refs": _manual_contribution_refs(sprint_id, artifact)}
-    created = add_artifact(
-        kind=target.get("kind") or artifact.get("kind", "custom"),
-        title=f"{artifact.get('title', '产物')}（回滚 v{version}）",
-        author_roster=artifact.get("author_roster"),
-        content=target.get("content", ""),
-        task_id=artifact.get("task_id"),
-        file_name=file_name,
-        degraded=degraded,
-        degraded_reason=degraded_reason,
-        source=target.get("source", "unknown"),
-        quality_status="failed" if degraded else "unchecked" if collaborative_final else target.get("quality_status", "unchecked"),
-        regen=rollback_regen,
-        parent_id=root_id,
-        version=version,
-        sprint_id=sprint_id,
-    )
-    if collaborative_final and not created.get("degraded"):
-        created = await _revalidate_manual_collaborative_version(created, sprint_id)
-    return {"ok": True, "artifact": created}
+    import revision_outputs
+    artifact = revision_outputs.canonical(artifact)
+    artifact_id = artifact['id']
+    if (artifact.get('regen') or {}).get('bundle_members'):
+        import revision_jobs
+        target = _find_artifact(req.target_id)
+        sid = artifact['sprint_id']
+        if target.get('sprint_id') != sid or storage.artifact_root(sid, target['id']) != storage.artifact_root(sid, artifact_id):
+            raise HTTPException(400, '目标快照不在同一版本链')
+        return await revision_jobs.legacy_bundle_request(artifact, 'rollback',
+            {'target_id': req.target_id, 'feedback': '恢复历史产物组'})
+    return await rollback(artifact_id, req.target_id)
 
 
 @router.get("/api/artifacts/{artifact_id}/raw")
@@ -478,6 +386,8 @@ async def artifact_raw(artifact_id: str):
 
 @router.post("/api/artifacts/{artifact_id}/edit")
 async def edit_artifact(artifact_id: str, req: EditRequest):
+    if storage.revision_operations(active=True):
+        raise HTTPException(409, '产物修订仍在执行，请稍后再编辑')
     """站内文本编辑：修改后的内容存为版本链上的新版本。"""
     content = req.content.strip()
     if not content:
@@ -485,6 +395,13 @@ async def edit_artifact(artifact_id: str, req: EditRequest):
     if len(content) > 200_000:
         raise HTTPException(status_code=400, detail="内容超过 200KB，无法保存")
     artifact = _find_artifact(artifact_id)
+    import revision_outputs
+    canonical_artifact = revision_outputs.canonical(artifact)
+    bundle_anchor = canonical_artifact if (canonical_artifact.get('regen') or {}).get('bundle_members') else None
+    if bundle_anchor:
+        import revision_jobs
+        return await revision_jobs.legacy_bundle_request(bundle_anchor, 'edit',
+            {'content': content, 'feedback': '保存正文编辑并同步配套文件', 'artifact_id': artifact_id})
     sprint_id = artifact.get("sprint_id") or _current_sprint_id()
     collaborative_final = (artifact.get("kind") == "final" and
                            (storage.get_sprint(sprint_id) or {}).get("execution_style") == "collaborative")
@@ -547,6 +464,8 @@ async def code_preview_artifact(artifact_id: str):
 
 @router.post("/api/artifacts/generate")
 async def generate_artifact(req: GenerateRequest):
+    if storage.revision_operations(active=True):
+        raise HTTPException(409, '产物修订仍在执行，请稍后生成')
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt 不能为空")

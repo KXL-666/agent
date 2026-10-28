@@ -122,6 +122,8 @@ def _manual_contribution_refs(sprint_id: str, artifact: dict) -> list[str]:
 
 
 def _manual_call_guard(sprint_id: str):
+    from revision_service import current_cancellation
+    cancelled = current_cancellation.get()
     from route_helpers import _local_model_ready
     sprint = storage.get_sprint(sprint_id) or {}
     budget = max(0.0, float(sprint.get("budget") or 0))
@@ -130,6 +132,8 @@ def _manual_call_guard(sprint_id: str):
     remaining_budget = max(0.0, budget - spent) if budget else 0.0
 
     def guard():
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError('修订任务已结束，停止后续模型调用')
         if sprint.get("execution_mode") == "local" and not _local_model_ready():
             raise RuntimeError("本地模式模型配置已变更，已阻止修订调用")
         current_delta = max(0.0, llm.usage_total_cost() - baseline_cost)
@@ -182,7 +186,7 @@ async def _revalidate_manual_collaborative_version(artifact: dict, sprint_id: st
     before_usage = _usage_snapshot()
     token = _manual_call_guard(sprint_id)
     try:
-        contract = sprint.get("contract") or {}
+        contract = regen.get("revision_contract") or sprint.get("contract") or {}
         refs = [f"requirement:{item['requirement_id']}" for item in contract.get("requirements", [])]
         refs += list(regen.get("contribution_refs") or [])
         offered = handoffs.offer(
@@ -283,6 +287,7 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
 
     if mode == "forge" and regen.get("file_kind"):
         spec = f"{regen.get('spec', '')}{suffix}"
+        next_regen = {**regen, "spec": spec}
         previous_path = forge.safe_deliverable_path(artifact.get("file_name") or "")
         if previous_path:
             import artifact_quality
@@ -313,6 +318,7 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
         check = await asyncio.to_thread(forge.self_check, file_name, regen["file_kind"])
         return {
             "content": (preview or f"已重新生成真实文件：{file_name}") + saved + forge.self_check_note(check),
+            "regen": next_regen,
             "file_name": file_name,
             "degraded": check.get("status", "passed" if check.get("ok") else "failed") == "failed",
             "degraded_reason": "重新生成的成品仍未通过质检" if check.get("status", "passed" if check.get("ok") else "failed") == "failed" else "",
@@ -320,7 +326,7 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
             "quality_status": check.get("status", "passed" if check.get("ok") else "failed"),
         }
 
-    prompt = (regen.get("prompt") or artifact.get("content", "")) + suffix
+    prompt = (regen.get("prompt") or "") + "\n\n已有产物（保留未要求修改的内容）：\n" + artifact.get("content", "") + suffix
     meta: dict = {}
     content = await asyncio.to_thread(
         chat_text,
@@ -331,6 +337,7 @@ async def _rebuild(artifact: dict, instruction: str = "") -> dict:
         temperature=0.6,
         max_tokens=4000,
         timeout=300,
+        roster=regen.get("roster") or artifact.get("author_roster"),
         meta=meta,
     )
     if not content.strip():
@@ -464,7 +471,7 @@ async def _generate_document_impl(
         filename = forge.semantic_filename(prompt, kind, _KIND_DEFAULT_NAME[kind].rpartition('.')[0])
         bus.emit({"type": "generate_progress", "stage": "正在撰写成品内容", "prompt": prompt[:40]})
         file_name = await asyncio.to_thread(
-            forge.forge_file, kind, spec, filename, roster, None, True
+            forge.forge_file, kind, spec, filename, roster, quick=True
         )
         if file_name:
             bus.emit({"type": "generate_progress", "stage": "正在校验与自检成品", "prompt": prompt[:40]})
@@ -631,7 +638,8 @@ async def run_sprint(
                 "task_kind": task_kind,
                 "uploads_text": uploads_text,
                 "uploads_images": uploads_images or [],
-            }
+            },
+            config={"configurable": {"thread_id": sprint_id}},
         )
         deliver_kind = result.get("deliver_kind", "") if isinstance(result, dict) else ""
         sprint_meta["deliver_kind"] = deliver_kind or sprint_meta.get("deliver_kind", "")
@@ -692,6 +700,8 @@ async def run_sprint(
         if ticker_task:
             ticker_task.cancel()
         runtime_state.running = False
+        # 本轮状态已由 storage 落库，工作流的内存快照不再需要
+        runtime_state.graph.checkpointer.delete_thread(sprint_id)
         sprint_meta["finished_at"] = sprint_meta["finished_at"] or time.time()
         llm.SCENE_PACE = runtime_state.BASE_SCENE_PACE
         forge.set_explicit_save_dir("")

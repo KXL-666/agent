@@ -9,9 +9,7 @@ import { OFFICE_API_BASE } from '@/config/officeMode'
 import { setAgentState } from '@/scene/officeSceneBridge'
 import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
 import {
-  appendAssistantMessage,
   appendHintMessage,
-  appendTaskMessage,
   appendUserMessage,
   clearThread,
   getSelectedRoster,
@@ -24,6 +22,9 @@ import {
   finishChat,
   abortChat,
   getPendingRosters,
+  appendConversationResult,
+  getArtifactTarget,
+  setArtifactTarget,
   type ChatMessage,
 } from '@/store/officeChatStore'
 import {
@@ -39,6 +40,9 @@ import {
   uploadFiles,
   type OfficeUpload,
 } from '@/store/officeUploadStore'
+
+import { runConversationTurn } from '@/services/conversationActions'
+import { ConversationArtifact } from '@/components/ConversationArtifact'
 
 function hexColor(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
@@ -63,7 +67,7 @@ export function OfficeChatView() {
   const setImages = (value: OfficeUpload[] | ((previous: OfficeUpload[]) => OfficeUpload[])) =>
     setImageThreads((prev) => ({ ...prev, [roster]: typeof value === 'function' ? value(prev[roster] ?? []) : value }))
   const [uploading, setUploading] = useState(false)
-  const [assigning, setAssigning] = useState(false)
+  const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(roster))
   const listRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
 
@@ -138,7 +142,8 @@ export function OfficeChatView() {
     const controller = beginChat(roster)
     if (!controller) return
 
-    const history = getThreadSnapshot(roster).filter((m) => !m.hint).map((m) => ({
+    const previousMessages = getThreadSnapshot(roster)
+    const history = previousMessages.filter((m) => !m.hint).map((m) => ({
       role: m.role,
       content: m.content,
     }))
@@ -159,7 +164,16 @@ export function OfficeChatView() {
     let degraded = false
     let imagesDropped = false
     let backupUsed = false
+    let executingAction = true
     try {
+      const result = await runConversationTurn({ thread: roster, message: text, history: previousMessages, uploadIds, signal: controller.signal })
+      executingAction = false
+      if (result.handled) {
+        appendConversationResult(roster, result.reply || '本轮操作已完成', result.artifacts)
+        if (result.artifacts?.length) setArtifactTarget(roster, '')
+        return
+      }
+      if (result.context) history.push({ role: 'assistant', content: result.context })
       const res = await fetch(`${OFFICE_API_BASE}/api/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -222,6 +236,10 @@ export function OfficeChatView() {
       }
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
+        if (executingAction) {
+          appendHintMessage(roster, '已停止等待；已提交的产物操作可能仍在后台执行，完成后可继续询问结果。')
+          return
+        }
         updateLastAssistantMessage(
           roster,
           acc ? `${acc}\n\n（已手动中断）` : '（已手动中断）',
@@ -230,8 +248,8 @@ export function OfficeChatView() {
         )
         showToast('已中断本次回复')
       } else if (!acc) {
-        appendAssistantMessage(roster, '（连接失败，请确认后端已启动）', 'mock')
-        showToast('发送失败：无法连接后端，请确认服务已启动')
+        appendHintMessage(roster, `本轮未完成：${(error as Error).message || '无法连接后端'}。可重新发送。`)
+        showToast((error as Error).message || '发送失败')
       } else {
         appendHintMessage(roster, '连接已断开，以上为部分回复，可继续追问。')
       }
@@ -246,44 +264,12 @@ export function OfficeChatView() {
     }
   }
 
-  /** 把当前输入作为任务派给当前成员：单兵作战，不触发团队 Sprint */
-  async function handleAssignTask() {
-    const text = input.trim()
-    if (!text || assigning) return
-    setAssigning(true)
-    appendUserMessage(roster, `📌 指派任务：${text}`)
-    setInput('')
-    try {
-      const res = await fetch(`${OFFICE_API_BASE}/api/solo/task`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roster, message: text }),
-      })
-      const payload = (await res.json().catch(() => null)) as
-        | { task_id?: string; detail?: string }
-        | null
-      if (!res.ok || !payload?.task_id) {
-        throw new Error(payload?.detail ?? `请求失败（${res.status}）`)
-      }
-      appendTaskMessage(roster, text.slice(0, 30), payload.task_id)
-      showToast(`已指派给 ${displayNameOf(roster)}，TA 开始单兵作战`)
-    } catch (error) {
-      appendHintMessage(
-        roster,
-        `任务指派失败：${(error as Error).message || '无法连接后端'}`,
-      )
-      showToast((error as Error).message || '任务指派失败')
-    } finally {
-      setAssigning(false)
-    }
-  }
-
   return (
     <div className="view-page chat-page">
       <header className="view-head">
         <div>
           <h1>单飞</h1>
-          <p>各成员独立对话、独立干活：点「指派任务」让当前成员单兵作战，产物进「交付」面板</p>
+          <p>向任一角色直接提需求，完成后继续聊天修改；每个角色独立保留上下文和产物</p>
         </div>
       </header>
 
@@ -357,12 +343,12 @@ export function OfficeChatView() {
                 ) : message.role === 'task' ? (
                   <TaskCard key={message.taskId ?? i} message={message} />
                 ) : (
-                  <ChatBubble key={i} message={message} />
+                  <ChatBubble key={i} message={message} roster={roster} />
                 ),
               )
             )}
             {pending ? (
-              <p className="chat-typing">{displayNameOf(roster)} 正在输入…</p>
+              <p className="chat-typing">{displayNameOf(roster)} 正在处理…</p>
             ) : null}
           </div>
 
@@ -385,6 +371,7 @@ export function OfficeChatView() {
             </ul>
           ) : null}
 
+          {target ? <p className="chat-hint">正在基于 {target} 修改 <button type="button" onClick={() => setArtifactTarget(roster, '')}>取消指定</button></p> : null}
           <footer className="chat-input-row">
             <input
               ref={imageInputRef}
@@ -411,15 +398,6 @@ export function OfficeChatView() {
                 if (e.key === 'Enter') handleSend()
               }}
             />
-            <button
-              type="button"
-              className="view-ghost-btn"
-              disabled={pending || assigning || !input.trim()}
-              onClick={handleAssignTask}
-              title="把当前输入作为任务派给当前成员，TA 独立完成并产出到「交付」面板"
-            >
-              {assigning ? '指派中…' : '指派任务'}
-            </button>
             {pending ? (
               <button
                 type="button"
@@ -444,12 +422,13 @@ export function OfficeChatView() {
   )
 }
 
-function ChatBubble({ message }: { message: ChatMessage }) {
+function ChatBubble({ message, roster }: { message: ChatMessage; roster: number }) {
   const isUser = message.role === 'user'
   return (
     <div className={`chat-bubble-row ${isUser ? 'mine' : ''}`}>
       <div className="chat-bubble">
         <p>{message.content}</p>
+        {message.artifacts?.map(artifact => <ConversationArtifact key={artifact.id} artifact={artifact} thread={roster} />)}
         <span className="chat-meta">
           {message.time}
           {!isUser && message.via ? (

@@ -102,6 +102,8 @@ async def preview_sprint_plan(req: SprintRequest):
 
 @router.post("/api/sprint/start")
 async def start_sprint(req: SprintRequest):
+    if storage.revision_operations(active=True):
+        raise HTTPException(409, '产物修订仍在执行，请完成后再开始 Sprint')
     requirement = req.requirement.strip()
     if not requirement:
         raise HTTPException(status_code=400, detail="requirement 不能为空")
@@ -182,7 +184,7 @@ async def start_sprint(req: SprintRequest):
 @router.post("/api/demo/start")
 async def start_demo():
     """零成本演示模式：脚本化回放一场完整 Sprint，不消耗任何 API 额度。"""
-    if runtime_state.running:
+    if runtime_state.running or storage.revision_operations(active=True):
         raise HTTPException(status_code=409, detail="Sprint 正在进行中")
     runtime_state.running = True
     runtime_state.sprint_task = asyncio.create_task(_run_demo())

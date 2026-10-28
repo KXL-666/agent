@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import artifact_code
 import contributions
 import forge
 
@@ -144,7 +145,7 @@ class ContributionTest(unittest.TestCase):
         raw = ("===FILE: converter.py\ndef convert(x): return x\n===END\n"
                "===FILE: tests/test_cli.py\ndef test_cli(): assert True\n===END\n")
         with patch.object(forge, "CODE_DIR", str(Path(self.scratch.name) / "generated")), \
-             patch.object(forge, "chat_text", return_value=raw):
+             patch.object(artifact_code, "chat_text", return_value=raw):
             dev_files = forge.forge_code("实现核心逻辑", "需求", "T1", roster=2)
             qa_files = forge.forge_code("编写测试", "需求", "T2", roster=4)
         self.assertEqual([Path(item).name for item in dev_files], ["converter.py"])
@@ -152,7 +153,7 @@ class ContributionTest(unittest.TestCase):
 
     def test_forge_code_retries_invalid_file_wrapping_without_tool_calls(self):
         with patch.object(forge, "CODE_DIR", str(Path(self.scratch.name) / "generated")), \
-             patch.object(forge, "chat_text", side_effect=["plain explanation", "===FILE: converter.py\ndef convert(x): return x\n===END"]) as request:
+             patch.object(artifact_code, "chat_text", side_effect=["plain explanation", "===FILE: converter.py\ndef convert(x): return x\n===END"]) as request:
             files = forge.forge_code("实现核心逻辑", "需求", "T1", roster=2)
         self.assertEqual([Path(item).name for item in files], ["converter.py"])
         self.assertEqual(request.call_count, 2)

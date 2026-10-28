@@ -19,6 +19,10 @@ DB_PATH = os.getenv("OFFICE_DB_PATH") or os.path.join(
 _lock = threading.Lock()
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id TEXT PRIMARY KEY,
+  state TEXT NOT NULL DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS sprints (
   id TEXT PRIMARY KEY,
   requirement TEXT NOT NULL DEFAULT '',
@@ -91,6 +95,23 @@ CREATE TABLE IF NOT EXISTS handoffs (
   reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_sprint ON handoffs(sprint_id, task_id, id);
+CREATE TABLE IF NOT EXISTS revision_sessions (
+  id TEXT PRIMARY KEY, root_id TEXT NOT NULL, sprint_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL, accepted_artifact_id TEXT,
+  history TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_revision_root ON revision_sessions(root_id, updated_at);
+CREATE TABLE IF NOT EXISTS revision_operations (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, request_id TEXT NOT NULL,
+  expected_artifact_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,
+  status TEXT NOT NULL, artifact_id TEXT, error TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL, updated_at REAL NOT NULL,
+  UNIQUE(session_id, request_id)
+);
+-- Current runtime/accounting is process-global: serialize revision jobs until
+-- Sprint and model usage have per-job contexts.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_revision_one_active
+  ON revision_operations((1)) WHERE status IN ('queued', 'running');
 """
 
 
@@ -111,6 +132,19 @@ def init() -> None:
     with _lock, _conn() as conn:
         conn.executescript(_SCHEMA)
         _ensure_columns(conn)
+
+
+def get_chat_session(session_id: str) -> dict:
+    with _lock, _conn() as conn:
+        row = conn.execute("SELECT state FROM chat_sessions WHERE id=?", (session_id,)).fetchone()
+    return json.loads(row["state"]) if row else {}
+
+
+def save_chat_session(session_id: str, state: dict) -> None:
+    with _lock, _conn() as conn:
+        conn.execute("INSERT INTO chat_sessions(id,state) VALUES(?,?) "
+                     "ON CONFLICT(id) DO UPDATE SET state=excluded.state",
+                     (session_id, json.dumps(state, ensure_ascii=False)))
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
@@ -137,6 +171,9 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     ):
         if name not in artifact_columns:
             conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {decl}")
+    revision_columns = {row['name'] for row in conn.execute('PRAGMA table_info(revision_sessions)')}
+    if 'settings' not in revision_columns:
+        conn.execute("ALTER TABLE revision_sessions ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")
 
 
 init()
@@ -170,6 +207,160 @@ def _row(row: sqlite3.Row | None) -> dict | None:
     if "degraded" in data:
         data["degraded"] = bool(data["degraded"])
     return data
+
+
+def _revision_row(row) -> dict | None:
+    if row is None:
+        return None
+    result = dict(row)
+    for key in ('history', 'payload', 'settings'):
+        if key in result:
+            result[key] = json.loads(result[key])
+    return result
+
+
+def create_revision_session(artifact_id: str) -> dict:
+    import uuid
+    artifact = get_artifact(artifact_id)
+    if not artifact:
+        raise ValueError('产物不存在')
+    sid = artifact['sprint_id']
+    root = artifact_root(sid, artifact_id)
+    with _lock, _conn() as conn:
+        # Reopening the same artifact restores its conversation; selecting a
+        # historical version explicitly starts a separate editing branch.
+        existing = conn.execute('SELECT * FROM revision_sessions WHERE artifact_id=? ORDER BY updated_at DESC LIMIT 1',
+                                (artifact_id,)).fetchone()
+        if existing:
+            return _revision_row(existing)
+        identity, now = uuid.uuid4().hex, time.time()
+        conn.execute('INSERT INTO revision_sessions (id,root_id,sprint_id,artifact_id,accepted_artifact_id,history,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)',
+                     (identity, root, sid, artifact_id,
+                      artifact_id if artifact.get('quality_status') == 'passed' else None, '[]', now, now))
+        return _revision_row(conn.execute('SELECT * FROM revision_sessions WHERE id=?', (identity,)).fetchone())
+
+
+def get_revision_session(session_id: str) -> dict | None:
+    with _conn() as conn:
+        return _revision_row(conn.execute('SELECT * FROM revision_sessions WHERE id=?', (session_id,)).fetchone())
+
+
+def create_revision_conversation(settings: dict) -> dict:
+    """An empty durable conversation owns its budget and attachments before v1."""
+    import uuid
+    identity, now = uuid.uuid4().hex, time.time()
+    sid = 'R' + identity
+    with _lock, _conn() as conn:
+        conn.execute('INSERT INTO sprints (id,requirement,status,started_at,budget,execution_mode,execution_style) VALUES (?,?,?,?,?,?,?)',
+                     (sid, '对话生成', 'completed', now, settings.get('budget', 0),
+                      settings.get('execution_mode', 'cloud'), 'conversation'))
+        conn.execute('INSERT INTO revision_sessions (id,root_id,sprint_id,artifact_id,history,created_at,updated_at,settings) VALUES (?,?,?,?,?,?,?,?)',
+                     (identity, 'new:' + identity, sid, '', '[]', now, now, json.dumps(settings, ensure_ascii=False)))
+        return _revision_row(conn.execute('SELECT * FROM revision_sessions WHERE id=?', (identity,)).fetchone())
+
+
+def list_revision_sessions(root_id: str | None = None) -> list[dict]:
+    with _conn() as conn:
+        return [_revision_row(r) for r in conn.execute(
+            'SELECT * FROM revision_sessions' + (' WHERE root_id=?' if root_id else '') + ' ORDER BY updated_at DESC',
+            (root_id,) if root_id else ())]
+
+
+def artifact_used_by_revision(artifact_id: str) -> bool:
+    """Protect companion roots as well as the conversation's primary chain."""
+    with _conn() as conn:
+        if conn.execute('SELECT 1 FROM revision_sessions WHERE artifact_id=? OR accepted_artifact_id=? OR root_id=?',
+                        (artifact_id, artifact_id, artifact_id)).fetchone():
+            return True
+        for row in conn.execute("SELECT regen FROM artifacts WHERE regen LIKE ?", ('%' + artifact_id + '%',)):
+            try:
+                regen = json.loads(row['regen'] or '{}')
+                if any(member.get('artifact_id') == artifact_id for member in regen.get('bundle_members', [])):
+                    return True
+            except (ValueError, TypeError):
+                continue
+    return False
+
+
+def get_revision_operation(operation_id: str) -> dict | None:
+    with _conn() as conn:
+        return _revision_row(conn.execute('SELECT * FROM revision_operations WHERE id=?', (operation_id,)).fetchone())
+
+
+def revision_operations(session_id: str | None = None, *, active: bool = False) -> list[dict]:
+    clauses, params = [], []
+    if session_id:
+        clauses.append('session_id=?')
+        params.append(session_id)
+    if active:
+        clauses.append("status IN ('queued','running')")
+    with _conn() as conn:
+        return [_revision_row(row) for row in conn.execute(
+            'SELECT * FROM revision_operations' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
+            + ' ORDER BY created_at', params)]
+
+
+def begin_revision_operation(session_id: str, request_id: str, expected_id: str,
+                             action: str, payload: dict) -> tuple[dict, bool]:
+    import uuid
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with _lock, _conn() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        old = conn.execute('SELECT * FROM revision_operations WHERE session_id=? AND request_id=?',
+                           (session_id, request_id)).fetchone()
+        if old:
+            if old['payload'] != encoded or old['expected_artifact_id'] != expected_id or old['action'] != action:
+                raise ValueError('同一请求标识不能用于不同操作')
+            return _revision_row(old), False
+        session = conn.execute('SELECT * FROM revision_sessions WHERE id=?', (session_id,)).fetchone()
+        if not session:
+            raise LookupError('修订会话不存在')
+        if session['artifact_id'] != expected_id:
+            raise ValueError('当前编辑版本已变化，请刷新后重试')
+        if conn.execute("SELECT 1 FROM revision_operations WHERE status IN ('queued','running')").fetchone():
+            raise ValueError('已有修订任务正在执行，请等待完成')
+        identity, now = uuid.uuid4().hex, time.time()
+        conn.execute('INSERT INTO revision_operations VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                     (identity, session_id, request_id, expected_id, action, encoded, 'queued', None, '', now, now))
+        return _revision_row(conn.execute('SELECT * FROM revision_operations WHERE id=?', (identity,)).fetchone()), True
+
+
+def mark_revision_running(operation_id: str) -> None:
+    with _lock, _conn() as conn:
+        conn.execute("UPDATE revision_operations SET status='running', updated_at=? WHERE id=? AND status='queued'",
+                     (time.time(), operation_id))
+
+
+def finish_revision_operation(operation_id: str, *, artifact: dict | None = None,
+                              summary: str = '', error: str = '', interrupted: bool = False) -> None:
+    """Commit the pointer, conversation entry and job result together."""
+    with _lock, _conn() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        op = _revision_row(conn.execute('SELECT * FROM revision_operations WHERE id=?', (operation_id,)).fetchone())
+        if not op or op['status'] not in ('queued', 'running'):
+            return
+        session = _revision_row(conn.execute('SELECT * FROM revision_sessions WHERE id=?', (op['session_id'],)).fetchone())
+        status = 'interrupted' if interrupted else 'failed' if error else 'completed'
+        entry = {'operation_id': operation_id, 'action': op['action'],
+                 'feedback': op['payload'].get('feedback', ''), 'summary': summary,
+                 'status': status, 'error': error, 'created_at': time.time()}
+        current = session['artifact_id']
+        accepted = session['accepted_artifact_id']
+        if artifact:
+            current = artifact['id']
+            entry.update(artifact_id=current, version=artifact.get('version', 1),
+                         quality_status=artifact.get('quality_status', 'unchecked'))
+            if artifact.get('quality_status') == 'passed' and not artifact.get('degraded'):
+                accepted = current
+        history = session['history'] + [entry]
+        now = time.time()
+        root = session['root_id']
+        if artifact and not session['artifact_id']:
+            root = artifact['id']
+        conn.execute('UPDATE revision_sessions SET artifact_id=?, accepted_artifact_id=?, history=?, updated_at=?,root_id=? WHERE id=?',
+                     (current, accepted, json.dumps(history, ensure_ascii=False), now, root, session['id']))
+        conn.execute('UPDATE revision_operations SET status=?, artifact_id=?, error=?, updated_at=? WHERE id=?',
+                     (status, artifact['id'] if artifact else None, error, now, operation_id))
 
 
 # ------------------------------ Sprint ------------------------------

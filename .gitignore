@@ -28,6 +28,8 @@ backend/uploads/
 backend/_server*.log
 backend/artifacts_data.json
 backend/usage.json
+# 本地排查脚本与临时备份（含数据库快照，不入库）
+work/
 backend/skills_data.json
 backend/skills_data.tmp
 __pycache__/

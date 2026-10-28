@@ -45,6 +45,10 @@ import {
 } from '@/store/officeUploadStore'
 import { requestNotifyPermission } from '@/services/officeNotify'
 
+import { runConversationTurn } from '@/services/conversationActions'
+import { ConversationArtifact } from '@/components/ConversationArtifact'
+import { appendUserMessage, appendConversationResult, getThreadSnapshot, subscribeChat, updateLastAssistantMessage, getArtifactTarget, setArtifactTarget, beginChat, finishChat, getPendingRosters } from '@/store/officeChatStore'
+
 function hexColor(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
 }
@@ -77,8 +81,10 @@ export function TalkView() {
 
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
-  /** 空闲闲聊消息流（Sprint 启动后清空，由 Sprint 消息流接管） */
-  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'ai'; content: string }[]>([])
+  /** 唯一团队对话线程；与六个单飞线程分别持久化。 */
+  const chatMessages = useSyncExternalStore(subscribeChat, () => getThreadSnapshot(0))
+  const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(0))
+  const pendingRosters = useSyncExternalStore(subscribeChat, getPendingRosters)
   const [listening, setListening] = useState(false)
   const [attachments, setAttachments] = useState<OfficeUpload[]>([])
   const [uploading, setUploading] = useState(false)
@@ -88,8 +94,6 @@ export function TalkView() {
   const [sheetOpen, setSheetOpen] = useState(false)
   const [manualTarget, setManualTarget] = useState<number | null>(null)
   const [thinkOpen, setThinkOpen] = useState(true)
-  /** 运行中已下达的指示回显（用户气泡） */
-  const [echoes, setEchoes] = useState<string[]>([])
   const listRef = useRef<HTMLDivElement>(null)
   const toolsRef = useRef<HTMLDivElement | null>(null)
 
@@ -97,11 +101,7 @@ export function TalkView() {
     ensureAgentConfigsLoaded()
   }, [])
 
-  // 切换 Sprint（含查看历史）时清空指示回显，避免串轮次
   const sprintKey = viewedSprintId || meta.id
-  useEffect(() => {
-    setEchoes([])
-  }, [sprintKey])
 
   // 点击「＋」菜单以外的任意位置关闭菜单
   useEffect(() => {
@@ -114,11 +114,18 @@ export function TalkView() {
     return () => document.removeEventListener('pointerdown', close)
   }, [menuOpen])
 
-  const requirement = viewedMeta?.requirement || meta.requirement
+  const requirement = (viewedMeta?.requirement || meta.requirement).split('\n\n此前对话背景：')[0]
   const sprintStatus = viewedMeta?.status ?? meta.status
   const stage = viewedMeta?.stage ?? meta.stage
   const cost = viewedMeta?.cost ?? meta.cost
   const hasSprint = Boolean(requirement)
+  useEffect(() => {
+    if (running || !hasSprint || !sprintKey) return
+    const delivered = artifacts.filter(a => a.sprint_id === sprintKey && (a.kind === 'final' || a.kind === 'custom'))
+    const recorded = new Set(getThreadSnapshot(0).flatMap(m => m.artifacts?.map(a => a.id) ?? []))
+    const fresh = delivered.filter(a => !recorded.has(a.id))
+    if (fresh.length) appendConversationResult(0, '本轮产物已保存，可以直接继续提出修改要求。', fresh)
+  }, [running, hasSprint, sprintKey, artifacts])
   const { done, total } = computeSprintProgress(tasks)
 
   const displayNameOf = (rosterNo: number) =>
@@ -130,7 +137,7 @@ export function TalkView() {
   useEffect(() => {
     const el = listRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [tasks, artifacts, activities, echoes, requirement, sprintStatus, chatMessages])
+  }, [tasks, artifacts, activities, requirement, sprintStatus, chatMessages])
 
   function handleQuickTool(label: string) {
     switch (label) {
@@ -272,50 +279,27 @@ export function TalkView() {
       return
     }
     showToast('任务已启动，产品经理正在拆解需求')
-    // Sprint 消息流接管：清掉闲聊回显
-    setChatMessages([])
+    // 历史对话与产物保留，后续要求仍可定位它们。
     setText('')
     setAttachments([])
   }
 
-  /** 意图识别：闲聊 / 工作需求（接口失败时按闲聊处理，避免误触发 Sprint） */
-  async function classifyIntent(message: string): Promise<'chat' | 'requirement'> {
-    try {
-      const res = await fetch(`${OFFICE_API_BASE}/api/chat/intent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-      })
-      const payload = (await res.json().catch(() => null)) as { intent?: string } | null
-      if (res.ok && payload?.intent === 'requirement') return 'requirement'
-    } catch {
-      /* 网络失败按闲聊处理 */
-    }
-    return 'chat'
-  }
-
   /** 闲聊回复：产品经理（roster 1）以流式对话回应，不触发任何任务 */
-  async function replyAsChat(message: string) {
+  async function replyAsChat(message: string, context = '') {
     const history = chatMessages.slice(-12).map((m) => ({
       role: m.role === 'user' ? 'user' : 'assistant',
       content: m.content,
     }))
-    // 先插入空的 AI 占位消息，随后按 SSE delta 逐段追加
-    setChatMessages((prev) => [...prev, { role: 'ai', content: '' }])
+    if (context) history.push({ role: 'assistant', content: context })
+    appendConversationResult(0, '')
     try {
       const res = await fetch(`${OFFICE_API_BASE}/api/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roster: 1, message, history }),
       })
-      if (!res.ok || !res.body) {
-        setChatMessages((prev) => {
-          const next = [...prev]
-          next[next.length - 1] = { role: 'ai', content: '（连接失败，请确认后端已启动）' }
-          return next
-        })
-        return
-      }
+      if (!res.ok || !res.body) throw new Error('连接失败，请确认后端已启动')
+      let acc = ''
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
@@ -333,61 +317,56 @@ export function TalkView() {
           try {
             const payload = JSON.parse(line.slice(6)) as { delta?: string }
             if (payload.delta) {
-              setChatMessages((prev) => {
-                const next = [...prev]
-                next[next.length - 1] = {
-                  role: 'ai',
-                  content: next[next.length - 1].content + payload.delta,
-                }
-                return next
-              })
+              acc += payload.delta
+              updateLastAssistantMessage(0, acc, 'llm')
             }
           } catch {
             // 单条事件解析失败不影响后续
           }
         }
       }
-      // 读完仍为空则兜底
-      setChatMessages((prev) => {
-        const next = [...prev]
-        if (!next[next.length - 1].content) {
-          next[next.length - 1] = { role: 'ai', content: '（连接失败，请确认后端已启动）' }
-        }
-        return next
-      })
-    } catch {
-      setChatMessages((prev) => {
-        const next = [...prev]
-        next[next.length - 1] = { role: 'ai', content: '（连接失败，请确认后端已启动）' }
-        return next
-      })
+      if (!acc) throw new Error('未收到模型回复')
+    } catch (error) {
+      updateLastAssistantMessage(0, `本轮未完成：${(error as Error).message}`, 'mock')
     }
   }
 
   /** 发送：运行中下达指示；空闲时自动识别意图——闲聊产品经理回复，需求直接开工 */
   async function handleSend() {
     const raw = text.trim()
-    if (!raw || sending) return
+    if (!raw || sending || pendingRosters.includes(0)) return
     const payload = manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${raw}` : raw
     if (running) {
       const ok = await sendInstruct(payload)
       if (ok) {
-        setEchoes((prev) => [...prev, raw])
+        appendUserMessage(0, raw)
         setText('')
       }
       return
     }
+    const controller = beginChat(0)
+    if (!controller) return
     setSending(true)
+    const previousMessages = getThreadSnapshot(0)
+    appendUserMessage(0, raw)
     setText('')
-    const intent = await classifyIntent(raw)
-    if (intent === 'chat') {
-      setChatMessages((prev) => [...prev, { role: 'user', content: raw }])
-      await replyAsChat(raw)
+    try {
+      const result = await runConversationTurn({ thread: 0, message: raw, history: previousMessages,
+        uploadIds: attachments.map(item => item.id), sprintId: sprintKey || '', signal: controller.signal })
+      if (result.handled) {
+        appendConversationResult(0, result.reply || '本轮操作已完成', result.artifacts)
+        if (result.artifacts?.length) setArtifactTarget(0, '')
+        setAttachments([])
+      } else if (result.intent === 'requirement') {
+        await beginSprint(manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${result.requirement || raw}` : result.requirement || payload)
+      } else {
+        await replyAsChat(raw, result.context)
+      }
+    } catch (error) {
+      appendConversationResult(0, `本轮未完成：${(error as Error).message}。请重新发送。`)
+    } finally {
       setSending(false)
-    } else {
-      // 识别为需求：直接交给团队开工，无需再确认（beginSprint 内部管理 sending）
-      showToast('识别为任务需求，交给团队开工')
-      await beginSprint(payload)
+      finishChat(0)
     }
   }
 
@@ -410,23 +389,6 @@ export function TalkView() {
         </header>
 
         <main className="talk-chat" ref={listRef}>
-          {/* 闲聊消息流（Sprint 启动后清空，由 Sprint 消息流接管） */}
-          {chatMessages.map((m, i) => (
-            <div className={`talk-msg ${m.role === 'user' ? 'user' : 'ai'}`} key={`chat-${i}`}>
-              <div
-                className="talk-avatar"
-                style={{
-                  background:
-                    m.role === 'user' ? '#1d2129' : hexColor(AGENT_ROSTER[0]?.color ?? 0x1d2129),
-                }}
-              >
-                {m.role === 'user' ? '我' : avatarOf(1) || displayNameOf(1).slice(0, 1)}
-              </div>
-              <div className="talk-msg-body">
-                <div className="talk-bubble">{m.content}</div>
-              </div>
-            </div>
-          ))}
 
           {hasSprint ? (
             <>
@@ -465,7 +427,7 @@ export function TalkView() {
                   ))}
 
                   {/* 产物卡片（真实产物） */}
-                  {artifacts.map((artifact) => (
+                  {(running ? artifacts : []).map((artifact) => (
                     <ArtifactCard key={artifact.id} artifact={artifact} running={running} />
                   ))}
 
@@ -477,26 +439,38 @@ export function TalkView() {
                         <span className="talk-caret" />
                       </>
                     ) : (
-                      `本轮任务已结束：${done}/${total} 项任务通过验收，共产出 ${artifacts.length} 件产物，累计花费 ¥${cost.toFixed(2)}。可前往「交付」页查看与下载。`
+                      `本轮任务已结束：${done}/${total} 项任务通过验收，共产出 ${artifacts.length} 件产物，累计花费 ¥${cost.toFixed(2)}。可在下方产物卡中预览、下载，或继续发消息修改。`
                     )}
                   </div>
                 </div>
               </div>
 
-              {/* 运行中补充的指示回显 */}
-              {echoes.map((echo, i) => (
-                <div className="talk-msg user" key={i}>
-                  <div className="talk-avatar" style={{ background: '#1d2129' }}>我</div>
-                  <div className="talk-msg-body">
-                    <div className="talk-bubble">{echo}</div>
-                  </div>
-                </div>
-              ))}
             </>
           ) : null}
+          {/* 持久化的连续对话与产物版本 */}
+          {chatMessages.filter(m => !hasSprint || m.role !== 'user' || m.content !== requirement).map((m, i) => (
+            <div className={`talk-msg ${m.role === 'user' ? 'user' : 'ai'}`} key={`chat-${i}`}>
+              <div
+                className="talk-avatar"
+                style={{
+                  background:
+                    m.role === 'user' ? '#1d2129' : hexColor(AGENT_ROSTER[0]?.color ?? 0x1d2129),
+                }}
+              >
+                {m.role === 'user' ? '我' : avatarOf(1) || displayNameOf(1).slice(0, 1)}
+              </div>
+              <div className="talk-msg-body">
+                <div className="talk-bubble">{m.content}</div>
+                {m.artifacts?.map(artifact => <ConversationArtifact key={artifact.id} artifact={artifact} thread={0} />)}
+              </div>
+            </div>
+          ))}
+
         </main>
 
         <footer className="talk-foot">
+          {target ? <p className="chat-hint">正在基于 {target} 修改 <button type="button" onClick={() => setArtifactTarget(0, '')}>取消指定</button></p> : null}
+          {sending || pendingRosters.includes(0) ? <p role="status">正在处理本轮需求…</p> : null}
           {attachments.length > 0 || uploading ? (
             <ul className="attachment-chips talk-attach-chips">
               {attachments.map((item) => (
@@ -567,7 +541,7 @@ export function TalkView() {
                   ? '补充指示，例如：周报里加上本周风险…'
                   : '和团队聊聊，或描述想完成的任务（自动识别，无需确认）…'
               }
-              disabled={sending}
+              disabled={sending || pendingRosters.includes(0)}
               onChange={(event) => {
                 setText(event.target.value)
                 const el = event.target
@@ -586,7 +560,7 @@ export function TalkView() {
               className={`talk-voice ${listening ? 'listening' : ''}`}
               title={listening ? '正在聆听…' : '语音输入'}
               aria-label="语音输入"
-              disabled={sending}
+              disabled={sending || pendingRosters.includes(0)}
               onClick={handleVoice}
             >
               ♩
@@ -742,6 +716,7 @@ function ArtifactCard({ artifact, running }: { artifact: OfficeArtifact; running
         <i style={{ width: passed || !running ? '100%' : '60%' }} />
       </div>
       <div className="ap">{note}</div>
+      <ConversationArtifact artifact={artifact} thread={0} />
     </div>
   )
 }

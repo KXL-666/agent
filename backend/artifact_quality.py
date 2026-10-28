@@ -99,7 +99,7 @@ def _date_supported(key: tuple, source: dict[tuple, str]) -> bool:
     return False
 
 
-_NEGATION_BEFORE = re.compile(r"(?:不|无需|不要|不得|不能|禁止|避免|不含)[^。；;，,]{0,12}$")
+_NEGATION_BEFORE = re.compile(r"(?:不|无需|无须|不要|不得|不能|禁止|避免|不含|无)[^。；;，,]{0,12}$")
 
 
 def _affirmed(text: str, pattern: str) -> bool:
@@ -118,7 +118,7 @@ def requirement_scope(spec: str) -> str:
     match = re.search(r"(?:加工需求|需求)[：:]\s*", text)
     if match:
         text = text[match.end():]
-    for marker in ("团队各环节的产出", "任务完成情况", "附件内容", "重要："):
+    for marker in ("团队各环节的产出", "任务完成情况", "附件内容", "重要：", "已有成品（", "附件原文："):
         text = text.split(marker, 1)[0]
     return text.strip()
 

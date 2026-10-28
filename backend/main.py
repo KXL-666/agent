@@ -68,11 +68,14 @@ if _last:
 async def lifespan(_: FastAPI):
     import archive_layout
     import file_knowledge
+    import revision_jobs
+    revision_jobs.recover_interrupted()
     await asyncio.to_thread(archive_layout.migrate)
     await asyncio.to_thread(file_knowledge.index_existing)
     if sprint_meta.get("id"):
         artifact_store.set_sprint(sprint_meta["id"])
     yield
+    await revision_jobs.shutdown()
     if runtime_state.sprint_task and not runtime_state.sprint_task.done():
         runtime_state.sprint_task.cancel()
 
@@ -94,6 +97,7 @@ from routers.agents import router as agents_router
 from routers.usage import router as usage_router
 from routers.backup import router as backup_router
 from routers.ws import router as ws_router
+from routers.revision import router as revision_router
 
 app.include_router(sprint_router)
 app.include_router(uploads_router)
@@ -105,6 +109,7 @@ app.include_router(agents_router)
 app.include_router(usage_router)
 app.include_router(backup_router)
 app.include_router(ws_router)
+app.include_router(revision_router)
 
 # 仅允许本机开发/预览前端跨域访问，避免任意站点调用本机 API
 app.add_middleware(

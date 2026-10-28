@@ -33,6 +33,8 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
 # 动画节奏倍率：调低可加速整场演出（环境变量 SCENE_PACE 可覆盖）
 SCENE_PACE = float(os.getenv("SCENE_PACE", "0.5") or 0.5)
+# 演出性等待开关：0/false/off 时节点不再为动画留白（接口调用、批量跑时关闭）
+SCENE_ANIMATION = os.getenv("SCENE_ANIMATION", "1").strip().lower() not in ("0", "false", "off", "no")
 
 # ---------------------------------------------------------------------------
 # 回退标志：chat_json/chat_text 每次回退到 Mock 时记录，供工作流节点感知并提示前端

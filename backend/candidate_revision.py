@@ -28,11 +28,50 @@ def _destination(sprint_id: str, source: Path) -> Path:
 
 def _replace_once(texts: list[tuple[object, str]], old: str, new: str) -> bool:
     matches = [(target, value) for target, value in texts if old in value]
-    if len(matches) != 1:
+    if len(matches) != 1 or matches[0][1].count(old) != 1:
         return False
     target, value = matches[0]
-    target.text = value.replace(old, new, 1)
-    return True
+    paragraphs = ([target] if hasattr(target, 'runs') else
+                  list(target.text_frame.paragraphs) if hasattr(target, 'text_frame') else
+                  list(target.paragraphs) if hasattr(target, 'paragraphs') else [])
+    located = [p for p in paragraphs if old in p.text]
+    if len(located) == 1:
+        paragraph = located[0]
+        runs = list(paragraph.runs)
+        if ''.join(run.text for run in runs) == paragraph.text:
+            start = paragraph.text.index(old)
+            end = start + len(old)
+            offset = 0
+            inserted = False
+            for run in runs:
+                text = run.text
+                run_end = offset + len(text)
+                if offset < end and run_end > start:
+                    prefix = text[:max(0, start - offset)]
+                    suffix = text[max(0, end - offset):]
+                    run.text = prefix + (new if not inserted else '') + suffix
+                    inserted = True
+                offset = run_end
+            return inserted
+    # Do not flatten rich text, fields or several paragraphs as a side effect
+    # of a content edit. The explicit rewrite route can handle those cases.
+    return False
+
+
+def _sync_word_source(path: Path) -> None:
+    """A subsequent whole-file rewrite must see the edited Word, not old Markdown."""
+    document = Document(path)
+    lines = []
+    for paragraph in document.paragraphs:
+        style = paragraph.style.name if paragraph.style else ''
+        match = re.match(r'Heading ([1-6])', style)
+        lines.append(('#' * int(match.group(1)) + ' ' if match else '') + paragraph.text)
+    for table in document.tables:
+        for row in table.rows:
+            lines.append('| ' + ' | '.join(cell.text for cell in row.cells) + ' |')
+    directory = artifact_quality.report_directory(path, forge.WORKSPACE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'source.md').write_text('\n\n'.join(lines), encoding='utf-8')
 
 
 def _rebuild_textual(kind: str, target: Path, spec: str, content: str) -> bool:
@@ -145,6 +184,13 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
     location = str(patch.get("location") or "").strip()
     replacement = patch.get("replacement")
     operation = str(patch.get("operation") or "replace").strip().lower()
+    if operation == 'format':
+        import revision_format
+        try:
+            detail = revision_format.apply(kind, source, target, patch)
+            return '_process/' + target.relative_to(forge.WORKSPACE_DIR).as_posix(), '', detail
+        except (ValueError, IndexError, KeyError, TypeError) as error:
+            return None, f'格式修订失败：{error}', {}
     if operation == "refit_length_exact":
         try:
             return _refit_length_exact(kind, source, target, str(patch.get("requirement") or ""), roster)
@@ -157,12 +203,14 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
             return None, f"篇幅返工失败：{error}", {}
     if operation == "delete" and kind != "docx":
         return None, "仅 Word 完整段落支持删除修订", {}
-    if operation != "delete" and (replacement is None or replacement == ""):
+    if operation not in ("delete", "format") and (replacement is None or replacement == ""):
         return None, "缺少具体替换内容", {}
     detail = {}
     try:
         if kind == "docx":
             old = str(patch.get("old_text") or "")
+            if operation != 'replace' and operation != 'delete':
+                return None, 'Word 不支持此修改操作', {}
             if not old:
                 return None, "Word 修订需要精确旧文本", {}
             doc = Document(source)
@@ -178,6 +226,7 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
                 if not _replace_once(candidates, old, str(replacement)):
                     return None, "Word 目标文字不存在或匹配不唯一", {}
             doc.save(target)
+            _sync_word_source(target)
             detail = {"location": location or old, "old_text": old, "operation": operation}
         elif kind == "pdf":
             old = str(patch.get("old_text") or "")

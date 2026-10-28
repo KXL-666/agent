@@ -58,7 +58,7 @@ async def backup_export():
 @router.post("/import")
 async def backup_import(file: UploadFile):
     """导入备份 zip：恢复数据库/配置/产物文件。Sprint 运行中拒绝导入。"""
-    if runtime_state.running:
+    if runtime_state.running or storage.revision_operations(active=True):
         raise HTTPException(status_code=409, detail="Sprint 运行中，请先结束再导入备份")
     data = await file.read()
     if len(data) > 500 * 1024 * 1024:

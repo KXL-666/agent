@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from pptx import Presentation
 
+import deliverable_generator
 import forge
 import artifact_quality
 import office_runtime
@@ -98,7 +99,7 @@ class PresentationLayoutTest(unittest.TestCase):
                 {"heading": f"结论{i}", "bullets": ["事实"]} for i in range(count)
             ]}
 
-        with patch.object(forge, "chat_json", side_effect=fake_json):
+        with patch.object(deliverable_generator, "chat_json", side_effect=fake_json):
             no_cover = forge._gen_pptx(P1, 3)
             with_cover = forge._gen_pptx(P2, 3)
         self.assertFalse(no_cover["include_cover"])
@@ -121,7 +122,7 @@ class PresentationLayoutTest(unittest.TestCase):
                 ]}
             self.fail(f"unexpected prompt: {user[:160]}")
 
-        with patch.object(forge, "chat_json", side_effect=fake_json):
+        with patch.object(deliverable_generator, "chat_json", side_effect=fake_json):
             payload = forge._gen_pptx(P2, 3)
         self.assertEqual(len(payload["slides"]), 4)
         self.assertTrue(payload["include_cover"])

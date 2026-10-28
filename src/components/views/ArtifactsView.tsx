@@ -1,5 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
+import { RevisionChatPanel } from '@/components/RevisionChatPanel'
 import { ArtifactQualityPanel } from '@/components/ArtifactQualityPanel'
 import { OFFICE_API_BASE } from '@/config/officeMode'
 import {
@@ -335,8 +336,8 @@ export function ArtifactsView() {
   const [sandboxFor, setSandboxFor] = useState<OfficeArtifact | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [deletingGroup, setDeletingGroup] = useState<string | null>(null)
-  const [reviseFor, setReviseFor] = useState<string | null>(null)
-  const [reviseText, setReviseText] = useState('')
+  const [revisionFor, setRevisionFor] = useState<OfficeArtifact | null>(null)
+  const [conversationOpen, setConversationOpen] = useState(false)
   const [versionsFor, setVersionsFor] = useState<string | null>(null)
   const currentArtifacts = useSyncExternalStore(subscribeArtifacts, getArtifactsSnapshot)
 
@@ -429,41 +430,6 @@ export function ArtifactsView() {
     }
   }
 
-  async function revise(artifact: OfficeArtifact) {
-    const instruction = reviseText.trim()
-    if (!instruction || busyId) return
-    setBusyId(artifact.id)
-    try {
-      const res = await fetch(
-        `${OFFICE_API_BASE}/api/artifacts/${artifact.id}/revise`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ instruction }),
-        },
-      )
-      const payload = (await res.json().catch(() => null)) as
-        | { artifact?: OfficeArtifact; detail?: string }
-        | null
-      if (!res.ok) {
-        showToast(payload?.detail ?? '生成修订版失败')
-        return
-      }
-      if (payload?.artifact) {
-        upsertArtifact(payload.artifact)
-        setAllArtifacts((items) => [...items.filter((item) => item.id !== payload.artifact!.id), payload.artifact!])
-        setOpenId(payload.artifact.id)
-      }
-      setReviseFor(null)
-      setReviseText('')
-      showToast('已生成修订版，原版本仍保留可追溯')
-    } catch {
-      showToast('生成修订版失败，请确认后端已启动')
-    } finally {
-      setBusyId(null)
-    }
-  }
-
   async function reveal(artifact: OfficeArtifact) {
     try {
       const res = await fetch(
@@ -542,6 +508,7 @@ export function ArtifactsView() {
           <h1>最终交付</h1>
           <p>按日期和需求名称归档成品；开发、测试、评审及复盘记录可在「过程文件」查看。</p>
         </div>
+        <button type="button" className="view-primary-btn" onClick={() => { setRevisionFor(null); setConversationOpen(true) }}>对话生成与修改</button>
       </header>
 
       <label className="artifact-history-search">
@@ -616,7 +583,7 @@ export function ArtifactsView() {
                       {!artifact.file_name ? <button type="button" onClick={() => setOpenId(open ? null : artifact.id)}>查看摘要</button> : null}
                       <button type="button" className="artifact-quick-download" onClick={() => download(artifact)}>{artifact.file_name ? '下载文件' : '下载摘要'}</button>
                       {artifact.file_name ? <button type="button" onClick={() => void reveal(artifact)}>打开所在文件夹</button> : null}
-                      <button type="button" className="artifact-revise-btn" onClick={() => { setOpenId(artifact.id); setReviseFor(artifact.id); setReviseText('') }}>继续修改</button>
+                      <button type="button" className="artifact-revise-btn" onClick={() => setRevisionFor(artifact)}>对话修改</button>
                       <button type="button" className="artifact-delete-btn" onClick={() => void removeOne(artifact)}>删除</button>
                     </div>
                   </div>
@@ -631,35 +598,6 @@ export function ArtifactsView() {
                       <pre className="view-md artifact-doc-body">
                         {artifact.content}
                       </pre>
-                      {reviseFor === artifact.id ? (
-                        <div className="artifact-revise-row">
-                          <input
-                            autoFocus
-                            value={reviseText}
-                            placeholder="说明怎么改，例如：第二章再展开一点，补三个案例"
-                            onChange={(event) => setReviseText(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter') void revise(artifact)
-                            }}
-                          />
-                          <button
-                            type="button"
-                            disabled={busyId === artifact.id || !reviseText.trim()}
-                            onClick={() => void revise(artifact)}
-                          >
-                            {busyId === artifact.id ? '生成中…' : '生成修订版'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReviseFor(null)
-                              setReviseText('')
-                            }}
-                          >
-                            取消
-                          </button>
-                        </div>
-                      ) : null}
                       {versionsFor === artifact.id ? (
                         <VersionChainPanel
                           artifact={artifact}
@@ -698,14 +636,9 @@ export function ArtifactsView() {
                         <button
                           type="button"
                           className="artifact-revise-btn"
-                          onClick={() => {
-                            setReviseFor(
-                              reviseFor === artifact.id ? null : artifact.id,
-                            )
-                            setReviseText('')
-                          }}
+                          onClick={() => setRevisionFor(artifact)}
                         >
-                          继续修改
+                          对话修改
                         </button>
                         <button
                           type="button"
@@ -728,6 +661,7 @@ export function ArtifactsView() {
           </div>
         )
       ) : null}
+      {revisionFor || conversationOpen ? <RevisionChatPanel artifact={revisionFor ?? undefined} onClose={() => { setRevisionFor(null); setConversationOpen(false); void refreshDeliverables() }} /> : null}
       {editFor ? (
         <ArtifactEditModal artifact={editFor} onClose={() => { setEditFor(null); void refreshDeliverables() }} />
       ) : null}

@@ -20,6 +20,9 @@ import forge  # noqa: E402
 import graph  # noqa: E402
 import llm  # noqa: E402
 import storage  # noqa: E402
+import task_planner  # noqa: E402
+import workflow_nodes  # noqa: E402
+from roles import DEV_BE, DEV_FE, QA  # noqa: E402
 
 
 def fake_chat_json(system, user="", fallback=None, *args, **kwargs):
@@ -92,9 +95,9 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_code_work_orders_backend_before_parallel_dependents(self):
         tasks = [
-            {"id": "T1", "assignee_roster": graph.DEV_FE},
-            {"id": "T2", "assignee_roster": graph.QA},
-            {"id": "T3", "assignee_roster": graph.DEV_BE},
+            {"id": "T1", "assignee_roster": DEV_FE},
+            {"id": "T2", "assignee_roster": QA},
+            {"id": "T3", "assignee_roster": DEV_BE},
         ]
         phases = graph.code_task_phases(tasks)
         self.assertEqual([[task["id"] for task in phase] for phase in phases], [["T3"], ["T1", "T2"]])
@@ -102,7 +105,7 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
     async def test_retrospective_never_claims_failed_tasks_were_completed(self):
         summary, markdown = graph.retrospective_content({
             "requirement": "生成命令行工具",
-            "tasks": [{"id": "T1", "title": "实现转换逻辑", "assignee_roster": graph.DEV_BE, "status": "打回"}],
+            "tasks": [{"id": "T1", "title": "实现转换逻辑", "assignee_roster": DEV_BE, "status": "打回"}],
             "qa_report": {"status": "unchecked"},
             "lead_decision": {"status": "unchecked"},
         }, False, [{"kind": "final", "title": "交付待修正", "quality_status": "failed", "degraded": True}])
@@ -137,9 +140,10 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
                     "reason": "模拟独立复核"}
 
         with (
-            patch.object(graph, "chat_json", side_effect=observing_chat),
-            patch.object(graph.verification, "verify", side_effect=fake_verify),
-            patch.object(graph.review_decision, "decide", side_effect=fake_lead),
+            patch.object(workflow_nodes, "chat_json", side_effect=observing_chat),
+            patch.object(task_planner, "chat_json", side_effect=observing_chat),
+            patch.object(workflow_nodes.verification, "verify", side_effect=fake_verify),
+            patch.object(workflow_nodes.review_decision, "decide", side_effect=fake_lead),
             patch.object(forge, "forge_file", return_value=None),
             patch.object(forge, "render_docx_from_markdown", return_value=None),
             patch.object(forge, "forge_code", return_value=[]),
@@ -157,7 +161,8 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
                     "review_note": "",
                     "deliver_kind": "",
                     "uploads_text": "",
-                }
+                },
+                config={"configurable": {"thread_id": "test-sprint"}},
             )
 
         self.assertEqual(result["deliver_kind"], "code")
@@ -207,12 +212,12 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
             "requirement": "生成接口联调通知",
             "deliver_kind": "docx",
             "tasks": [{"id": "T1", "title": "核对通知事实", "status": "待测试",
-                       "assignee_roster": graph.DEV_BE, "requirement_ids": ["R1"]}],
+                       "assignee_roster": DEV_BE, "requirement_ids": ["R1"]}],
             "requirement_contract": {"requirements": [{"requirement_id": "R1"}]},
             "uploads_text": "",
         }
-        with patch.object(graph.storage, "get_sprint", return_value={"id": "TEST_SPRINT"}):
-            result = await graph.candidate(state)
+        with patch.object(workflow_nodes.storage, "get_sprint", return_value={"id": "TEST_SPRINT"}):
+            result = await workflow_nodes.candidate(state)
         self.assertNotIn("candidate_id", result)
         blocked = [item for item in artifacts.artifacts_store
                    if item.get("kind") == "candidate" and item.get("quality_status") == "failed"]
@@ -223,9 +228,9 @@ class GraphFlowTest(unittest.IsolatedAsyncioTestCase):
     def test_candidate_handoff_references_candidate_hash_and_contributions(self):
         state = {"requirement_contract": {"requirements": [{"requirement_id": "R1"}]},
                  "tasks": [{"contribution_ref": "contribution:T1"}]}
-        with (patch.object(graph.storage, "get_sprint", return_value={"contract": {}}),
-              patch.object(graph.handoffs, "offer") as offer):
-            graph._offer_candidate_to_qa("S1", state, "A1", "abc123")
+        with (patch.object(workflow_nodes.storage, "get_sprint", return_value={"contract": {}}),
+              patch.object(workflow_nodes.handoffs, "offer") as offer):
+            workflow_nodes._offer_candidate_to_qa("S1", state, "A1", "abc123")
         args, kwargs = offer.call_args
         self.assertEqual(args[0], "S1")
         self.assertEqual(kwargs["to_roster"], 4)

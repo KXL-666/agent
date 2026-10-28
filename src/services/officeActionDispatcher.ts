@@ -106,6 +106,7 @@ function tryDrainQueue() {
       normalized,
       `remaining=${visitQueue.length}`,
       `completed=${completedCount}`,
+      `invalid=${invalidCount}`,
     )
     executeVisit(normalized, peek.messageFn)
     return

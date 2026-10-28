@@ -16,6 +16,12 @@ def source_material(contract: dict) -> str:
     """验收依据 = 用户需求 + 附件原文，与生成端使用同一份来源，避免把附件事实判成无依据。"""
     raw = str(contract.get("raw_requirement") or "").strip()
     attachment = str(contract.get("attachment_context") or "").strip()
+    prior = list(dict.fromkeys(list(contract.get('prior_user_quotes') or [])
+        + [str(item.get('quote') or '') for item in contract.get('format_scoped_sources', [])] + [
+        str(c.get('source', {}).get('quote') or c.get('text') or '') for c in contract.get('superseded', [])
+        if c.get('source', {}).get('type') == 'user']))
+    if prior:
+        attachment += '\n历史用户原话（仅作事实出处；旧要求已失效，与当前要求冲突之处以当前要求为准）：\n' + '\n'.join(prior)
     if not attachment or attachment in raw:
         return raw
     return f"{raw}\n\n附件原文：\n{attachment}"
@@ -100,8 +106,12 @@ def _apply_mechanical_toc_checks(items: list[dict], clauses: list[dict], metrics
         text = str(clause.get("text") or "")
         if "目录" not in text:
             continue
-        negated = bool(re.search(r"(?:不要|不带|无需|无)\s*目录", text))
+        negated = not artifact_quality._affirmed(text, r"目录")
         passed = (not toc_present) if negated else toc_present
+        # A compound clause can also forbid a cover or illustrations. A TOC
+        # check may fail that clause but cannot prove its other requirements.
+        if passed and re.search(r"封面|插图|图表|正文|标题|字体|页码", text):
+            continue
         item["status"] = "passed" if passed else "failed"
         item["evidence"] = ("文件结构检查：未发现目录字段或目录样式段落。" if not toc_present
                             else "文件结构检查：检测到目录字段或目录样式段落。")
@@ -172,7 +182,7 @@ def verify(candidate: dict, contract: dict, candidate_sha256: str,
     if kind == "code":
         project_dir = (candidate.get("regen") or {}).get("project_dir")
         if project_dir and Path(project_dir).is_dir():
-            previous = forge.project_report()
+            previous = candidate.get('regen') or {}
             report = project_agent.evaluate(Path(project_dir), previous.get("planned_files", []),
                                             previous.get("runtime", "python"))
         else:
