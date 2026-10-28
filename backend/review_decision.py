@@ -95,7 +95,9 @@ def decide(candidate: dict, contract: dict, qa_report: dict, handoff_records: li
         "旧候选因返工降级，其交接状态不能作为当前候选的失败原因。"
         "旧版本已修复的问题不要列入 issues。"
         "issues 只列当前候选违反需求或缺失必需证据的阻断问题；非阻断建议写入 note。"
-        "缺少实际内容、运行或视觉证据时写 unchecked；证据明确显示错误写 failed。",
+        "缺少实际内容、运行或视觉证据时写 unchecked；证据明确显示错误写 failed。"
+        "字数判定只认 qa_report.metrics.counted_characters（唯一权威，统一口径=汉字+英文/数字词、剔除标题段），"
+        "禁止自行重新估算或改写该数值。『恰好/正好 N 字』须 actual==N 才算通过；『约 N 字』允许 ±20%。",
         json.dumps({"raw_requirement": contract.get("raw_requirement"),
                     "clauses": contract.get("requirements", []), "candidate_sha256": expected_sha256,
                     "actual_content": actual, "companion_content": companion_text, "actual_checks": actual_checks,

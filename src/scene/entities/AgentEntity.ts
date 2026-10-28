@@ -127,6 +127,13 @@ export class AgentEntity extends Container {
     this.updateOverlayPositions()
   }
 
+  /** 思考泡：展示决策依据（淡黄色 💭 变体，比对话泡停留更久），不写 bubbleText 避免干扰拜访状态机 */
+  showThought(text: string, duration = 7) {
+    if (this.agent.bubbleText) return // 正在对话时不覆盖对话泡
+    this.bubble.show(text, duration, 'thought')
+    this.updateOverlayPositions()
+  }
+
   hideBubble() {
     this.agent.bubbleText = undefined
     this.bubble.hide()

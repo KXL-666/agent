@@ -177,6 +177,14 @@ def _inspect(path: str | Path, kind: str, spec: str, workspace: str | Path) -> d
             check("标题与导航", any(p.style.name in ("Title", "Heading 1") for p in paragraphs), "检查原生 Word 标题样式")
             normalized = [p.text.strip() for p in paragraphs if len(p.text.strip()) > 50]
             check("内容重复", len(set(normalized)) >= len(normalized) * .8, "检查长段落是否被重复填充")
+            # 目录检测：TOC 字段指令或目录样式段落，两者任一即判定含目录
+            toc_field = any("TOC" in (node.text or "") for node in doc.element.body.iter()
+                            if node.tag.endswith("}instrText"))
+            toc_styles = [p for p in doc.paragraphs if p.style.name.startswith(("TOC", "目录"))]
+            metrics["toc_present"] = bool(toc_field or toc_styles)
+            if re.search(r"(?:不要|不带|无需|无)\s*目录", requirement_scope(spec)):
+                check("需求中的目录缺失", not metrics["toc_present"],
+                      "未发现目录字段或目录样式段落" if not metrics["toc_present"] else "检测到目录字段或目录样式段落")
         elif kind == "xlsx":
             from openpyxl import load_workbook
             with closing(load_workbook(path, data_only=False)) as wb, closing(load_workbook(path, data_only=True)) as values:
@@ -344,13 +352,20 @@ def _inspect(path: str | Path, kind: str, spec: str, workspace: str | Path) -> d
                 elif mode in ("不超过", "最多"):
                     ok = amount <= wanted
                 elif unit == "字":
-                    ok = wanted * .8 <= amount <= wanted * 1.2
+                    # 「恰好/正好 N 字」是精确要求须逐字命中；「约 N 字」才允许 ±20% 容差。
+                    ok = amount == wanted if mode == "exact" else wanted * .8 <= amount <= wanted * 1.2
                 elif kind == "pptx" and unit == "页" and requested.get("count_scope") == "content":
                     total_wanted = wanted + int(requested.get("cover", False))
                     ok = amount == total_wanted
                 else:
                     ok = amount == wanted
-                check("用户指定篇幅", ok, f"要求{mode}{wanted}{unit}，实际{amount}{unit}")
+                if unit == "字":
+                    if mode == "exact":
+                        check("用户指定篇幅", ok, f"要求恰好{wanted}字，实际{amount}字（统一口径，须精确命中）")
+                    else:
+                        check("用户指定篇幅", ok, f"要求约{wanted}字（容差±20%，{round(wanted * .8)}~{round(wanted * 1.2)}），实际{amount}字")
+                else:
+                    check("用户指定篇幅", ok, f"要求{mode}{wanted}{unit}，实际{amount}{unit}")
     except Exception as error:
         check("文件可读取", False, str(error))
     failed = any(c["ok"] is False for c in checks)
@@ -397,6 +412,7 @@ def model_review(report: dict, path: str | Path, workspace: str | Path, roster: 
         "Word 的 actual_content 在正文段落后包含表格行，单元格以 | 分隔；检查项也给出表格数量。"
         "指控缺少表格或表格条目之前，必须核对这些行和表格数量，不能仅依据正文段落概述。"
         "只报告有证据的问题，不凭缺少截图臆测缺陷；素材中待用户填写的输入项不等于占位失败。"
+        "字数判定只认检查项里的 counted_characters（统一口径），禁止自行重新估算；『恰好/正好 N 字』须逐字命中，『约 N 字』允许 ±20%。"
         '返回 JSON {"passed":true,"issues":[{"location":"具体页/章节/单元格","problem":"实际问题","fix":"具体修改要求"}]'
         + (',"verification":[{"requirement_id":"R1","status":"passed|failed|unchecked","evidence":"...","location":"...","problem":"...","fix":"...","owner_roster":3}]' if clauses is not None else '')
         + '}。' + clause_prompt +

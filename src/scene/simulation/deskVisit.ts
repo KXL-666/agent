@@ -4,6 +4,7 @@ import type {
   Desk,
   DeskVisitMission,
   DeskVisitStop,
+  DialogLine,
 } from '@/types/agent'
 import {
   AGENT_ROSTER,
@@ -24,6 +25,9 @@ import type { AgentEntity } from '@/scene/entities/AgentEntity'
 import { talkFacingToward } from '@/scene/systems/movementFacing'
 
 const DEFAULT_TALK_SEC = 3.5
+
+/** 多回合剧本每句的停留时长（秒） */
+const LINE_TALK_SEC = 2.6
 
 export function rosterAgentAt(agents: Agent[], rosterNo: number): Agent | undefined {
   const i = rosterNo - 1
@@ -95,9 +99,15 @@ function missionForStops(
   stops: DeskVisitStop[],
   resumeTask: string,
   talkDuration: number,
+  lines?: DialogLine[],
 ): DeskVisitMission | null {
   if (stops.length === 0) return null
   const [current, ...queue] = stops
+  // 多回合剧本：总时长按句数换算，每句 2.6 秒
+  const effectiveLines = lines && lines.length > 1 ? lines : undefined
+  const effectiveDuration = effectiveLines
+    ? effectiveLines.length * LINE_TALK_SEC
+    : talkDuration
   return {
     kind: 'desk_visit',
     phase: 'goto',
@@ -105,7 +115,8 @@ function missionForStops(
     hostDeskId: current.hostDeskId,
     message: current.message,
     resumeTask,
-    talkDuration,
+    talkDuration: effectiveDuration,
+    lines: effectiveLines,
     queue,
   }
 }
@@ -117,14 +128,29 @@ export function startDeskVisit(
   hostRosterNo: number,
   message: string,
   talkDuration = DEFAULT_TALK_SEC,
+  lines?: DialogLine[],
 ): Agent[] {
-  return startDeskVisitTour(
-    agents,
-    visitorRosterNo,
-    [hostRosterNo],
-    () => message,
-    talkDuration,
+  const visitor = rosterAgentAt(agents, visitorRosterNo)
+  if (!visitor) return agents
+  const stops = buildStops(agents, [hostRosterNo], () => message).filter(
+    (s) => s.hostAgentId !== visitor.id,
   )
+  const mission = missionForStops(
+    stops,
+    visitor.currentTask ??
+      AGENT_ROSTER[visitorRosterNo - 1]?.task ??
+      '工作中…',
+    talkDuration,
+    lines,
+  )
+  if (!mission) return agents
+
+  const firstStop = stops[0]!
+  return agents.map((a) => {
+    if (a.id !== visitor.id) return a
+    const going = assignGotoHost(a, firstStop, agents)
+    return { ...going, mission }
+  })
 }
 
 /** 按顺序串联多站，全部完成后回访客工位 */
@@ -302,6 +328,23 @@ function syncDeskVisitTalkPartners(agents: Agent[]): Agent[] {
   return result
 }
 
+/** 多回合分播：隐藏另一方的气泡，轮到当前说话者显示其台词 */
+function showDialogLine(
+  entities: Map<string, AgentEntity>,
+  visitorId: string,
+  hostId: string,
+  lines: DialogLine[],
+  index: number,
+) {
+  const line = lines[index]
+  if (!line) return
+  const speakerId = line.speaker === 'host' ? hostId : visitorId
+  const otherId = line.speaker === 'host' ? visitorId : hostId
+  entities.get(otherId)?.hideBubble()
+  // 略长于句间隔，避免切换瞬间气泡闪没
+  entities.get(speakerId)?.showBubble(line.text, LINE_TALK_SEC + 0.6)
+}
+
 export function processDeskVisitMissions(
   dt: number,
   agents: Agent[],
@@ -321,7 +364,12 @@ export function processDeskVisitMissions(
         ? talkFacingToward(agent.x, agent.y, host.x, host.y)
         : { viewFacing: 'front' as const, facing: 1 as const }
 
-      entities.get(agent.id)?.showBubble(mission.message, mission.talkDuration)
+      const lines = mission.lines
+      if (lines && lines.length > 0) {
+        showDialogLine(entities, agent.id, mission.hostAgentId, lines, 0)
+      } else {
+        entities.get(agent.id)?.showBubble(mission.message, mission.talkDuration)
+      }
 
       return {
         ...agent,
@@ -333,6 +381,8 @@ export function processDeskVisitMissions(
           ...mission,
           phase: 'talk' as const,
           talkRemaining: mission.talkDuration,
+          lineIndex: lines ? 0 : undefined,
+          lineRemaining: lines ? LINE_TALK_SEC : undefined,
         },
       }
     }
@@ -342,19 +392,47 @@ export function processDeskVisitMissions(
       const toward = host
         ? talkFacingToward(agent.x, agent.y, host.x, host.y)
         : null
-      const left = (mission.talkRemaining ?? mission.talkDuration) - dt
-      if (left > 0) {
-        return {
-          ...agent,
-          ...(toward ?? {}),
-          state: 'talking' as const,
-          currentTask: HANDOFF_STATUS.handingOff,
-          mission: { ...mission, talkRemaining: left } satisfies DeskVisitMission,
+      const totalLeft = (mission.talkRemaining ?? mission.talkDuration) - dt
+
+      // 多回合剧本分播：按句推进，轮到谁谁说
+      const lines = mission.lines
+      if (lines && mission.lineIndex != null) {
+        if (totalLeft > 0) {
+          let lineIndex = mission.lineIndex
+          let lineRemaining = (mission.lineRemaining ?? LINE_TALK_SEC) - dt
+          if (lineRemaining <= 0 && lineIndex + 1 < lines.length) {
+            lineIndex += 1
+            lineRemaining = LINE_TALK_SEC
+            showDialogLine(entities, agent.id, mission.hostAgentId, lines, lineIndex)
+          }
+          return {
+            ...agent,
+            ...(toward ?? {}),
+            state: 'talking' as const,
+            currentTask: HANDOFF_STATUS.handingOff,
+            mission: {
+              ...mission,
+              talkRemaining: totalLeft,
+              lineIndex,
+              lineRemaining,
+            } satisfies DeskVisitMission,
+          }
         }
+        // 剧本播完：隐藏双方气泡
+        entities.get(agent.id)?.hideBubble()
+        entities.get(mission.hostAgentId)?.hideBubble()
+      } else {
+        if (totalLeft > 0) {
+          return {
+            ...agent,
+            ...(toward ?? {}),
+            state: 'talking' as const,
+            currentTask: HANDOFF_STATUS.handingOff,
+            mission: { ...mission, talkRemaining: totalLeft } satisfies DeskVisitMission,
+          }
+        }
+        entities.get(agent.id)?.hideBubble()
       }
-
-      entities.get(agent.id)?.hideBubble()
-
       if (mission.queue.length > 0) {
         const [next, ...queue] = mission.queue
         const going = assignGotoHost(

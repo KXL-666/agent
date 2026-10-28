@@ -1,6 +1,6 @@
 import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js'
 import type { FederatedPointerEvent } from 'pixi.js'
-import type { Agent, AgentState } from '@/types/agent'
+import type { Agent, AgentState, DialogLine } from '@/types/agent'
 import { OFFICE_AUTO_DEMO } from '@/config/officeMode'
 import {
   AGENT_ROSTER,
@@ -276,12 +276,15 @@ export class OfficeScene {
     visitorRosterNo: number,
     hostRosterNo: number,
     message: string,
+    lines?: DialogLine[],
   ) {
     this.agents = this.simulator.startDeskVisit(
       this.agents,
       visitorRosterNo,
       hostRosterNo,
       message,
+      undefined,
+      lines,
     )
     this.pushDataToEntities()
   }
@@ -441,6 +444,13 @@ export class OfficeScene {
     this.agentEntities.get(id)?.playCustomAnimation(animation, task)
     this.pullDataFromEntities()
     setOfficeAgents(this.agents)
+  }
+
+  /** 成员头顶思考泡：展示决策依据；暂停时不弹（数据已入 store 与通知中心） */
+  showAgentThought(id: string, text: string) {
+    if (this.paused) return
+    if (!this.agents.some((a) => a.id === id)) return
+    this.agentEntities.get(id)?.showThought(text)
   }
 
   resize(containerWidth: number, containerHeight: number) {
@@ -634,7 +644,7 @@ export class OfficeScene {
 
     this.animation.update(this.agentEntities, dt)
     this.sortOfficeDepth()
-    this.syncDeskOccupancy()
+    this.syncDeskSeatStates()
 
     // 夜晚灯光呼吸：轻微明暗起伏，让房间有「活」的灯光感
     if (this.nightMode && this.nightLayer?.visible) {
@@ -776,14 +786,15 @@ export class OfficeScene {
     })
   }
 
-  private syncDeskOccupancy() {
-    const occupied = new Set(
-      this.agents
-        .filter((a) => a.state === 'working' && a.assignedDeskId)
-        .map((a) => a.assignedDeskId!),
-    )
+  /** 椅背状态灯跟随座位成员状态：坐姿状态即亮，离座（拜访/走动）时熄灭 */
+  private syncDeskSeatStates() {
+    const seatStates = new Map<string, AgentState>()
+    for (const agent of this.agents) {
+      if (!agent.assignedDeskId || agent.mission || agent.state === 'walking') continue
+      seatStates.set(agent.assignedDeskId, agent.state)
+    }
     for (const desk of this.deskEntities.values()) {
-      desk.setOccupied(occupied.has(desk.deskId))
+      desk.setSeatState(seatStates.get(desk.deskId) ?? null)
     }
   }
 

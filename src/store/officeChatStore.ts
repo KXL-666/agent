@@ -3,13 +3,17 @@
 import { useEffect } from 'react'
 
 export type ChatMessage = {
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'task'
   content: string
   time: string
   via?: 'llm' | 'mock'
   model?: string
   /** 轻提示（小灰字）：如图片被模型忽略、已切换备用通道 */
   hint?: boolean
+  /** 单飞任务卡片：关联后端 task_id，随 WS 事件更新状态 */
+  taskId?: string
+  taskStatus?: 'running' | 'done' | 'failed'
+  artifactId?: string
 }
 
 const STORAGE_KEY = 'office.chat.v1'
@@ -136,6 +140,46 @@ export function appendAssistantMessage(
 /** 追加一条轻提示（渲染为小灰字，不参与气泡/模型标注） */
 export function appendHintMessage(roster: number, content: string) {
   append(roster, { role: 'assistant', content, time: nowLabel(), hint: true })
+}
+
+/** 追加单飞任务卡片（进行中），等待 WS 事件更新为完成/失败 */
+export function appendTaskMessage(roster: number, title: string, taskId: string) {
+  append(roster, {
+    role: 'task',
+    content: title,
+    time: nowLabel(),
+    taskId,
+    taskStatus: 'running',
+  })
+}
+
+/** 单飞任务完成/失败后更新卡片状态并挂上产物 */
+export function updateTaskMessage(
+  roster: number,
+  taskId: string,
+  status: 'done' | 'failed',
+  artifactId?: string | null,
+) {
+  restore()
+  const current = threads[roster] ?? []
+  const index = current.findIndex(
+    (m) => m.role === 'task' && m.taskId === taskId,
+  )
+  if (index < 0) return
+  threads = {
+    ...threads,
+    [roster]: [
+      ...current.slice(0, index),
+      {
+        ...current[index],
+        taskStatus: status,
+        artifactId: artifactId ?? current[index].artifactId,
+      },
+      ...current.slice(index + 1),
+    ],
+  }
+  persist()
+  notify()
 }
 
 // 流式回复时 localStorage 写入做节流，避免每个 delta 都全量序列化

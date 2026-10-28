@@ -11,6 +11,7 @@ import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
 import {
   appendAssistantMessage,
   appendHintMessage,
+  appendTaskMessage,
   appendUserMessage,
   clearThread,
   getSelectedRoster,
@@ -32,7 +33,7 @@ import {
 } from '@/store/officeAgentConfigStore'
 import { getOfficeAgents } from '@/store/officeStore'
 import { showToast } from '@/store/officeUiStore'
-import { openSprintDialog } from '@/store/officeViewStore'
+import { setActiveView } from '@/store/officeViewStore'
 import {
   removeUpload,
   uploadFiles,
@@ -62,6 +63,7 @@ export function OfficeChatView() {
   const setImages = (value: OfficeUpload[] | ((previous: OfficeUpload[]) => OfficeUpload[])) =>
     setImageThreads((prev) => ({ ...prev, [roster]: typeof value === 'function' ? value(prev[roster] ?? []) : value }))
   const [uploading, setUploading] = useState(false)
+  const [assigning, setAssigning] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
 
@@ -244,20 +246,44 @@ export function OfficeChatView() {
     }
   }
 
-  /** 把当前输入作为需求打开新建任务弹窗：可补齐附件、保存位置、极速模式与预算后再开工 */
-  function handleStartSprint() {
+  /** 把当前输入作为任务派给当前成员：单兵作战，不触发团队 Sprint */
+  async function handleAssignTask() {
     const text = input.trim()
-    if (!text) return
-    openSprintDialog(text)
+    if (!text || assigning) return
+    setAssigning(true)
+    appendUserMessage(roster, `📌 指派任务：${text}`)
     setInput('')
+    try {
+      const res = await fetch(`${OFFICE_API_BASE}/api/solo/task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roster, message: text }),
+      })
+      const payload = (await res.json().catch(() => null)) as
+        | { task_id?: string; detail?: string }
+        | null
+      if (!res.ok || !payload?.task_id) {
+        throw new Error(payload?.detail ?? `请求失败（${res.status}）`)
+      }
+      appendTaskMessage(roster, text.slice(0, 30), payload.task_id)
+      showToast(`已指派给 ${displayNameOf(roster)}，TA 开始单兵作战`)
+    } catch (error) {
+      appendHintMessage(
+        roster,
+        `任务指派失败：${(error as Error).message || '无法连接后端'}`,
+      )
+      showToast((error as Error).message || '任务指派失败')
+    } finally {
+      setAssigning(false)
+    }
   }
 
   return (
     <div className="view-page chat-page">
       <header className="view-head">
         <div>
-          <h1>对话</h1>
-          <p>各成员独立对话，可在回复期间切换并向其他成员发送消息</p>
+          <h1>单飞</h1>
+          <p>各成员独立对话、独立干活：点「指派任务」让当前成员单兵作战，产物进「交付」面板</p>
         </div>
       </header>
 
@@ -328,6 +354,8 @@ export function OfficeChatView() {
                   <p key={i} className="chat-hint">
                     {message.content}
                   </p>
+                ) : message.role === 'task' ? (
+                  <TaskCard key={message.taskId ?? i} message={message} />
                 ) : (
                   <ChatBubble key={i} message={message} />
                 ),
@@ -386,11 +414,11 @@ export function OfficeChatView() {
             <button
               type="button"
               className="view-ghost-btn"
-              disabled={pending || !input.trim()}
-              onClick={handleStartSprint}
-              title="打开新建任务弹窗，可补齐附件/保存位置/极速模式/预算后开工"
+              disabled={pending || assigning || !input.trim()}
+              onClick={handleAssignTask}
+              title="把当前输入作为任务派给当前成员，TA 独立完成并产出到「交付」面板"
             >
-              交给团队开工
+              {assigning ? '指派中…' : '指派任务'}
             </button>
             {pending ? (
               <button
@@ -430,6 +458,37 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             </i>
           ) : null}
         </span>
+      </div>
+    </div>
+  )
+}
+
+/** 单飞任务卡片：进行中 → 已完成/失败，完成后可跳转交付面板查看产物 */
+function TaskCard({ message }: { message: ChatMessage }) {
+  const status = message.taskStatus ?? 'running'
+  const statusLabel =
+    status === 'running' ? '执行中…' : status === 'done' ? '已完成' : '失败'
+  return (
+    <div className="chat-bubble-row">
+      <div className={`chat-task-card is-${status}`}>
+        <span className="chat-task-icon" aria-hidden>
+          {status === 'running' ? '⏳' : status === 'done' ? '✅' : '❌'}
+        </span>
+        <div className="chat-task-body">
+          <strong>{message.content}</strong>
+          <span className="chat-task-status">
+            {statusLabel} · {message.time}
+          </span>
+        </div>
+        {status === 'done' && message.artifactId ? (
+          <button
+            type="button"
+            className="view-ghost-btn chat-task-open"
+            onClick={() => setActiveView('artifacts')}
+          >
+            查看产物
+          </button>
+        ) : null}
       </div>
     </div>
   )

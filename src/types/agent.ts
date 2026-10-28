@@ -14,6 +14,12 @@ export interface DeskVisitStop {
   message: string
 }
 
+/** 多回合对话剧本中的一句 */
+export interface DialogLine {
+  speaker: 'visitor' | 'host'
+  text: string
+}
+
 /** 工位拜访（可串联多站，最后一站后再回座） */
 export interface DeskVisitMission {
   kind: 'desk_visit'
@@ -24,6 +30,12 @@ export interface DeskVisitMission {
   resumeTask: string
   talkDuration: number
   talkRemaining?: number
+  /** 多回合对话剧本（可选）：talk 阶段按节拍分播，缺省时按单句 message 展示 */
+  lines?: DialogLine[]
+  /** 当前播放到第几句（lines 存在时有效） */
+  lineIndex?: number
+  /** 当前句剩余时长 */
+  lineRemaining?: number
   /** 当前站之后还要去的目标 */
   queue: DeskVisitStop[]
   /** return 阶段走回座位后要落入的状态(菜单改状态用) */

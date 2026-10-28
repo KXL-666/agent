@@ -1,6 +1,7 @@
 import { Container, Graphics, Sprite } from 'pixi.js'
-import type { Desk } from '@/types/agent'
+import type { AgentState, Desk } from '@/types/agent'
 import { SEAT_OFFSET_Y } from '@/scene/layout/officeLayout'
+import { STATE_COLORS } from '@/scene/ui/StatusLabel'
 import {
   getOfficeChairTexture,
   getOfficeDeskTexture,
@@ -89,13 +90,13 @@ export class DeskEntity {
     this.occupiedIndicator.zIndex = chairZ + 0.5
   }
 
-  setOccupied(occupied: boolean) {
+  /** 椅背状态灯：颜色跟随座位成员状态，无人时熄灭 */
+  setSeatState(state: AgentState | null) {
     this.occupiedIndicator.clear()
-    if (occupied) {
-      this.occupiedIndicator.circle(0, SEAT_OFFSET_Y - 4, 5.5)
-      this.occupiedIndicator.fill({ color: 0x50b86c, alpha: 0.85 })
-      this.occupiedIndicator.stroke({ color: 0xffffff, width: 1.5, alpha: 0.6 })
-    }
+    if (!state) return
+    this.occupiedIndicator.circle(0, SEAT_OFFSET_Y - 4, 5.5)
+    this.occupiedIndicator.fill({ color: STATE_COLORS[state] ?? STATE_COLORS.idle, alpha: 0.9 })
+    this.occupiedIndicator.stroke({ color: 0xffffff, width: 1.5, alpha: 0.6 })
   }
 
   getSeatPosition() {

@@ -3,6 +3,7 @@ import { submitVisitAction } from '@/services/officeActionDispatcher'
 import type { VisitActionMessage } from '@/services/officeActionDispatcher'
 import { getOfficeAgents, setOfficeAgents } from '@/store/officeStore'
 import type { AgentState } from '@/types/agent'
+import type { OfficeDialogLine } from '@/types/officeAction'
 
 let scene: OfficeScene | null = null
 let officePaused = false
@@ -30,6 +31,7 @@ type PendingDeskVisit = {
   visitorRosterNo: number
   hostRosterNo: number
   message: string
+  lines?: OfficeDialogLine[]
 }
 
 type PendingDeskVisitTour = {
@@ -87,6 +89,7 @@ function flushPendingActions() {
         visitor: action.visitorRosterNo,
         host: action.hostRosterNo,
         message: action.message,
+        lines: action.lines,
       })
     } else if (action.kind === 'desk_visit_tour') {
       submitVisitAction(
@@ -125,6 +128,7 @@ export function requestDeskVisit(
   visitorRosterNo: number,
   hostRosterNo: number,
   message: string,
+  lines?: OfficeDialogLine[],
 ) {
   if (!scene) {
     pendingActions.push({
@@ -132,6 +136,7 @@ export function requestDeskVisit(
       visitorRosterNo,
       hostRosterNo,
       message,
+      lines,
     })
     console.info('[OfficeHTTP] scene not ready, pending desk_visit', {
       visitor: visitorRosterNo,
@@ -139,7 +144,7 @@ export function requestDeskVisit(
     })
     return
   }
-  scene.requestDeskVisit(visitorRosterNo, hostRosterNo, message)
+  scene.requestDeskVisit(visitorRosterNo, hostRosterNo, message, lines)
 }
 
 /** 1 号依次拜访 2、3、4… 号，全部说完后回座 */
@@ -266,6 +271,12 @@ export function playAgentEmote(agentId: string, animation: string, task?: string
     return
   }
   scene.playAgentAnimation(agentId, animation, task)
+}
+
+/** 成员头顶思考泡：展示决策依据；场景未就绪时丢弃（通知中心仍可回溯全文） */
+export function showAgentThought(agentId: string, text: string) {
+  if (!scene) return
+  scene.showAgentThought(agentId, text)
 }
 
 export type { VisitActionMessage }

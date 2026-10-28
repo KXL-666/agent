@@ -9,6 +9,7 @@ set_state（状态/任务牌）、desk_visit（起身找某人说话）、emote�
 
 import asyncio
 import os
+import re
 import json
 import zipfile
 import hashlib
@@ -25,6 +26,7 @@ import contributions
 import verification
 import review_decision
 import candidate_revision
+import artifact_quality
 from agile import plan_fields
 from requirement_contract import build_contract
 from artifacts import add_artifact, artifacts_store
@@ -63,12 +65,37 @@ def set_state(roster_no: int, state: str, task: str | None = None) -> None:
 _SPEAK_LLM_ENABLED = True
 
 
-def visit(visitor: int, host: int, message: str) -> None:
-    emit({"type": "desk_visit", "visitor": visitor, "host": host, "message": message})
+def visit(visitor: int, host: int, message: str,
+          lines: list[dict] | None = None) -> None:
+    event = {"type": "desk_visit", "visitor": visitor, "host": host, "message": message}
+    if lines:
+        event["lines"] = lines
+    emit(event)
+
+
+def thought(roster_no: int, text: str, phase: str = "", task_id: str = "") -> None:
+    """推送一条成员的决策依据/思考说明，让「为什么这么做」对用户可见。
+
+    与气泡对话不同：气泡是口语化表演，思考是决策依据（拆解思路、分工理由、
+    核验结论、评审意见），全文可在通知中心回溯。不额外消耗模型调用——
+    内容来自各节点 LLM 的顺路输出或已有实质数据的确定性合成。"""
+    text = (text or "").strip()
+    if not text:
+        return
+    emit({
+        "type": "thought",
+        "rosterNo": roster_no,
+        "thought": text[:220],
+        "phase": phase,
+        "taskId": task_id,
+    })
 
 
 async def speak(visitor: int, host: int, context: str, fallback: str) -> None:
-    """让 LLM 现场生成一句角色对话作为气泡文案；失败时回退到 fallback"""
+    """让 LLM 现场生成 2~3 回合的当面对话剧本；失败时回退到 fallback 单句。
+
+    多回合剧本让协作从「说一句就走」变成「有来有往」：访客说明来意 →
+    被访者回应 → 访客收尾。一次模型调用生成整段，前端按节拍分播气泡。"""
     global _SPEAK_LLM_ENABLED
     if not _SPEAK_LLM_ENABLED or sprint_meta.get("fast"):
         visit(visitor, host, fallback)
@@ -80,15 +107,18 @@ async def speak(visitor: int, host: int, context: str, fallback: str) -> None:
         chat_json,
         (
             "你在模拟一个软件团队的办公室。"
-            f"「{roster_label(visitor)}」正走到「{roster_label(host)}」的工位前当面说话。"
-            "要求：口语化、自然、符合角色身份，可以带一点职场个性，"
-            "不超过 25 个字，不要引号，不要称呼前缀。"
-            '输出 JSON：{"message":"..."}'
+            f"「{roster_label(visitor)}」正走到「{roster_label(host)}」的工位前当面沟通。"
+            "生成 2~3 回合的简短对话剧本：第一句由访客（visitor）说明来意，"
+            "随后两人交替回应，最后一句由访客收尾确认。"
+            "要求：口语化、自然、符合各自角色身份，可以带一点职场个性，"
+            "每句不超过 25 个字，不要引号，不要称呼前缀，对话要围绕话题有实质推进。"
+            '输出 JSON：{"lines":[{"speaker":"visitor","text":"..."},'
+            '{"speaker":"host","text":"..."}]}'
         ),
         f"话题：{context}",
-        fallback,
+        {"lines": [{"speaker": "visitor", "text": fallback}]},
         temperature=0.9,
-        max_tokens=120,
+        max_tokens=220,
     )
 
     bubble_fallback = llm.consume_fallback()
@@ -96,13 +126,18 @@ async def speak(visitor: int, host: int, context: str, fallback: str) -> None:
         # 限流持续：本轮后续气泡直接走模板，不再浪费配额
         _SPEAK_LLM_ENABLED = False
         print("[LLM] 气泡对话检测到 429 限流，本轮 Sprint 气泡切换为模板文案")
-    if isinstance(result, dict):
-        message = str(result.get("message", "")).strip()
-    else:
-        message = str(result).strip()
-    if not message:
-        message = fallback
-    visit(visitor, host, message[:40])
+    lines: list[dict] = []
+    if isinstance(result, dict) and isinstance(result.get("lines"), list):
+        for item in result["lines"][:3]:
+            if not isinstance(item, dict):
+                continue
+            speaker = "host" if item.get("speaker") == "host" else "visitor"
+            text = str(item.get("text", "")).strip()[:40]
+            if text:
+                lines.append({"speaker": speaker, "text": text})
+    if not lines:
+        lines = [{"speaker": "visitor", "text": fallback[:40]}]
+    visit(visitor, host, lines[0]["text"], lines)
 
 
 def emote(roster_no: int, animation: str, label: str) -> None:
@@ -172,6 +207,7 @@ async def pause(seconds: float) -> None:
 
 def mock_plan() -> dict:
     return {
+        "thought": "模型不可用，按默认分工模板拆解：接口契约、核心实现、页面联调、自动化测试四条线并行推进。",
         "tasks": [
             {"title": "设计数据库表结构与接口契约", "role_hint": "后端"},
             {"title": "实现核心业务接口", "role_hint": "后端"},
@@ -383,7 +419,8 @@ async def kickoff(state: SprintState) -> dict:
         chat_json,
         system=(
             "你是敏捷团队的产品经理。把需求拆解为 3-5 个任务，"
-            '输出 JSON：{"contract":{"target_kind":"docx|pdf|pptx|xlsx|code",'
+            '输出 JSON：{"thought":"一两句向团队说明拆解思路：为什么这样拆、重点和风险在哪",'
+            '"contract":{"target_kind":"docx|pdf|pptx|xlsx|code",'
             '"audience":"读者或使用者","purpose":"用途",'
             '"requirements":[{"source":"user|attachment","source_quote":"原文连续片段",'
             '"source_name":"附件名（仅附件）","source_location":"附件位置（仅附件）",'
@@ -426,6 +463,9 @@ async def kickoff(state: SprintState) -> dict:
                 "reason": fallback_info["reason"],
             }
         )
+
+    # 产品经理的拆解思路对团队可见（LLM 顺路输出；兜底时使用模板说明）
+    thought(PO, str(plan.get("thought") or mock_plan()["thought"]), "需求拆解")
 
     contract = build_contract(
         state["requirement"], uploads_text, plan.get("contract"),
@@ -578,6 +618,14 @@ async def assign(state: SprintState) -> dict:
             update_task(t)
     set_state(SM, "working", "分派任务")
     await pause(0.8)
+
+    # 分工依据对团队可见：哪个任务给谁、各自的职责边界（确定性合成真实分派结果）
+    assignment_parts = [
+        f"「{t['title']}」→ {roster_name(t['assignee_roster'])}（{t.get('role_scope', '待确认')}）"
+        for t in tasks if t.get("assignee_roster")
+    ]
+    thought(SM, "按角色匹配分派：" + "；".join(assignment_parts), "任务分派")
+
     for t in tasks:
         no = t["assignee_roster"]
         if no:
@@ -619,6 +667,16 @@ async def develop(state: SprintState) -> dict:
         async with semaphore:
             if t["status"] == "已取消":
                 return
+            # 接手思路对团队可见：职责边界 + 验收条件 + 入手方向（确定性合成，不耗模型配额）
+            criteria = t.get("acceptance_criteria", [])
+            thought(
+                no,
+                f"接到「{t['title']}」：职责是{t.get('role_scope', '按任务要求执行')}；"
+                f"需满足 {len(criteria)} 条验收（{criteria[0] if criteria else '按任务描述核验'}），"
+                + ("重点排查上一轮指出的缺陷后重新提交。" if t["status"] == "打回"
+                   else "先梳理输入素材与需求条款，再动手产出。"),
+                "并行开发", t["id"],
+            )
             # 产物：开发说明（LLM 生成实现要点，未配 LLM 时用模板兜底）
             note_meta: dict = {}
             if state.get("deliver_kind", "docx") == "code":
@@ -893,6 +951,17 @@ async def test(state: SprintState) -> dict:
             continue
         task["status"] = "打回" if failed_ids.intersection(task.get("requirement_ids", [])) else "待评审"
         update_task(task)
+
+    # QA 的核验依据对团队可见：多少条通过/失败、主要问题在哪
+    qa_items = report.get("items", [])
+    qa_failed = [item for item in qa_items if item.get("status") == "failed"]
+    qa_thought_text = (
+        f"逐条核验 {len(qa_items)} 条：通过 {len(qa_items) - len(qa_failed)} 条，"
+        f"未通过 {len(qa_failed)} 条，结论 {report['status']}。"
+        + (f"首要问题：{qa_failed[0].get('problem') or report.get('reason', '')}"
+           if qa_failed else "")
+    )
+    thought(QA, qa_thought_text, "测试验证")
     if sprint_id and storage.get_sprint(sprint_id):
         handoffs.offer(
             sprint_id, task_id="", from_roster=QA, to_roster=LEAD,
@@ -976,10 +1045,40 @@ async def review(state: SprintState) -> dict:
             open_questions=[decision["reason"]] if decision.get("reason") else [],
             acceptance_criteria=["发布字节 SHA-256 与 LEAD 审阅候选一致"],
         )
+    # LEAD 的复核依据对团队可见：结论 + 理由 + 定位到的问题
+    lead_issues = decision.get("issues", [])
+    lead_thought_text = (
+        f"独立复核结论：{decision['status']}。"
+        + (f"理由：{decision['reason']}。" if decision.get("reason") else "")
+        + (f"共定位 {len(lead_issues)} 处需修复问题。" if lead_issues else "")
+    )
+    thought(LEAD, lead_thought_text, "技术评审")
+
+    # 打回时当面指出问题：LEAD 逐个拜访被打回任务的负责人，当面说清楚哪里不行
+    if decision["status"] == "failed":
+        visit_targets: list[int] = []
+        for task in tasks:
+            owner = task.get("assignee_roster")
+            if task.get("status") == "打回" and owner in (DEV_BE, DEV_FE, QA) and owner not in visit_targets:
+                visit_targets.append(owner)
+        for owner in visit_targets[:2]:
+            owner_problems = [
+                issue.get("problem") or issue.get("location") or "有条款未通过"
+                for issue in lead_issues
+                if issue.get("owner_roster") in (None, owner)
+            ][:2]
+            problem_text = "；".join(str(p)[:40] for p in owner_problems) or "部分验收条款未通过"
+            await speak(
+                LEAD,
+                owner,
+                f"评审未通过，向{roster_label(owner)}当面指出问题：{problem_text}，请其确认并认领修复",
+                f"评审没通过：{problem_text}，麻烦尽快修复",
+            )
     await speak(LEAD, SM, f"同版本独立评审：{decision['status']}", f"LEAD 结论：{decision['status']}")
     return {"tasks": tasks, "lead_decision": decision,
             "review_note": decision.get("reason", ""),
             "rework_count": state["rework_count"] + (1 if decision["status"] == "failed" else 0)}
+
 
 
 async def fix(state: SprintState) -> dict:
@@ -995,6 +1094,15 @@ async def fix(state: SprintState) -> dict:
     qa_items = [item for item in state.get("qa_report", {}).get("items", []) if item.get("status") == "failed"]
     lead_items = state.get("lead_decision", {}).get("issues", [])
     issues = qa_items + lead_items
+    # 字数精确兜底：不依赖条款文本是否含「字数」关键词。只要需求是「恰好 N 字」
+    # 且 QA 统一口径实测不符，就把精确返工排到修复队列最前，杜绝路由漏判。
+    if kind in ("docx", "pdf"):
+        requested = artifact_quality.contract(state["requirement"], "docx")
+        actual = (state.get("qa_report", {}).get("metrics") or {}).get("counted_characters")
+        if (requested.get("unit") == "字" and requested.get("count_mode") == "exact"
+                and requested.get("count") and isinstance(actual, int) and actual != requested["count"]):
+            issues.insert(0, {"requirement_id": "", "location": "全文", "owner_roster": None,
+                              "problem": f"字数不达标：实测 {actual} 字，要求恰好 {requested['count']} 字。"})
     succeeded = 0
     for issue in issues[:6]:
         requirement_id = issue.get("requirement_id")
@@ -1011,9 +1119,10 @@ async def fix(state: SprintState) -> dict:
             preview = project_agent.snapshot(Path(project_dir), limit=20000)
         meta = {}
         problem_text = f"{issue.get('problem') or ''} {issue.get('location') or ''}"
-        if kind in ("docx", "pdf") and re.search(r"字数|篇幅", problem_text):
-            # 篇幅是全文约束，逐段替换无法收敛；走确定性整篇压缩。
-            patch = {"operation": "refit_length", "location": "全文", "requirement": state["requirement"]}
+        if kind in ("docx", "pdf") and re.search(r"字数|篇幅|恰好.{0,8}字|正文.{0,10}\d+\s*字", problem_text):
+            # 字数按统一口径精确返工：模型按“还差多少字”的确定性反馈迭代重写正文，
+            # 直到恰好命中目标字数（页数等其它篇幅约束仍走确定性压缩）。
+            patch = {"operation": "refit_length_exact", "location": "全文", "requirement": state["requirement"]}
         else:
             patch = await asyncio.to_thread(
                 chat_json,
@@ -1034,7 +1143,7 @@ async def fix(state: SprintState) -> dict:
         if meta.get("fallback_reason") or not isinstance(patch, dict):
             continue
         new_file, reason, detail = await asyncio.to_thread(
-            candidate_revision.apply, sprint_meta.get("id", ""), kind, current["file_name"], patch, project_dir
+            candidate_revision.apply, sprint_meta.get("id", ""), kind, current["file_name"], patch, project_dir, owner
         )
         if not new_file:
             emit({"type": "repair_attempt", "status": "blocked", "reason": reason, "issue": issue})
@@ -1065,6 +1174,14 @@ async def fix(state: SprintState) -> dict:
             )
         emit({"type": "repair_attempt", "status": "ready", "from_candidate": current["id"],
               "to_candidate": revised["id"], "detail": detail, "sha256": digest})
+        # 修复思路对团队可见：定位到哪里、怎么修的
+        thought(
+            owner,
+            f"针对「{str(issue.get('problem') or issue.get('location') or '候选问题')[:60]}」："
+            f"定位到 {str(patch.get('location', '原文位置'))[:30]}，"
+            f"采用{patch.get('operation', 'replace')}完成修复，生成返工候选。",
+            "定点返工",
+        )
         current = revised
         state["candidate_id"] = revised["id"]
         state["candidate_sha256"] = digest
@@ -1163,6 +1280,15 @@ async def wrapup(state: SprintState) -> dict:
     # as completed by a second unconstrained model call.
     set_state(SM, "working", "整理复盘文档")
     summary_text, summary_markdown = retrospective_content(state, accepted, finals)
+    # 复盘结论对团队可见：本轮做得如何、下一步做什么
+    rework = state.get("rework_count", 0)
+    thought(
+        SM,
+        f"本轮复盘：{len(done)}/{len(state['tasks'])} 个任务通过，验收{'通过' if accepted else '未通过'}；"
+        f"共返工 {rework} 轮。" + ("全部任务一次通过，流程顺畅。" if rework == 0 and accepted else
+        "主要改进点：减少返工、提升一次通过率。"),
+        "复盘收尾",
+    )
     summary_file = await asyncio.to_thread(
         forge.render_docx_from_markdown, summary_markdown, "Sprint复盘总结.docx"
     )

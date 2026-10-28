@@ -7,6 +7,7 @@ import { showToast } from '@/store/officeUiStore'
 
 export type OfficeView =
   | 'home'
+  | 'talk'
   | 'tasks'
   | 'agents'
   | 'files'
@@ -33,7 +34,7 @@ export const WORKSPACES: Workspace[] = [
   { label: '协调', roles: [6] },
 ]
 
-let activeView: OfficeView = 'home'
+let activeView: OfficeView = 'talk'
 let activeWorkspace = 0
 let searchOpen = false
 let sprintDialogOpen = false

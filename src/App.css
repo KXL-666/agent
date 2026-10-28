@@ -24,20 +24,44 @@
   align-items: center;
   gap: 10px;
   padding: 2px 8px;
-  font-size: 15px;
-  font-weight: 700;
 }
 
 .brand-mark {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: #e35d4f;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #e35d4f, #c24437);
   color: #fff;
-  font-size: 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    0 2px 6px rgba(227, 93, 79, 0.3);
+}
+
+.brand-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+
+.brand-text strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.brand-text em {
+  font-style: normal;
+  font-size: 11px;
+  color: #9a978f;
+}
+
+[data-theme="dark"] .brand-text em {
+  color: #8b8f89;
 }
 
 .sidebar-search {
@@ -366,6 +390,40 @@
 .system-status {
   justify-content: space-between;
   padding: 0 4px;
+}
+
+/* 侧栏底部齿轮：任务设置入口 */
+.sidebar-gear {
+  border: none;
+  background: transparent;
+  color: #888;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+}
+
+.sidebar-gear:hover {
+  background: #f0f0ee;
+  color: #333;
+}
+
+[data-theme="dark"] .sidebar-gear {
+  color: #7c8087;
+}
+
+[data-theme="dark"] .sidebar-gear:hover {
+  background: #2b2f35;
+  color: #e3e5e1;
+}
+
+.settings-panel {
+  width: 520px;
 }
 
 .section-title {
@@ -724,41 +782,6 @@
   font-size: 10px;
 }
 
-.quick-tools {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-}
-
-.quick-tool {
-  min-height: 42px;
-  border: 1px solid #eceae4;
-  border-radius: 8px;
-  background: #fff;
-  color: #666;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  font: inherit;
-  cursor: pointer;
-}
-
-.quick-tool:hover {
-  background: #f8f7f4;
-  color: #222;
-}
-
-.quick-tool span {
-  font-size: 15px;
-}
-
-.quick-tool strong {
-  font-size: 10px;
-  font-weight: 500;
-}
-
 .office-canvas canvas {
   display: block;
   flex: 1;
@@ -948,55 +971,211 @@
   pointer-events: none;
 }
 
-.toolbar-inner {
+/* ---------- 对话指挥中心页（按 office-command-center 模板） ---------- */
+
+.view-page.talk-page {
+  padding: 0;
+  gap: 0;
+}
+
+.talk-app {
+  height: 100%;
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.talk-head {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.12),
-    0 0 0 1px rgba(0, 0, 0, 0.04);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  pointer-events: auto;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid #e6e8ec;
+  flex-shrink: 0;
 }
 
-.toolbar-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: none;
-  border-radius: 9px;
-  background: transparent;
-  color: #555;
-  padding: 8px 12px;
-  font: inherit;
-  font-size: 12px;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.toolbar-btn:hover {
-  background: #f3f2ef;
-  color: #111;
-}
-
-.toolbar-btn.primary {
-  background: #111;
+.talk-brand {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: #1d2129;
   color: #fff;
-  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 15px;
+  flex-shrink: 0;
 }
 
-.toolbar-btn.primary:hover {
-  background: #333;
+.talk-titles .t { font-size: 15px; font-weight: 600; line-height: 1.3; }
+.talk-titles .s { font-size: 12px; color: #8a919f; }
+.talk-head .spacer { flex: 1; }
+
+.talk-office-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #fff;
+  border: 1px solid #e6e8ec;
+  border-radius: 10px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: #1d2129;
+  cursor: pointer;
+  transition: all .15s;
 }
 
-.toolbar-icon {
-  width: 14px;
-  text-align: center;
-}
+.talk-office-btn:hover { border-color: #c9cdd4; background: #f7f8fa; }
+.talk-office-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; }
+.talk-office-btn .cnt { background: #eef1f6; border-radius: 999px; font-size: 11px; padding: 1px 7px; color: #8a919f; }
+
+/* 消息流 */
+.talk-chat { flex: 1; overflow-y: auto; padding: 20px 24px 12px; scroll-behavior: smooth; }
+.talk-msg { display: flex; gap: 10px; margin-bottom: 20px; align-items: flex-start; }
+.talk-msg.user { flex-direction: row-reverse; }
+.talk-msg-body { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; }
+.talk-msg.user .talk-msg-body { align-items: flex-end; }
+.talk-avatar { width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 600; }
+.talk-bubble { width: fit-content; max-width: 72%; padding: 11px 16px; border-radius: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; font-size: 14px; }
+.talk-msg.user .talk-bubble { background: #f2f3f5; border-top-right-radius: 5px; }
+.talk-msg.ai .talk-bubble { background: #f7f8fa; border-top-left-radius: 5px; }
+.talk-msg-body > .talk-bubble { margin-top: 8px; }
+.talk-msg-body > .talk-think:first-child { margin-top: 0; }
+
+.talk-caret { display: inline-block; width: 2px; height: 15px; background: #1d2129; vertical-align: -2px; margin-left: 2px; animation: talk-blink .8s step-end infinite; }
+@keyframes talk-blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+@keyframes talk-rotate { to { transform: rotate(360deg); } }
+@keyframes talk-rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes talk-sheet-in { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+
+/* 调度记录（思考区，可折叠） */
+.talk-think { margin-top: 8px; width: 72%; max-width: 560px; background: #fff; border: 1px solid #e6e8ec; border-radius: 10px; overflow: hidden; font-size: 12.5px; box-sizing: border-box; }
+.talk-think-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: #8a919f; cursor: pointer; user-select: none; }
+.talk-think-head .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #e6e8ec; border-top-color: #1d2129; animation: talk-rotate .8s linear infinite; }
+.talk-think-body { padding: 0 12px 10px; color: #8a919f; white-space: pre-wrap; display: none; }
+.talk-think.open .talk-think-body { display: block; }
+
+/* 任务交接卡片 */
+.talk-handoff { margin-top: 8px; width: 72%; max-width: 560px; box-sizing: border-box; background: #fff; border: 1px solid #e6e8ec; border-radius: 12px; padding: 10px 12px; display: flex; align-items: center; gap: 11px; box-shadow: 0 2px 8px rgba(29,33,41,.04); animation: talk-rise .25s ease; }
+.talk-handoff .hava { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 600; font-size: 12px; }
+.talk-handoff .hinfo { min-width: 0; flex: 1; }
+.talk-handoff .hname { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.talk-handoff .hname .tag { font-size: 10.5px; color: #8a919f; background: #f2f3f5; border-radius: 4px; padding: 0 6px; font-weight: 400; }
+.talk-handoff .hrole { font-size: 11.5px; color: #8a919f; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.talk-handoff .hst { flex-shrink: 0; font-size: 12px; color: #8a919f; display: flex; align-items: center; gap: 5px; }
+.talk-handoff .hst .loading { width: 11px; height: 11px; border-radius: 50%; border: 2px solid #e6e8ec; border-top-color: #1d2129; animation: talk-rotate .7s linear infinite; }
+.talk-handoff .hst .ok { color: #1bb978; font-weight: 600; }
+.talk-handoff .flow { font-size: 11px; color: #a5adba; margin-right: 2px; }
+
+/* 产物卡片 */
+.talk-artifact { margin-top: 8px; width: 72%; max-width: 560px; box-sizing: border-box; background: #fff; border: 1px solid #e6e8ec; border-radius: 12px; padding: 10px 14px; font-size: 12.5px; }
+.talk-artifact .at { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.talk-artifact .at .file { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.talk-artifact .bar { height: 6px; background: #eef1f6; border-radius: 99px; overflow: hidden; }
+.talk-artifact .bar i { display: block; height: 100%; background: #3b6cff; border-radius: 99px; transition: width .3s; }
+.talk-artifact .ap { margin-top: 6px; color: #8a919f; }
+
+/* 输入区 */
+.talk-foot { border-top: 1px solid #e6e8ec; padding: 14px 24px 16px; flex-shrink: 0; background: #fff; }
+.talk-input-wrap { flex: 1; min-width: 0; display: flex; align-items: flex-end; gap: 10px; background: #f7f8fa; border: 1px solid #e6e8ec; border-radius: 13px; padding: 10px 12px; transition: border-color .2s, box-shadow .2s, background .2s; }
+.talk-input-wrap:focus-within { border-color: #c3c9d4; background: #fff; box-shadow: 0 0 0 3px rgba(59,108,255,.08); }
+.talk-tools { position: relative; flex-shrink: 0; }
+.talk-plus { width: 30px; height: 30px; border: 1px solid #e2e0d8; border-radius: 999px; background: #fff; color: #555; font: inherit; font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.talk-plus:hover { background: #f3f2ef; color: #111; }
+.talk-menu { position: absolute; left: 0; bottom: calc(100% + 8px); z-index: 2; margin: 0; padding: 6px; list-style: none; min-width: 168px; border-radius: 10px; background: #fff; box-shadow: 0 10px 28px rgba(0,0,0,.16), 0 0 0 1px rgba(0,0,0,.05); }
+.talk-menu button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: none; border-radius: 8px; background: transparent; color: #555; font: inherit; font-size: 12px; text-align: left; white-space: nowrap; cursor: pointer; }
+.talk-menu button:hover { background: #f3f2ef; color: #111; }
+.talk-input { flex: 1; min-width: 0; resize: none; border: none; outline: none; background: transparent; color: #1d2129; font-size: 14px; line-height: 1.6; max-height: 150px; font-family: inherit; scrollbar-width: none; -ms-overflow-style: none; }
+.talk-input::-webkit-scrollbar { display: none; }
+.talk-attach-chips { margin: 0 0 8px; }
+.talk-voice { width: 36px; height: 36px; border: 1px solid #e2e0d8; border-radius: 10px; background: #fff; color: #555; font-size: 15px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all .15s; }
+.talk-voice:hover:not(:disabled) { background: #f3f2ef; color: #111; }
+.talk-voice:disabled { opacity: .5; cursor: not-allowed; }
+.talk-voice.listening { background: #eef2ff; border-color: #3b6cff; color: #3b6cff; animation: talk-pulse 1.2s ease-in-out infinite; }
+@keyframes talk-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(59,108,255,.25); } 50% { box-shadow: 0 0 0 5px rgba(59,108,255,0); } }
+.talk-send { width: 36px; height: 36px; border: none; border-radius: 10px; background: #1d2129; color: #fff; font-size: 15px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: opacity .15s, transform .1s; }
+.talk-send:disabled { opacity: .35; cursor: not-allowed; }
+.talk-send:active:not(:disabled) { transform: scale(.95); }
+.talk-send.stop { background: #e5484d; color: #fff; }
+.talk-input-row { display: flex; align-items: flex-end; gap: 10px; }
+.talk-pause { width: 36px; height: 36px; border: 1px solid #e2e0d8; border-radius: 10px; background: #fff; color: #555; font-size: 13px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all .15s; }
+.talk-pause:hover:not(:disabled) { background: #f3f2ef; color: #111; }
+.talk-pause:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 办公室员工浮层 */
+.talk-overlay { position: fixed; inset: 0; background: rgba(29,33,41,.35); display: none; align-items: flex-start; justify-content: center; z-index: 100; padding-top: 8vh; }
+.talk-overlay.show { display: flex; }
+.talk-sheet { width: 440px; max-width: calc(100vw - 32px); background: #fff; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.14); overflow: hidden; animation: talk-sheet-in .2s ease; }
+.talk-sheet-head { padding: 18px 20px 10px; }
+.talk-sheet-head .t { font-size: 17px; font-weight: 700; letter-spacing: .3px; }
+.talk-sheet-head .s { font-size: 12.5px; color: #8a919f; margin-top: 2px; }
+.talk-sheet-list { padding: 4px 10px 12px; max-height: 52vh; overflow-y: auto; }
+.talk-mrow { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 11px; cursor: pointer; position: relative; transition: background .12s; width: 100%; border: none; background: transparent; font: inherit; text-align: left; color: inherit; }
+.talk-mrow:hover { background: #f5f6f8; }
+.talk-mrow.active { background: linear-gradient(90deg, #eef2ff, #f5f3ff); }
+.talk-mrow .mava { width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 12px; }
+.talk-mrow .minfo { flex: 1; min-width: 0; }
+.talk-mrow .mname { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.talk-mrow .mname .badge { font-size: 10.5px; border-radius: 4px; padding: 1px 6px; font-weight: 500; }
+.talk-mrow .mname .badge.sub { background: #eef1f6; color: #6b7280; }
+.talk-mrow .mrole { font-size: 12px; color: #8a919f; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.talk-mrow .mst { width: 9px; height: 9px; border-radius: 50%; background: #d7dae0; flex-shrink: 0; }
+.talk-mrow.online .mst { background: #34d399; }
+.talk-mrow.active .mst { background: #3b6cff; box-shadow: 0 0 0 4px rgba(59,108,255,.15); }
+.talk-sheet-foot { border-top: 1px solid #e6e8ec; padding: 10px 16px; display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: #8a919f; }
+.talk-sheet-foot .auto-chip { margin-left: auto; display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; color: #1d2129; }
+.talk-sheet-foot .auto-chip input { accent-color: #3b6cff; width: 14px; height: 14px; cursor: pointer; }
+
+/* 对话页暗色主题 */
+[data-theme="dark"] .talk-head { border-bottom-color: #363a40; }
+[data-theme="dark"] .talk-titles .s { color: #7c8087; }
+[data-theme="dark"] .talk-office-btn { background: #23262b; border-color: #3a3e45; color: #e3e5e1; }
+[data-theme="dark"] .talk-office-btn:hover { background: #2b2f35; border-color: #4a4e55; }
+[data-theme="dark"] .talk-office-btn .cnt { background: #2b2f35; color: #9aa0a8; }
+[data-theme="dark"] .talk-msg.user .talk-bubble { background: #2b2f35; }
+[data-theme="dark"] .talk-msg.ai .talk-bubble { background: #2b2f35; }
+[data-theme="dark"] .talk-caret { background: #e3e5e1; }
+[data-theme="dark"] .talk-think { background: #1d2024; border-color: #363a40; }
+[data-theme="dark"] .talk-think-head { color: #9aa0a8; }
+[data-theme="dark"] .talk-think-head .spin { border-color: #3a3e45; border-top-color: #e3e5e1; }
+[data-theme="dark"] .talk-think-body { color: #9aa0a8; }
+[data-theme="dark"] .talk-handoff { background: #1d2024; border-color: #363a40; box-shadow: none; }
+[data-theme="dark"] .talk-handoff .hname .tag { background: #2b2f35; color: #9aa0a8; }
+[data-theme="dark"] .talk-handoff .hrole { color: #9aa0a8; }
+[data-theme="dark"] .talk-handoff .hst { color: #9aa0a8; }
+[data-theme="dark"] .talk-handoff .hst .loading { border-color: #3a3e45; border-top-color: #e3e5e1; }
+[data-theme="dark"] .talk-artifact { background: #1d2024; border-color: #363a40; }
+[data-theme="dark"] .talk-artifact .bar { background: #2b2f35; }
+[data-theme="dark"] .talk-artifact .ap { color: #9aa0a8; }
+[data-theme="dark"] .talk-foot { border-top-color: #363a40; background: transparent; }
+[data-theme="dark"] .talk-input-wrap { background: #1d2024; border-color: #363a40; }
+[data-theme="dark"] .talk-input-wrap:focus-within { background: #23262b; border-color: #4a4e55; }
+[data-theme="dark"] .talk-input { color: #e3e5e1; }
+[data-theme="dark"] .talk-voice { background: #23262b; border-color: #3a3e45; color: #c9ccc6; }
+[data-theme="dark"] .talk-voice:hover:not(:disabled) { background: #2b2f35; color: #f0f1ee; }
+[data-theme="dark"] .talk-voice.listening { background: #25304a; border-color: #6b8cff; color: #6b8cff; }
+[data-theme="dark"] .talk-plus { background: #23262b; border-color: #3a3e45; color: #c9ccc6; }
+[data-theme="dark"] .talk-plus:hover { background: #2b2f35; color: #f0f1ee; }
+[data-theme="dark"] .talk-menu { background: #23262b; box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.06); }
+[data-theme="dark"] .talk-menu button { color: #c9ccc6; }
+[data-theme="dark"] .talk-menu button:hover { background: #2b2f35; color: #f0f1ee; }
+[data-theme="dark"] .talk-send { background: #e8e9e6; color: #17181a; }
+[data-theme="dark"] .talk-send.stop { background: #e5484d; color: #fff; }
+[data-theme="dark"] .talk-pause { background: #23262b; border-color: #3a3e45; color: #c9ccc6; }
+[data-theme="dark"] .talk-pause:hover:not(:disabled) { background: #2b2f35; color: #f0f1ee; }
+[data-theme="dark"] .talk-sheet { background: #23262b; }
+[data-theme="dark"] .talk-sheet-head .s { color: #9aa0a8; }
+[data-theme="dark"] .talk-mrow:hover { background: #2b2f35; }
+[data-theme="dark"] .talk-mrow.active { background: linear-gradient(90deg, #25304a, #2c2a45); }
+[data-theme="dark"] .talk-mrow .mname .badge.sub { background: #2b2f35; color: #9aa0a8; }
+[data-theme="dark"] .talk-mrow .mrole { color: #9aa0a8; }
+[data-theme="dark"] .talk-mrow .mst { background: #3a3e45; }
+[data-theme="dark"] .talk-sheet-foot { border-top-color: #363a40; color: #9aa0a8; }
+[data-theme="dark"] .talk-sheet-foot .auto-chip { color: #e3e5e1; }
 
 @media (max-width: 1180px) {
   .office-sidebar {
@@ -3082,6 +3261,37 @@ button.sidebar-search:hover {
   font-size: 11px;
 }
 
+.task-detail-thoughts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.task-detail-thoughts li {
+  padding: 8px 10px;
+  border-left: 3px solid #e8cf8a;
+  border-radius: 6px;
+  background: #fff9e8;
+}
+
+.task-detail-thoughts li p {
+  margin: 3px 0 0;
+  color: #57534e;
+}
+
+[data-theme="dark"] .task-detail-thoughts li {
+  background: rgba(232, 207, 138, 0.08);
+  border-left-color: #8a7340;
+}
+
+[data-theme="dark"] .task-detail-thoughts li p {
+  color: #d6d3d1;
+}
+
 /* ------------------------------ 直接生成进度 ------------------------------ */
 
 .artifact-gen-progress {
@@ -3361,50 +3571,6 @@ button.sidebar-search:hover {
 
 .tone-gray {
   background: #9ca3af;
-}
-
-/* ---------- 底部工具栏：运行中补充指示 ---------- */
-
-.toolbar-instruct {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 8px;
-  padding-left: 10px;
-  border-left: 1px solid #eceae4;
-}
-
-.toolbar-instruct input {
-  width: 240px;
-  border: 1px solid #e2e0d8;
-  border-radius: 8px;
-  padding: 7px 10px;
-  font: inherit;
-  font-size: 12px;
-}
-
-.toolbar-instruct input:focus {
-  outline: 2px solid #86efac;
-  border-color: transparent;
-}
-
-.toolbar-instruct button {
-  border: 1px solid #e2e0d8;
-  background: #fff;
-  border-radius: 8px;
-  padding: 7px 12px;
-  font-size: 12px;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.toolbar-instruct button:hover:not(:disabled) {
-  background: #f3f2ef;
-}
-
-.toolbar-instruct button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
 }
 
 /* ---------- 侧栏：备份导入导出 ---------- */
@@ -3926,17 +4092,6 @@ button.sidebar-search:hover {
   color: #6f736d;
 }
 
-[data-theme="dark"] .quick-tool {
-  background: #23262b;
-  border-color: #363a40;
-  color: #9aa09a;
-}
-
-[data-theme="dark"] .quick-tool:hover {
-  background: #2b2f35;
-  color: #e3e5e1;
-}
-
 /* ---- 底部悬浮工具栏 ---- */
 
 [data-theme="dark"] .toolbar-inner {
@@ -3944,28 +4099,6 @@ button.sidebar-search:hover {
   box-shadow:
     0 8px 24px rgba(0, 0, 0, 0.45),
     0 0 0 1px rgba(255, 255, 255, 0.06);
-}
-
-[data-theme="dark"] .toolbar-btn {
-  color: #c9ccc6;
-}
-
-[data-theme="dark"] .toolbar-btn:hover {
-  background: #2b2f35;
-  color: #f0f1ee;
-}
-
-[data-theme="dark"] .toolbar-btn.primary {
-  background: #e8e9e6;
-  color: #17181a;
-}
-
-[data-theme="dark"] .toolbar-btn.primary:hover {
-  background: #ffffff;
-}
-
-[data-theme="dark"] .toolbar-instruct {
-  border-left-color: #363a40;
 }
 
 /* ---- 画布上的小人操作菜单 ---- */
@@ -4258,7 +4391,6 @@ button.sidebar-search:hover {
 [data-theme="dark"] .sprint-dialog textarea,
 [data-theme="dark"] .config-field input,
 [data-theme="dark"] .config-field select,
-[data-theme="dark"] .toolbar-instruct input,
 [data-theme="dark"] .chat-input-row input,
 [data-theme="dark"] .artifact-gen-form input,
 [data-theme="dark"] .artifact-generator textarea,
@@ -4807,8 +4939,12 @@ button.sidebar-search:hover {
 
   .sidebar-brand {
     padding: 2px 4px;
-    font-size: 13px;
     white-space: nowrap;
+  }
+
+  /* 移动端顶栏空间紧，副标题隐藏 */
+  .brand-text em {
+    display: none;
   }
 
   .sidebar-search,
@@ -4967,7 +5103,6 @@ button.sidebar-search:hover {
     display: none;
   }
 
-  .office-bottom-toolbar .toolbar-inner { display: none; }
   .office-bottom-toolbar { display: block; }
   .mobile-task-controls { display: flex; gap: 8px; overflow-x: auto; padding: 8px; }
   .mobile-task-controls button { flex: 0 0 auto; min-height: 40px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border-color, #d4d4d4); background: var(--panel-bg, #fff); color: inherit; }
@@ -5214,6 +5349,87 @@ button.sidebar-search:hover {
   text-align: center;
   font-size: 12px;
   color: #a8a29e;
+}
+
+/* 单飞任务卡片：指派任务后在聊天流中展示执行状态 */
+.chat-task-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid #e3e0da;
+  background: #fafaf8;
+}
+
+.chat-task-card.is-running {
+  border-color: #d8c58a;
+  background: #fdf8ec;
+}
+
+.chat-task-card.is-done {
+  border-color: #b7dcc0;
+  background: #f1f9f2;
+}
+
+.chat-task-card.is-failed {
+  border-color: #ecc0bd;
+  background: #fdf2f1;
+}
+
+.chat-task-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.chat-task-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chat-task-body strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-task-status {
+  font-size: 11px;
+  color: #8a8a86;
+}
+
+.chat-task-open {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 12px;
+}
+
+[data-theme="dark"] .chat-task-card {
+  border-color: #3d4148;
+  background: #23262b;
+}
+
+[data-theme="dark"] .chat-task-card.is-running {
+  border-color: #6b5d33;
+  background: #2b2a22;
+}
+
+[data-theme="dark"] .chat-task-card.is-done {
+  border-color: #2f5237;
+  background: #202a22;
+}
+
+[data-theme="dark"] .chat-task-card.is-failed {
+  border-color: #643a37;
+  background: #2c2221;
+}
+
+[data-theme="dark"] .chat-task-status {
+  color: #9a9a94;
 }
 
 [data-theme="dark"] .config-backup {

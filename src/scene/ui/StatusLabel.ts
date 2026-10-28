@@ -21,7 +21,8 @@ const TASK_STYLE = {
   fontStyle: 'italic' as const,
 }
 
-const STATE_COLORS: Record<string, number> = {
+/** 成员状态配色：标签状态点与工位座位灯共用 */
+export const STATE_COLORS: Record<string, number> = {
   idle: 0xaaaaaa,
   walking: 0x4a90d9,
   working: 0x50b86c,

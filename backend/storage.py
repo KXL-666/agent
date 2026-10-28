@@ -418,13 +418,13 @@ def list_artifacts(sprint_id: str) -> list[dict]:
 
 
 def list_deliverables() -> list[dict]:
-    """所有 Sprint 的最终交付物与独立生成成品，附带所属需求和日期。"""
+    """所有 Sprint 的最终交付物、独立生成成品与单飞产物，附带所属需求和日期。"""
     with _lock, _conn() as conn:
         rows = conn.execute(
             """SELECT a.*, s.requirement AS sprint_requirement,
                       s.started_at AS sprint_started_at
                FROM artifacts a LEFT JOIN sprints s ON s.id=a.sprint_id
-               WHERE a.kind IN ('final', 'custom')
+               WHERE a.kind IN ('final', 'custom') OR a.sprint_id = 'solo'
                ORDER BY COALESCE(s.started_at, a.created_at) DESC,
                         a.title COLLATE NOCASE ASC, a.created_at DESC"""
         ).fetchall()

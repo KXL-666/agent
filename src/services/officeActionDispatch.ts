@@ -1,4 +1,4 @@
-import { isOfficePaused, playAgentEmote, setAgentState } from '@/scene/officeSceneBridge'
+import { isOfficePaused, playAgentEmote, setAgentState, showAgentThought } from '@/scene/officeSceneBridge'
 import { submitVisitAction } from '@/services/officeActionDispatcher'
 import { notifySprintOutcome } from '@/services/officeNotify'
 import { playDoneSound, playTaskSound } from '@/services/officeSound'
@@ -12,7 +12,9 @@ import {
   type OfficeArtifact,
 } from '@/store/officeArtifactStore'
 import { clearNotifications, recordNotification, restoreNotifications } from '@/store/officeEventStore'
+import { appendAssistantMessage, updateTaskMessage } from '@/store/officeChatStore'
 import { getOfficeAgents } from '@/store/officeStore'
+import { addThought, clearThoughts } from '@/store/officeThoughtStore'
 import { pulseArtifacts, showToast } from '@/store/officeUiStore'
 import {
   getViewedSprint,
@@ -25,6 +27,7 @@ import {
   applyTaskSnapshot,
   getSprintMetaSnapshot,
   getTasksSnapshot,
+  isSprintRunning,
   pushActivity,
   resetSprintMeta,
   setSprintMetaCost,
@@ -39,9 +42,9 @@ import type {
   SprintMetaPayload,
 } from '@/types/officeAction'
 
-type EmoteCapable = Extract<
-  OfficeActionMessage,
-  { rosterNo?: number; agentId?: string }
+type EmoteCapable = Exclude<
+  Extract<OfficeActionMessage, { rosterNo?: number }>,
+  { type: 'thought' }
 >
 
 function resolveAgentId(message: EmoteCapable): string | undefined {
@@ -68,8 +71,9 @@ function mergeTaskLabel(agentId: string, task?: string): string | undefined {
   const set = activeTasksByAgent.get(agentId) ?? new Set<string>()
   set.add(task)
   activeTasksByAgent.set(agentId, set)
-  // 最多展示最近 2 个任务，避免状态牌超长
-  return [...set].slice(-2).join(' + ')
+  // 最多展示最近 2 个任务标题，更多时追加总数，避免状态牌超长
+  const labels = [...set].slice(-2).join(' + ')
+  return set.size > 2 ? `${labels}（共 ${set.size} 项）` : labels
 }
 
 function dropTaskLabel(agentId: string, title?: string) {
@@ -144,6 +148,36 @@ function restoredEventDetail(event: Record<string, unknown>): { title?: string; 
     }
     case 'instruction_added':
       return { title: '补充指示', detail: String(event.text ?? '未提供指示内容') }
+    case 'thought': {
+      const rosterNo = Number(event.rosterNo ?? 0)
+      const name = AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
+      const phase = event.phase ? String(event.phase) : ''
+      return {
+        title: `${name} 的决策依据${phase ? ` · ${phase}` : ''}`,
+        detail: String(event.thought ?? ''),
+      }
+    }
+    case 'handoff': {
+      const handoff = (event.handoff ?? {}) as {
+        from_roster?: number
+        to_roster?: number
+        claims?: string[]
+        open_questions?: string[]
+        status?: string
+        reason?: string
+      }
+      const fromName = AGENT_ROSTER[Number(handoff.from_roster) - 1]?.name ?? `#${handoff.from_roster}`
+      const toName = AGENT_ROSTER[Number(handoff.to_roster) - 1]?.name ?? `#${handoff.to_roster}`
+      return {
+        title: `交接 · ${fromName} → ${toName}`,
+        detail: [
+          `状态：${handoff.status ?? '未知'}`,
+          handoff.claims?.length ? `声明：${handoff.claims.join('；')}` : '',
+          handoff.open_questions?.length ? `待确认：${handoff.open_questions.join('；')}` : '',
+          handoff.reason ? `说明：${handoff.reason}` : '',
+        ].filter(Boolean).join('\n'),
+      }
+    }
     case 'plan_fallback':
       return { title: '拆解兜底原因', detail: String(event.reason ?? '未提供具体原因') }
     case 'budget_exceeded':
@@ -185,6 +219,22 @@ function eventToText(event: Record<string, unknown>): string {
       const hostName = AGENT_ROSTER[Number(event.host) - 1]?.name ?? `#${event.host}`
       return `${visitorName} → ${hostName}：${String(event.message ?? '')}`
     }
+    case 'thought': {
+      const rosterNo = Number(event.rosterNo ?? 0)
+      const name = AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
+      const text = String(event.thought ?? '')
+      const phase = event.phase ? String(event.phase) : ''
+      return text
+        ? `💭 ${name}${phase ? `（${phase}）` : ''}：${text.length > 60 ? `${text.slice(0, 60)}…` : text}`
+        : ''
+    }
+    case 'handoff': {
+      const handoff = (event.handoff ?? {}) as { task_id?: string; from_roster?: number; to_roster?: number; claims?: string[] }
+      if (handoff.task_id) return '' // 任务级交接不在时间线恢复，避免刷屏
+      const fromName = AGENT_ROSTER[Number(handoff.from_roster) - 1]?.name ?? `#${handoff.from_roster}`
+      const toName = AGENT_ROSTER[Number(handoff.to_roster) - 1]?.name ?? `#${handoff.to_roster}`
+      return `🤝 ${fromName} → ${toName}：${(handoff.claims ?? []).join('；') || '交接'}`
+    }
     case 'task_update': {
       const task = (event.task ?? {}) as { title?: string; id?: string; status?: string }
       return `「${task.title ?? task.id ?? ''}」${task.status ?? ''}`
@@ -223,6 +273,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
         visitor: message.visitor,
         host: message.host,
         message: message.message,
+        lines: message.lines,
       })
       const visitorName =
         AGENT_ROSTER[message.visitor - 1]?.name ?? `#${message.visitor}`
@@ -230,6 +281,50 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       const visitText = `${visitorName} → ${hostName}：${message.message}`
       pushActivity(visitText)
       recordNotification(visitText, 'desk_visit')
+      return
+    }
+    case 'thought': {
+      // 成员决策依据：入思考流 store + 场景头顶思考泡 + 通知中心可回溯全文
+      const rosterNo = Number(message.rosterNo ?? 0)
+      const text = String(message.thought ?? '').trim()
+      if (!rosterNo || !text) return
+      const phase = String(message.phase ?? '')
+      const taskId = message.taskId ? String(message.taskId) : undefined
+      addThought({ rosterNo, thought: text, phase, taskId })
+      const agentId = getOfficeAgents()[rosterNo - 1]?.id
+      if (agentId) showAgentThought(agentId, text)
+      const name = AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
+      recordNotification(
+        `💭 ${name}${phase ? `（${phase}）` : ''}：${text.length > 60 ? `${text.slice(0, 60)}…` : text}`,
+        'thought',
+        { title: `${name} 的决策依据${phase ? ` · ${phase}` : ''}`, detail: text },
+      )
+      return
+    }
+    case 'handoff': {
+      // 交接叙事：仅阶段级交接（无 task_id）进通知中心，任务级交接由气泡与任务卡覆盖
+      const handoff = (message as { handoff?: Record<string, unknown> }).handoff
+      if (!handoff || handoff.task_id) return
+      const fromName = AGENT_ROSTER[Number(handoff.from_roster) - 1]?.name ?? `#${handoff.from_roster}`
+      const toName = AGENT_ROSTER[Number(handoff.to_roster) - 1]?.name ?? `#${handoff.to_roster}`
+      const claims = Array.isArray(handoff.claims) ? handoff.claims.join('；') : ''
+      const statusText = String(handoff.status ?? '')
+      const statusLabel = statusText === 'accepted' ? '已接收' : statusText === 'ready' ? '待接收' : statusText
+      recordNotification(
+        `🤝 ${fromName} → ${toName}：${claims || '交接'}（${statusLabel}）`,
+        'handoff',
+        {
+          title: `交接 · ${fromName} → ${toName}`,
+          detail: [
+            `状态：${statusLabel}`,
+            claims ? `声明：${claims}` : '',
+            Array.isArray(handoff.open_questions) && handoff.open_questions.length
+              ? `待确认：${handoff.open_questions.join('；')}`
+              : '',
+            handoff.reason ? `说明：${handoff.reason}` : '',
+          ].filter(Boolean).join('\n'),
+        },
+      )
       return
     }
     case 'desk_visit_tour': {
@@ -246,8 +341,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
     case 'set_state': {
       const update = message as Extract<OfficeActionMessage, { type: 'set_state' }>
       // Sprint 完成后会有后台复盘事件；不要让它把已结束团队重新标成工作中。
-      // 独立产物生成有自己的起止事件，仍可准确显示负责人状态。
-      if (sprintTerminal && update.source !== 'artifact_generation') return
+      // 独立产物生成与单兵任务有自己的起止事件，仍可准确显示负责成员状态。
+      if (sprintTerminal && update.source !== 'artifact_generation' && update.source !== 'solo_task') return
       const agentId = resolveAgentId(message)
       if (!agentId) {
         console.warn('[OfficeWS] set_state: agent not found', message)
@@ -268,6 +363,57 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
         return
       }
       playAgentEmote(agentId, message.animation, message.label)
+      return
+    }
+    case 'solo_task_update': {
+      // 单兵任务完成/失败：摘掉状态牌（保留其他进行中任务）、更新聊天任务卡片、成员回话
+      const update = message as Extract<OfficeActionMessage, { type: 'solo_task_update' }>
+      const rosterNo = Number(update.roster ?? 0)
+      const agentId = getOfficeAgents()[rosterNo - 1]?.id
+      if (agentId) {
+        dropTaskLabel(agentId, `单飞·${String(update.title ?? '').slice(0, 16)}`)
+        const remaining = activeTasksByAgent.get(agentId)
+        if (remaining && remaining.size > 0) {
+          const labels = [...remaining].slice(-2).join(' + ')
+          setAgentState(
+            agentId,
+            'working',
+            remaining.size > 2 ? `${labels}（共 ${remaining.size} 项）` : labels,
+          )
+        } else {
+          activeTasksByAgent.delete(agentId)
+          setAgentState(agentId, 'idle', '等待新任务')
+        }
+      }
+      if (rosterNo && update.task_id) {
+        updateTaskMessage(
+          rosterNo,
+          update.task_id,
+          update.status === 'failed' ? 'failed' : 'done',
+          update.artifact_id ?? null,
+        )
+        if (update.summary) {
+          appendAssistantMessage(rosterNo, String(update.summary), update.status === 'failed' ? 'mock' : 'llm')
+        }
+      }
+      const name = AGENT_ROSTER[rosterNo - 1]?.name ?? `#${rosterNo}`
+      const title = String(update.title ?? '单飞任务')
+      if (update.status === 'failed') {
+        playTaskSound()
+        showToast(`❌ ${name} 的单飞任务失败：${title}`)
+        recordNotification(`${name} 的单飞任务失败：${title}`, 'solo_task_update', {
+          title: `单飞任务失败 · ${title}`,
+          detail: String(update.summary ?? ''),
+        })
+      } else {
+        playTaskSound()
+        pulseArtifacts()
+        showToast(`✅ ${name} 完成单飞任务：${title}`, { kind: 'success' })
+        recordNotification(`${name} 完成单飞任务：${title}`, 'solo_task_update', {
+          title: `单飞任务完成 · ${title}`,
+          detail: String(update.summary ?? ''),
+        })
+      }
       return
     }
     case 'task_update': {
@@ -316,6 +462,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       activeTasksByAgent.clear()
       idleAllAgents()
       clearNotifications()
+      clearThoughts()
       setSprintRunning(true)
       applyTaskSnapshot([])
       clearArtifacts()
@@ -355,7 +502,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       const artifact = (message as { artifact?: OfficeArtifact }).artifact
       if (!artifact) return
       const viewed = getViewedSprint() || getSprintMetaSnapshot().id
-      if (!artifact.sprint_id || !viewed || artifact.sprint_id === viewed) upsertArtifact(artifact)
+      // 单飞产物（sprint_id='solo'）不入当前 Sprint 看板，但照常入产物 store 供交付面板刷新
+      if (!artifact.sprint_id || !viewed || artifact.sprint_id === viewed || artifact.sprint_id === 'solo') upsertArtifact(artifact)
       void refreshSprintHistory()
       const recordKinds = new Set(['prd', 'dev', 'test', 'review', 'summary'])
       const record = recordKinds.has(artifact.kind)
@@ -454,6 +602,25 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       })
       showToast(errorText)
       notifySprintOutcome('error', getSprintMetaSnapshot().requirement)
+      return
+    }
+    case 'sprint_end': {
+      // 后端在每轮运行 finally 中发出的最后一个事件，作为终态收敛点：
+      // 即使 sprint_done/stopped/error 因瞬断丢失，也能保证面板退出「进行中」。
+      sprintTerminal = true
+      const endPayload = message as { sprint_id?: unknown; status?: unknown; stage?: unknown }
+      const wasRunning = isSprintRunning()
+      setSprintRunning(false)
+      idleAllAgents()
+      // 只采纳与当前轮次匹配的 meta，忽略可能迟到的旧轮次信号
+      if (!endPayload.sprint_id || String(endPayload.sprint_id) === getSprintMetaSnapshot().id) {
+        applySprintMeta({
+          ...(endPayload.status ? { status: String(endPayload.status) } : {}),
+          ...(endPayload.stage ? { stage: String(endPayload.stage) } : {}),
+        })
+      }
+      // 正常路径下 sprint_done 已刷新过历史；仅在遗漏终态事件时补拉
+      if (wasRunning) void refreshSprintHistory()
       return
     }
     case 'plan_fallback': {

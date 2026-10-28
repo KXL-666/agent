@@ -36,9 +36,22 @@ def _inferred_acceptance_method(fragment: str, kind: str) -> str:
     page_count = re.search(r"(?:恰好|正好|共)\s*(\d+)\s*页", text)
     if page_count:
         return f"检查最终文件真实页数，要求恰好 {page_count.group(1)} 页。"
+    char_count = re.search(r"(?:(不少于|至少|不超过|最多|约|恰好|正好)\s*)?(\d{1,5})\s*字", text)
+    if char_count:
+        mode = char_count.group(1) or "恰好"
+        return (f"按统一口径（汉字+英文/数字词，剔除标题段）检查正文字数，要求{mode} {char_count.group(2)} 字；"
+                "字数由本地机械统计判定，不依赖模型估算。")
+    if kind in ("docx", "pdf", "pptx", "xlsx"):
+        title = re.search(r"标题\s*[《\"「『]([^》\"」』]+)[》\"」』]", text)
+        if title:
+            return f"检查文档标题样式段落包含《{title.group(1)}》原文文字。"
+        if re.search(r"(?:生成|制作|撰写|写|输出|交付).{0,12}(?:文档|报告|word|docx|ppt|excel|pdf)", text, re.I):
+            return "检查最终产物为可正常打开的指定类型文件，且含与需求相关的实际正文内容。"
     if "不要封面" in text or "不带封面" in text or "无封面" in text:
         return "检查真实分页与首页内容，确认没有独立封面页；无法取得分页证据时标记 unchecked。"
-    if any(term in text for term in ("团队协作", "六智能体", "六人协作")):
+    if re.search(r"(?:不要|不带|无需|无)\s*目录", text):
+        return "检查最终文件结构中不存在目录字段或目录样式段落；无法读取文件结构时标记 unchecked。"
+    if re.search(r"团队(?:协作|合作)(?:完成|开发|产出|撰写)|由.{0,6}团队.{0,4}(?:完成|协作)|六智能体|六人协作", text):
         return "核对本次 Sprint 的有效角色贡献、候选交接记录和最终候选哈希；缺少任一证据时标记 unchecked。"
     if kind == "code":
         if "README" in text and any(term in text for term in ("测试", "断言")):

@@ -1,10 +1,18 @@
 import type { AgentState } from '@/types/agent'
 
+/** 多回对对话剧本中的一句：speaker 为访客或被访者 */
+export type OfficeDialogLine = {
+  speaker: 'visitor' | 'host'
+  text: string
+}
+
 export type OfficeActionDeskVisit = {
   type: 'desk_visit'
   visitor: number
   host: number
   message: string
+  /** 多回合对话剧本（可选）：前端按节拍分播，缺省时按单句 message 展示 */
+  lines?: OfficeDialogLine[]
 }
 
 export type OfficeActionDeskVisitTour = {
@@ -21,8 +29,8 @@ export type OfficeActionSetState = {
   /** 名册序号，从 1 开始 */
   rosterNo?: number
   agentId?: string
-  /** 非 Sprint 的文件生成状态，可在上一轮结束后独立更新负责成员。 */
-  source?: 'artifact_generation'
+  /** 非 Sprint 的状态更新（独立产物生成 / 单兵任务），Sprint 结束后仍可更新负责成员。 */
+  source?: 'artifact_generation' | 'solo_task'
 }
 
 export type OfficeActionEmote = {
@@ -32,6 +40,36 @@ export type OfficeActionEmote = {
   label?: string
   rosterNo?: number
   agentId?: string
+}
+
+/** 成员思考/决策依据事件：让「为什么这么做」对用户可见 */
+export type OfficeActionThought = {
+  type: 'thought'
+  rosterNo: number
+  thought: string
+  /** 所处阶段，如「需求拆解」「并行开发」 */
+  phase?: string
+  /** 关联任务 ID（可选） */
+  taskId?: string
+}
+
+/** 交接事件：offer/receive 时推送，前端仅将阶段级交接（无 task_id）记入通知中心 */
+export type OfficeActionHandoff = {
+  type: 'handoff'
+  handoff: {
+    id: number
+    sprint_id: string
+    task_id: string
+    from_roster: number
+    to_roster: number
+    claims: string[]
+    open_questions?: string[]
+    acceptance_criteria?: string[]
+    status: string
+    reason?: string
+    version?: number
+  }
+  sprint_id?: string
 }
 
 /** 任务面板数据事件 */
@@ -98,6 +136,7 @@ export type OfficeActionSprintEvent = {
     | 'sprint_done'
     | 'sprint_stopped'
     | 'sprint_error'
+    | 'sprint_end'
     | 'hello'
     | 'plan_fallback'
     | 'budget_exceeded'
@@ -120,11 +159,24 @@ export type OfficeActionHello = {
   usage?: unknown
 }
 
+/** 单兵任务（单飞）进度事件：完成/失败时推送，更新聊天任务卡片 */
+export type OfficeActionSoloTaskUpdate = {
+  type: 'solo_task_update'
+  roster: number
+  task_id: string
+  title: string
+  status: 'done' | 'failed'
+  artifact_id?: string | null
+  summary?: string
+}
+
 export type OfficeActionMessage =
   | OfficeActionDeskVisit
   | OfficeActionDeskVisitTour
   | OfficeActionSetState
   | OfficeActionEmote
+  | OfficeActionThought
+  | OfficeActionHandoff
   | OfficeActionTaskUpdate
   | OfficeActionArtifactNew
   | OfficeActionArtifactUpdate
@@ -132,3 +184,4 @@ export type OfficeActionMessage =
   | OfficeActionSprintUsage
   | OfficeActionSprintEvent
   | OfficeActionHello
+  | OfficeActionSoloTaskUpdate

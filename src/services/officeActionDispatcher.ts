@@ -69,7 +69,7 @@ function executeVisit(
   dispatchLocked = true
 
   if (message.type === 'desk_visit') {
-    requestDeskVisit(message.visitor, message.host, message.message)
+    requestDeskVisit(message.visitor, message.host, message.message, message.lines)
     return
   }
   requestDeskVisitTour(

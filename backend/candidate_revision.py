@@ -1,6 +1,7 @@
 """Apply one located repair to a copy of a candidate; preserve other parts."""
 
 import hashlib
+import json
 from contextlib import closing
 import re
 import shutil
@@ -34,6 +35,78 @@ def _replace_once(texts: list[tuple[object, str]], old: str, new: str) -> bool:
     return True
 
 
+def _rebuild_textual(kind: str, target: Path, spec: str, content: str) -> bool:
+    """由同源 Markdown 重新渲染 Word/PDF。"""
+    if kind == "pdf":
+        from pdf_builder import build_pdf
+        return bool(build_pdf(forge._parse_docx_markdown(content), str(target)))
+    cover = bool(artifact_quality.contract(spec, "docx").get("cover"))
+    return bool(forge._build_docx(content, str(target), cover=cover))
+
+
+def _split_markdown(content: str) -> tuple[list[str], str]:
+    """把同源 Markdown 拆成标题行与正文；字数口径只统计正文。"""
+    lines = content.splitlines()
+    heads = [line for line in lines if line.strip().startswith("#")]
+    body = "\n".join(line for line in lines if not line.strip().startswith("#")).strip()
+    return heads, body
+
+
+def _llm_exact_fit(markdown: str, spec: str, target: int, roster: int | None) -> str:
+    """LLM 按“还差多少字”的确定性反馈把正文精确重写到目标字数，最多 3 轮收敛。"""
+    import llm
+    heads, body = _split_markdown(markdown)
+    current = artifact_quality.counted_length(forge._docx_prose(markdown))
+    for _ in range(3):
+        if current == target:
+            break
+        delta = target - current
+        meta: dict = {}
+        resp = llm.chat_json(
+            "你是严谨的文字编辑。把正文精确改写到目标字数。"
+            "字数统一口径：汉字 + 英文/数字词，不含标点、空格、换行与标题。"
+            f"当前正文 {current} 字，目标恰好 {target} 字，需{'增加' if delta > 0 else '减少'} {abs(delta)} 字。"
+            "只输出 JSON {\"body\":\"新正文\"}，body 只含正文段落（不含任何标题），段落间用换行分隔。"
+            "内容须自然连贯、紧扣主题、信息完整；不得重复堆砌，不得出现字数自报或编辑说明，不得保留 Markdown 标记。",
+            json.dumps({"target": target, "current": current, "headings": heads, "body": body},
+                       ensure_ascii=False),
+            fallback={}, roster=roster, meta=meta, max_tokens=6500, timeout=180,
+        )
+        new_body = str((resp or {}).get("body") or "").strip()
+        if not new_body:
+            break
+        body = new_body
+        markdown = "\n".join(heads + [body])
+        current = artifact_quality.counted_length(forge._docx_prose(markdown))
+    return markdown
+
+
+def _refit_length_exact(kind: str, source: Path, target: Path, spec: str, roster: int | None) -> tuple[str | None, str, dict]:
+    """字数精确返工：LLM 迭代重写同源正文，直到统一口径恰好等于目标字数。"""
+    source_markdown = artifact_quality.report_directory(source, forge.WORKSPACE_DIR) / "source.md"
+    if kind not in ("docx", "pdf") or not source_markdown.is_file():
+        return None, "篇幅返工需要 Word/PDF 的同源正文", {}
+    requested = artifact_quality.contract(spec, "docx")
+    target_count = int(requested.get("count") or 0)
+    if not target_count:
+        return None, "缺少目标字数，无法精确返工", {}
+    content = source_markdown.read_text(encoding="utf-8")
+    before = artifact_quality.counted_length(forge._docx_prose(content))
+    updated = _llm_exact_fit(content, spec, target_count, roster)
+    after = artifact_quality.counted_length(forge._docx_prose(updated))
+    if after == before:
+        return None, f"篇幅 {before} 字未能改写收敛（模型未返回有效正文）", {"before": before, "after": after}
+    if not _rebuild_textual(kind, target, spec, updated):
+        return None, "篇幅返工重新渲染失败", {}
+    target_quality = artifact_quality.report_directory(target, forge.WORKSPACE_DIR)
+    target_quality.mkdir(parents=True, exist_ok=True)
+    (target_quality / "source.md").write_text(updated, encoding="utf-8")
+    detail = {"location": "全文", "before": before, "after": after, "target": target_count}
+    exact = "已精确命中" if after == target_count else f"仍差 {abs(after - target_count)} 字"
+    return "_process/" + target.relative_to(forge.WORKSPACE_DIR).as_posix(), \
+        f"篇幅精确返工 {before}→{after} 字（目标 {target_count} 字，{exact}）", detail
+
+
 def _refit_length(kind: str, source: Path, target: Path, spec: str) -> tuple[str | None, str, dict]:
     """整篇篇幅返工：按统一字数口径确定性压缩同源正文，不做逐段替换。"""
     source_markdown = artifact_quality.report_directory(source, forge.WORKSPACE_DIR) / "source.md"
@@ -58,11 +131,12 @@ def _refit_length(kind: str, source: Path, target: Path, spec: str) -> tuple[str
     (target_quality / "source.md").write_text(updated, encoding="utf-8")
     budget = artifact_quality.length_budget(spec, "docx") or {}
     detail = {"location": "全文", "before": before, "after": after, "target": budget.get("target")}
-    return str(target), f"篇幅按统一口径压缩 {before}→{after} 字（目标 {budget.get('target', '未指定')}）", detail
+    return "_process/" + target.relative_to(forge.WORKSPACE_DIR).as_posix(), \
+        f"篇幅按统一口径压缩 {before}→{after} 字（目标 {budget.get('target', '未指定')}）", detail
 
 
 def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
-          project_dir: str = "") -> tuple[str | None, str, dict]:
+          project_dir: str = "", roster: int | None = None) -> tuple[str | None, str, dict]:
     source_name = forge.safe_deliverable_path(source_file)
     if not source_name:
         return None, "候选文件不存在", {}
@@ -71,6 +145,11 @@ def apply(sprint_id: str, kind: str, source_file: str, patch: dict,
     location = str(patch.get("location") or "").strip()
     replacement = patch.get("replacement")
     operation = str(patch.get("operation") or "replace").strip().lower()
+    if operation == "refit_length_exact":
+        try:
+            return _refit_length_exact(kind, source, target, str(patch.get("requirement") or ""), roster)
+        except (OSError, RuntimeError, ValueError) as error:
+            return None, f"篇幅精确返工失败：{error}", {}
     if operation == "refit_length":
         try:
             return _refit_length(kind, source, target, str(patch.get("requirement") or ""))

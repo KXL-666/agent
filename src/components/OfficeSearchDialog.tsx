@@ -151,11 +151,12 @@ export function OfficeSearchDialog() {
               <p className="search-hint">快速跳转</p>
               {(
                 [
-                  ['概览', 'home'],
+                  ['对话', 'talk'],
+                  ['办公室', 'home'],
                   ['任务', 'tasks'],
                   ['交付', 'artifacts'],
                   ['团队', 'agents'],
-                  ['对话', 'chat'],
+                  ['单飞', 'chat'],
                   ['通知', 'notifications'],
                   ['更多工具', 'browser'],
                 ] as const

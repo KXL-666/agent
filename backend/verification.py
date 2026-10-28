@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import re
 from pathlib import Path
 
 import artifact_quality
@@ -50,7 +51,8 @@ def _items(clauses: list[dict], model_items: list[dict] | None,
     )
     for item, clause in zip(result, clauses):
         text = str(clause.get("text") or "")
-        if not any(term in text for term in ("团队协作", "六智能体", "六人协作")):
+        # 「团队协作完成/产出」是过程条款；标题或正文主题含「团队协作」字样不算协作条款。
+        if not re.search(r"团队(?:协作|合作)(?:完成|开发|产出|撰写)|由.{0,6}团队.{0,4}(?:完成|协作)|六智能体|六人协作", text):
             continue
         item["status"] = "passed" if collaboration_ready else "unchecked"
         item["evidence"] = ("PO 契约、BE/FE 已校验贡献、SM→QA 候选交接与当前候选哈希均可追溯。"
@@ -87,6 +89,66 @@ def _apply_mechanical_page_checks(items: list[dict], clauses: list[dict], metric
         item["evidence"] = f"文件渲染页数为 {pages} 页；条款要求{'恰好' if exact else '不超过'} {limit} 页。"
         item["location"] = "整份文件 / 渲染页数"
         item["problem"] = "" if passed else f"实际 {pages} 页，超过条款限制 {limit} 页。"
+
+
+def _apply_mechanical_toc_checks(items: list[dict], clauses: list[dict], metrics: dict) -> None:
+    """「目录」条款用本地文件结构检查判定，不依赖模型从截图推断。"""
+    toc_present = metrics.get("toc_present")
+    if not isinstance(toc_present, bool):
+        return
+    for item, clause in zip(items, clauses):
+        text = str(clause.get("text") or "")
+        if "目录" not in text:
+            continue
+        negated = bool(re.search(r"(?:不要|不带|无需|无)\s*目录", text))
+        passed = (not toc_present) if negated else toc_present
+        item["status"] = "passed" if passed else "failed"
+        item["evidence"] = ("文件结构检查：未发现目录字段或目录样式段落。" if not toc_present
+                            else "文件结构检查：检测到目录字段或目录样式段落。")
+        item["location"] = "整份文件 / 文档结构"
+        if passed:
+            item["problem"] = ""
+        elif negated:
+            item["problem"] = "需求明确要求无目录，但文件结构中检测到目录字段或目录样式段落。"
+        else:
+            item["problem"] = "需求要求包含目录，但文件结构中未检测到目录字段或目录样式段落。"
+
+
+def _apply_mechanical_length_checks(items: list[dict], clauses: list[dict], metrics: dict,
+                                    requested: dict | None) -> None:
+    """字数条款用本地统一口径统计结果判定，不采信模型自报的字数。
+
+    模型无法稳定逐字计数，实测常出现 155/227/168 这类偏差；自检的 counted_characters
+    才是全链路统一口径，因此字数类条款一律以它为准。
+    """
+    requested = requested or {}
+    count, unit, mode = requested.get("count"), requested.get("unit"), requested.get("count_mode")
+    actual = metrics.get("counted_characters")
+    if not count or unit != "字" or not isinstance(actual, int):
+        return
+    # 「恰好/正好 N 字」精确命中；「约 N 字」允许 ±20%。判定只认自检 counted_characters。
+    if mode == "exact":
+        passed = actual == count
+        evidence = (f"按统一口径（汉字+英文/数字词，剔除标题段）实测 {actual} 字；"
+                    f"要求恰好 {count} 字，须精确命中。")
+    else:
+        low, high = round(count * .8), round(count * 1.2)
+        passed = low <= actual <= high
+        evidence = (f"按统一口径（汉字+英文/数字词，剔除标题段）实测 {actual} 字；"
+                    f"要求约 {count} 字，容差 ±20%（{low}~{high} 字）。")
+    for item, clause in zip(items, clauses):
+        text = str(clause.get("text") or "")
+        if not re.search(r"字数|篇幅|\d+\s*字", text):
+            continue
+        item["status"] = "passed" if passed else "failed"
+        item["evidence"] = evidence
+        item["location"] = "正文全文 / 自检统计"
+        if passed:
+            item["problem"] = ""
+        elif mode == "exact":
+            item["problem"] = f"字数不达标：实测 {actual} 字，要求恰好 {count} 字（相差 {actual - count} 字）。"
+        else:
+            item["problem"] = f"字数不达标：实测 {actual} 字，超出约 {count} 字的允许区间。"
 
 
 def verify(candidate: dict, contract: dict, candidate_sha256: str,
@@ -139,18 +201,31 @@ def verify(candidate: dict, contract: dict, candidate_sha256: str,
                     item["problem"] = "未完成隔离环境功能测试"
     else:
         report = artifact_quality.inspect(path, kind, source_material(contract), forge.WORKSPACE_DIR)
-        # 本地自检全通过时跳过模型评审，节省一次 LLM 调用；直接用本地检查结果
         has_failed = any(c.get("ok") is False for c in report.get("checks", []))
-        if has_failed:
+        # 条款级核验需要模型给出证据与位置；若本地全过就跳过评审，QA 永远无法通过，
+        # 交付会永久卡在 unchecked。因此只要存在验收条款就执行模型评审。
+        reviewed_by_model = has_failed or bool(clauses)
+        if reviewed_by_model:
             reviewed = artifact_quality.model_review(report, path, forge.WORKSPACE_DIR, QA, clauses=clauses)
         else:
             reviewed = report
         base["checks"] = reviewed.get("checks", [])
-        model_items = reviewed.get("review", {}).get("verification") if has_failed else None
+        model_items = reviewed.get("review", {}).get("verification") if reviewed_by_model else None
         base["items"] = _items(clauses, model_items, workflow_evidence)
         _apply_mechanical_page_checks(base["items"], clauses, reviewed.get("metrics", {}))
-        base["visual"] = reviewed.get("review", {}).get("visual", False) if has_failed else False
+        _apply_mechanical_toc_checks(base["items"], clauses, reviewed.get("metrics", {}))
+        _apply_mechanical_length_checks(base["items"], clauses, reviewed.get("metrics", {}),
+                                        reviewed.get("contract"))
+        base["metrics"] = reviewed.get("metrics", {})
         base["pages"] = reviewed.get("pages", [])
+        if reviewed_by_model:
+            base["review"] = reviewed.get("review", {})
+            base["visual"] = reviewed.get("review", {}).get("visual", False)
+        else:
+            # 无条款时不做模型评审，页面已由 office_runtime 真实渲染，以本地渲染成功作为视觉证据
+            render_ok = any(c.get("label") == "真实分页与页面边界" and c.get("ok") is True
+                            for c in base["checks"])
+            base["visual"] = bool(render_ok and base["pages"])
         if not base["visual"] and reviewed.get("pages"):
             base["reason"] = "页面视觉输入未成功送达 QA，视觉检查未核验"
     if any(check.get("ok") is False for check in base["checks"]) or any(item["status"] == "failed" for item in base["items"]):
@@ -161,6 +236,11 @@ def verify(candidate: dict, contract: dict, candidate_sha256: str,
         base["reason"] = base.get("reason") or "存在尚未核验的检查或条款"
     elif kind != "code" and base.get("pages") and not base.get("visual"):
         base["status"] = "unchecked"
+    elif kind != "code" and base.get("review", {}).get("status") == "failed":
+        base["status"] = "failed"
+        issues = base["review"].get("issues") or []
+        base["reason"] = "；".join(str(i.get("problem") or i) for i in issues if isinstance(i, dict))[:400] \
+            or "模型复核发现实质缺陷"
     elif contract.get("status") != "ready":
         base["status"] = "unchecked"
         base["reason"] = "PO 需求契约仍有未核验条款或来源"

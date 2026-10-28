@@ -1,4 +1,4 @@
-import type { Agent } from '@/types/agent'
+import type { Agent, DialogLine } from '@/types/agent'
 import {
   AGENT_ROSTER,
   DESKS,
@@ -85,8 +85,10 @@ export class OfficeSimulator {
     visitorRosterNo: number,
     hostRosterNo: number,
     message: string,
+    talkDuration?: number,
+    lines?: DialogLine[],
   ): Agent[] {
-    return startDeskVisit(agents, visitorRosterNo, hostRosterNo, message)
+    return startDeskVisit(agents, visitorRosterNo, hostRosterNo, message, talkDuration, lines)
   }
 
   startDeskVisitTour(
