@@ -42,9 +42,10 @@ test('成员对话可并行、独立中断，交错回复不会串入其他线�
     assert.equal(chat.getThreadSnapshot(0).at(-1).artifacts[0].id, 'team-artifact-v1')
     assert.equal(chat.getArtifactTarget(1), 'solo-artifact-v2')
     const saved = JSON.parse(memory.get('office.chat.v1'))
-    assert.equal(saved.conversationIds[0], teamSession)
-    assert.equal(saved.threads[0].at(-1).artifacts[0].id, 'team-artifact-v1')
-    chat.clearThread(0)
+    const teamConvId = saved.activeConvIds[0]
+    assert.equal(saved.backendConvByConv[teamConvId], teamSession)
+    assert.equal(saved.messagesByConv[teamConvId].at(-1).artifacts[0].id, 'team-artifact-v1')
+    chat.createConversation(0)
     assert.notEqual(chat.getConversationId(0), teamSession)
     assert.equal(chat.getThreadSnapshot(0).length, 0)
     assert.equal(chat.getArtifactTarget(0), '')
