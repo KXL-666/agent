@@ -1,12 +1,14 @@
 """BE/FE code is actually merged, and conflicting files block integration."""
 
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import project_agent
 
@@ -21,7 +23,7 @@ class DockerDiscoveryTest(unittest.TestCase):
                 self.assertEqual(project_agent.docker_executable(), str(fake_cli))
             with patch.object(project_agent.shutil, "which", return_value=None), \
                  patch.dict("os.environ", {"OFFICE_DOCKER_PATH": str(fake_cli.parent / "missing.exe")}):
-                with patch.object(project_agent.os, "name", "nt"), \
+                with patch.object(project_agent, "os", SimpleNamespace(name="nt", getenv=os.getenv)), \
                      patch.dict("os.environ", {"ProgramFiles": directory, "ProgramW6432": directory}):
                     install = Path(directory) / "Docker" / "Docker" / "resources" / "bin"
                     install.mkdir(parents=True)

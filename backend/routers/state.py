@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 import psutil
@@ -32,11 +33,19 @@ import runtime_state
 router = APIRouter(tags=["state"])
 
 
+@router.get("/api/runtime")
+async def runtime_capabilities():
+    from runtime_diagnostics import diagnose
+    return await asyncio.to_thread(diagnose)
+
+
 @router.get("/api/state")
 async def get_state():
     sprint_id = sprint_meta.get("id") if runtime_state.running else None
     baseline = sprint_meta.get("usage_baseline") or 0.0
     active = _active_round(runtime_state.running)
+    saved = storage.get_sprint(sprint_id) if sprint_id else None
+    durable_cost = float(saved.get("usage_cost") or 0) if saved and saved.get("run_options") else None
     return {
         "running": runtime_state.running,
         "paused": bus.is_paused(),
@@ -46,7 +55,7 @@ async def get_state():
         "sprint": active["sprint"],
         "requirement_contract": (_sprint_view(sprint_id) or {}).get("contract", {}),
         "handoffs": storage.list_handoffs(sprint_id) if sprint_id else [],
-        "cost": max(0.0, round(llm.usage_total_cost() - baseline, 4)) if runtime_state.running else 0,
+        "cost": durable_cost if durable_cost is not None else max(0.0, round(llm.usage_total_cost() - baseline, 4)) if runtime_state.running else 0,
         "history": storage.list_sprints(20),
     }
 
@@ -77,6 +86,8 @@ async def delete_sprint(sprint_id: str):
         raise HTTPException(status_code=409, detail="该 Sprint 正在进行中，不能删除")
     if not storage.get_sprint(sprint_id):
         raise HTTPException(status_code=404, detail="Sprint 不存在")
+    if runtime_state.persistent_ready:
+        await runtime_state.graph.checkpointer.adelete_thread(sprint_id)
     files = storage.delete_sprint(sprint_id)
     removed = 0
     for name in files:

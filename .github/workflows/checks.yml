@@ -1,0 +1,48 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Office and Chinese fonts (Linux rendering integration)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libreoffice fonts-noto-cjk
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python scripts/check-runtime.py --json
+      - name: Require real Office rendering on Linux
+        if: runner.os == 'Linux'
+        run: python scripts/check-runtime.py --require office cjk_font
+      - run: python scripts/test-backend.py
+      - name: Real Office rendering integration
+        if: runner.os == 'Linux'
+        run: python scripts/test-backend.py --with-office

@@ -25,7 +25,7 @@
 import asyncio
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,27 +41,34 @@ from graph import build_sprint_graph
 from roles import ROSTER
 
 import runtime_state
+from local_access import LocalBrowserAccess
+from process_lease import backend_lease
 
-agent_config.apply_saved_names()  # 恢复用户保存的成员姓名
-
-# 启动时恢复上一次 Sprint 的看板与产物，刷新/重启后不再"失忆"
-_last = storage.latest_sprint()
-if _last:
+def restore_latest_sprint() -> None:
+    """Restore only while owning the database lease; repeat calls replace snapshots."""
+    latest = storage.latest_sprint()
+    tasks_store.clear()
+    bus.event_log.clear()
+    # 手动结束的轮次不恢复为当前状态：重启后界面与对话上下文都保持干净，历史仍在任务中心可查
+    if not latest or latest["status"] == "stopped":
+        artifact_store.clear_current_sprint()
+        sprint_meta.update(id="", requirement="", status="idle", stage="", finished_at=0.0)
+        return
     sprint_meta.update(
         {
-            "id": _last["id"],
-            "requirement": _last["requirement"],
-            "started_at": _last["started_at"],
-            "finished_at": _last["finished_at"],
-            "status": _last["status"],
-            "stage": _last["stage"],
-            "deliver_kind": _last["deliver_kind"],
+            "id": latest["id"],
+            "requirement": latest["requirement"],
+            "started_at": latest["started_at"],
+            "finished_at": latest["finished_at"],
+            "status": latest["status"],
+            "stage": latest["stage"],
+            "deliver_kind": latest["deliver_kind"],
         }
     )
-    tasks_store.extend(storage.list_tasks(_last["id"]))
-    artifact_store.set_sprint(_last["id"])
-    forge.begin_sprint(_last["id"])
-    bus.load_persisted(_last["id"])  # 恢复历史事件：刷新/重启后通知与时间线不再清空
+    tasks_store.extend(storage.list_tasks(latest["id"]))
+    artifact_store.set_sprint(latest["id"])
+    forge.begin_sprint(latest["id"])
+    bus.load_persisted(latest["id"])
 
 
 @asynccontextmanager
@@ -69,15 +76,34 @@ async def lifespan(_: FastAPI):
     import archive_layout
     import file_knowledge
     import revision_jobs
-    revision_jobs.recover_interrupted()
-    await asyncio.to_thread(archive_layout.migrate)
-    await asyncio.to_thread(file_knowledge.index_existing)
-    if sprint_meta.get("id"):
-        artifact_store.set_sprint(sprint_meta["id"])
-    yield
-    await revision_jobs.shutdown()
-    if runtime_state.sprint_task and not runtime_state.sprint_task.done():
-        runtime_state.sprint_task.cancel()
+    with backend_lease(storage.DB_PATH):
+        async with AsyncExitStack() as resources:
+            from sprint_recovery import persistent_graph
+            previous_graph = runtime_state.graph
+            runtime_state.graph = await resources.enter_async_context(persistent_graph())
+            runtime_state.persistent_ready = True
+            runtime_state.requires_restart = False
+            runtime_state.recovery_lock = asyncio.Lock()
+            runtime_state.shutting_down = False
+            try:
+                await asyncio.to_thread(agent_config._migrate_plaintext_keys)
+                await asyncio.to_thread(agent_config.apply_saved_names)
+                storage.recover_interrupted_sprints()
+                restore_latest_sprint()
+                revision_jobs.recover_interrupted()
+                await asyncio.to_thread(archive_layout.migrate)
+                await asyncio.to_thread(file_knowledge.index_existing)
+                if sprint_meta.get("id"):
+                    artifact_store.set_sprint(sprint_meta["id"])
+                yield
+            finally:
+                runtime_state.shutting_down = True
+                await revision_jobs.shutdown()
+                if runtime_state.sprint_task and not runtime_state.sprint_task.done():
+                    runtime_state.sprint_task.cancel()
+                    await asyncio.gather(runtime_state.sprint_task, return_exceptions=True)
+                runtime_state.persistent_ready = False
+                runtime_state.graph = previous_graph
 
 
 app = FastAPI(title="AI 敏捷开发办公室", lifespan=lifespan)
@@ -98,6 +124,7 @@ from routers.usage import router as usage_router
 from routers.backup import router as backup_router
 from routers.ws import router as ws_router
 from routers.revision import router as revision_router
+from routers.preferences import router as preferences_router
 
 app.include_router(sprint_router)
 app.include_router(uploads_router)
@@ -110,15 +137,17 @@ app.include_router(usage_router)
 app.include_router(backup_router)
 app.include_router(ws_router)
 app.include_router(revision_router)
+app.include_router(preferences_router)
 
 # 仅允许本机开发/预览前端跨域访问，避免任意站点调用本机 API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LocalBrowserAccess)
 
 
 # ---------------------------------------------------------------------------

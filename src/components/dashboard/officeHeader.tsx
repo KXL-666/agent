@@ -167,7 +167,7 @@ function SprintProgress({
       ? allPassed
         ? '本轮已完成'
         : '本轮已结束 · 验收未完成'
-      : ({ failed: '本轮未通过验收', stopped: '本轮已手动结束',
+      : ({ failed: '本轮未通过验收', stopped: '本轮已手动结束', interrupted: '后端重启，本轮已中断',
            budget: '已达预算上限' }[meta.status] ?? '本轮已结束')
   const remaining = meta.budget > 0 ? Math.max(0, meta.budget - meta.cost) : 0
   const barHint = !passed.hasTasks && !weighted.hasTasks

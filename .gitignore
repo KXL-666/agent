@@ -33,3 +33,4 @@ work/
 backend/skills_data.json
 backend/skills_data.tmp
 __pycache__/
+*.runtime.lock

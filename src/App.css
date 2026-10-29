@@ -93,6 +93,116 @@
   gap: 2px;
 }
 
+/* 历史对话列表（团队对话，roster 0） */
+.sidebar-convos {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  margin-top: 14px;
+  border-top: 1px solid #eceef2;
+  padding-top: 10px;
+}
+
+.sidebar-convos-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px 6px;
+  font-size: 12px;
+  color: #8a919f;
+}
+
+.sidebar-convos-add {
+  border: none;
+  background: transparent;
+  color: #8a919f;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.sidebar-convos-add:hover { background: #f2f3f5; color: #1d2129; }
+
+.sidebar-convos-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 4px;
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-convo-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.sidebar-convo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: #555;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  padding: 7px 26px 7px 10px;
+  border-radius: 8px;
+}
+
+.sidebar-convo-title {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sidebar-convo-agent {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #a7adb8;
+}
+
+.sidebar-convo-del {
+  position: absolute;
+  right: 4px;
+  border: none;
+  background: transparent;
+  color: #a7adb8;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 2px 6px;
+  opacity: 0;
+  transition: opacity .12s;
+}
+
+.sidebar-convo-row:hover .sidebar-convo-del,
+.sidebar-convo-del:focus-visible { opacity: 1; }
+
+.sidebar-convo:hover { background: #f2f3f5; }
+
+.sidebar-convo.active {
+  background: #eef1f6;
+  color: #1d2129;
+  font-weight: 600;
+}
+
+.sidebar-convo-del:hover { background: #f2f3f5; color: #d1533f; }
+
 .nav-item {
   position: relative;
   display: flex;
@@ -1033,6 +1143,23 @@
 .talk-office-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; }
 .talk-office-btn .cnt { background: #eef1f6; border-radius: 999px; font-size: 11px; padding: 1px 7px; color: #8a919f; }
 
+.talk-new-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: #1d2129;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all .15s;
+}
+
+.talk-new-btn:hover { background: #343945; }
+
 /* 消息流 */
 .talk-chat { flex: 1; overflow-y: auto; padding: 20px 24px 12px; scroll-behavior: smooth; }
 .talk-msg { display: flex; gap: 10px; margin-bottom: 20px; align-items: flex-start; }
@@ -1045,6 +1172,11 @@
 .talk-msg.ai .talk-bubble { background: #f7f8fa; border-top-left-radius: 5px; }
 .talk-msg-body > .talk-bubble { margin-top: 8px; }
 .talk-msg-body > .talk-think:first-child { margin-top: 0; }
+
+/* 对话里回显的图片附件 */
+.talk-msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.talk-msg-images img { max-width: 220px; max-height: 160px; border-radius: 8px; border: 1px solid #e5e6eb; cursor: zoom-in; object-fit: cover; display: block; }
+[data-theme="dark"] .talk-msg-images img { border-color: #3a3f47; }
 
 .talk-caret { display: inline-block; width: 2px; height: 15px; background: #1d2129; vertical-align: -2px; margin-left: 2px; animation: talk-blink .8s step-end infinite; }
 @keyframes talk-blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
@@ -1136,6 +1268,18 @@
 [data-theme="dark"] .talk-office-btn { background: #23262b; border-color: #3a3e45; color: #e3e5e1; }
 [data-theme="dark"] .talk-office-btn:hover { background: #2b2f35; border-color: #4a4e55; }
 [data-theme="dark"] .talk-office-btn .cnt { background: #2b2f35; color: #9aa0a8; }
+[data-theme="dark"] .talk-new-btn { background: #e3e5e1; color: #1d2129; }
+[data-theme="dark"] .talk-new-btn:hover { background: #f2f3f5; }
+[data-theme="dark"] .sidebar-convos { border-top-color: #363a40; }
+[data-theme="dark"] .sidebar-convos-head { color: #7c8087; }
+[data-theme="dark"] .sidebar-convos-add { color: #7c8087; }
+[data-theme="dark"] .sidebar-convos-add:hover { background: #2b2f35; color: #e3e5e1; }
+[data-theme="dark"] .sidebar-convo { color: #9aa0a8; }
+[data-theme="dark"] .sidebar-convo-agent { color: #6b7280; }
+[data-theme="dark"] .sidebar-convo-del { color: #6b7280; }
+[data-theme="dark"] .sidebar-convo-del:hover { background: #363a40; color: #e08573; }
+[data-theme="dark"] .sidebar-convo:hover { background: #2b2f35; }
+[data-theme="dark"] .sidebar-convo.active { background: #2b2f35; color: #e3e5e1; }
 [data-theme="dark"] .talk-msg.user .talk-bubble { background: #2b2f35; }
 [data-theme="dark"] .talk-msg.ai .talk-bubble { background: #2b2f35; }
 [data-theme="dark"] .talk-caret { background: #e3e5e1; }
@@ -1756,6 +1900,63 @@
 
 .attachment-chip button:hover {
   color: #b91c1c;
+}
+
+/* 图片附件缩略图：粘贴/选择的图片直接可见 */
+.attachment-chip.has-thumb,
+.chat-image-chip.has-thumb {
+  border-radius: 14px;
+  padding: 3px 10px 3px 3px;
+}
+
+.attachment-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 11px;
+  border: 1px solid #ddd8cc;
+  background: #fff;
+  flex: none;
+  cursor: zoom-in;
+}
+
+/* 图片点击放大预览浮层 */
+.image-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(15, 17, 21, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+
+.image-preview-overlay img {
+  max-width: 88vw;
+  max-height: 86vh;
+  border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+  cursor: default;
+}
+
+.image-preview-overlay button {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.image-preview-overlay button:hover {
+  background: rgba(255, 255, 255, 0.3);
 }
 
 /* 成员设置弹窗 */
@@ -3220,6 +3421,96 @@ button.sidebar-search:hover {
   border-color: transparent;
 }
 
+/* ------------------------------ 偏好档案 ------------------------------ */
+
+.pref-section {
+  margin-top: 14px;
+  border-top: 1px solid #eceae4;
+  padding-top: 12px;
+}
+
+.pref-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pref-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.pref-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid #eceae4;
+  border-radius: 8px;
+  background: #f7f6f2;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pref-item button {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: #a8a29e;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+
+.pref-item button:hover {
+  color: #dc2626;
+}
+
+.pref-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.pref-add-row input {
+  flex: 1;
+  border: 1px solid #e2e0d8;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.pref-add-row input:focus {
+  outline: 2px solid #86efac;
+  border-color: transparent;
+}
+
+.pref-add-row button {
+  border: 1px solid #e2e0d8;
+  border-radius: 8px;
+  background: #fff;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pref-add-row button:hover:not(:disabled) {
+  background: #f3f2ef;
+}
+
+.pref-add-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ------------------------------ 任务卡片可点击 ------------------------------ */
 
 .task-card-clickable {
@@ -4425,6 +4716,27 @@ button.sidebar-search:hover {
   color: #9aa09a;
 }
 
+[data-theme="dark"] .pref-section {
+  border-color: #3d4148;
+}
+
+[data-theme="dark"] .pref-item {
+  background: #23262b;
+  border-color: #3d4148;
+  color: #e3e5e1;
+}
+
+[data-theme="dark"] .pref-add-row input,
+[data-theme="dark"] .pref-add-row button {
+  background: #1b1e22;
+  border-color: #3d4148;
+  color: #e3e5e1;
+}
+
+[data-theme="dark"] .pref-add-row button:hover:not(:disabled) {
+  background: #2b2f35;
+}
+
 /* ---- 成员设置弹窗 ---- */
 
 [data-theme="dark"] .avatar-option {
@@ -4621,6 +4933,11 @@ button.sidebar-search:hover {
   background: #2b2f35;
   border-color: #3d4148;
   color: #c9ccc6;
+}
+
+[data-theme="dark"] .attachment-thumb {
+  border-color: #3d4148;
+  background: #1d2129;
 }
 
 [data-theme="dark"] .version-row.latest {

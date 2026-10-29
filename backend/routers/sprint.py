@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import json
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -61,6 +62,11 @@ class ReassignRequest(BaseModel):
     roster: int
 
 
+class RecoverRequest(BaseModel):
+    checkpoint_id: str
+    request_id: str
+
+
 @router.get("/api/privacy/capabilities")
 async def privacy_capabilities():
     return {"local_model_ready": _local_model_ready(), "message": "本地模式要求所有已配置的主、备用模型 API 位于本机回环地址。"}
@@ -102,6 +108,8 @@ async def preview_sprint_plan(req: SprintRequest):
 
 @router.post("/api/sprint/start")
 async def start_sprint(req: SprintRequest):
+    if runtime_state.requires_restart:
+        raise HTTPException(409, "数据库已恢复，请重启后端后再开始任务")
     if storage.revision_operations(active=True):
         raise HTTPException(409, '产物修订仍在执行，请完成后再开始 Sprint')
     requirement = req.requirement.strip()
@@ -142,6 +150,15 @@ async def start_sprint(req: SprintRequest):
         except OSError as error:
             raise HTTPException(status_code=400, detail=f"保存位置不可用：{error}")
     forge.set_explicit_save_dir(save_dir)
+    from sprint_recovery import SCHEMA, signature, owner
+    from event_broadcaster import restore_instructions
+    restore_instructions([])
+    if runtime_state.persistent_ready and not direct_artifact:
+        storage.update_sprint(sprint_id, run_options_json=json.dumps({
+            "schema": SCHEMA, "workflow_signature": signature(),
+            "fast": bool(req.fast), "save_dir": save_dir, "task_kind": req.task_kind,
+            "owner": owner(),
+        }, ensure_ascii=False))
     sprint_meta.update(
         {
             "id": sprint_id,
@@ -181,6 +198,81 @@ async def start_sprint(req: SprintRequest):
     return {"ok": True, "sprint_id": sprint_id, "requirement": requirement, "uploads": len(req.upload_ids)}
 
 
+@router.get("/api/sprint/recoverable")
+async def recoverable_sprints():
+    from sprint_recovery import plan
+    rows = [row for row in storage.list_sprints(100) if row["status"] in ("interrupted", "failed")][:20]
+    return {"sprints": [await plan(row["id"]) for row in rows]}
+
+
+@router.get("/api/sprints/{sprint_id}/recovery")
+async def sprint_recovery_plan(sprint_id: str):
+    from sprint_recovery import plan
+    return await plan(sprint_id)
+
+
+@router.post("/api/sprints/{sprint_id}/recover", status_code=202)
+async def recover_sprint(sprint_id: str, req: RecoverRequest):
+    from sprint_recovery import plan, owner, validate_files, activate
+    if not req.request_id.strip() or len(req.request_id) > 100:
+        raise HTTPException(400, "续跑请求标识无效")
+    async with runtime_state.recovery_lock:
+        if runtime_state.requires_restart:
+            raise HTTPException(409, "数据库已恢复，请重启后端后再续跑")
+        sprint = storage.get_sprint(sprint_id)
+        if not sprint:
+            raise HTTPException(404, "Sprint 不存在")
+        options = sprint.get("run_options") or {}
+        previous = storage.get_resume_request(sprint_id, req.request_id)
+        if previous:
+            if previous.get("checkpoint_id") != req.checkpoint_id:
+                raise HTTPException(409, "同一请求标识不能用于不同检查点")
+            return {"ok": True, "sprint_id": sprint_id, "reused": True, "status": sprint["status"]}
+        if runtime_state.running or storage.revision_operations(active=True):
+            raise HTTPException(409, "已有任务正在执行，请先结束后再续跑")
+        preview = await plan(sprint_id)
+        if not preview["resumable"]:
+            raise HTTPException(409, preview["reason"])
+        if preview["checkpoint_id"] != req.checkpoint_id:
+            raise HTTPException(409, "检查点已变化，请重新查看续跑计划")
+        if preview["next_nodes"] and not llm_available():
+            raise HTTPException(400, "请先配置可用的成员模型 API")
+        if preview["next_nodes"] and sprint.get("execution_mode") == "local" and not _local_model_ready():
+            raise HTTPException(400, "本地模式要求主、备用模型均位于本机回环地址")
+        snapshot = await runtime_state.graph.aget_state({"configurable": {"thread_id": sprint_id}})
+        if snapshot.config["configurable"]["checkpoint_id"] != req.checkpoint_id:
+            raise HTTPException(409, "检查点已变化，请重新查看续跑计划")
+        problems = validate_files(snapshot.values)
+        if problems:
+            raise HTTPException(409, "；".join(problems[:5]))
+        # Recheck after all awaited reads; a new Sprint may have started meanwhile.
+        if runtime_state.running or storage.revision_operations(active=True):
+            raise HTTPException(409, "已有任务正在执行")
+        save_dir = str(options.get("save_dir") or "")
+        if save_dir:
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+            except OSError:
+                raise HTTPException(400, "原保存位置不可用，请恢复该目录权限后重试")
+        options["last_resume_request"] = {"id": req.request_id, "checkpoint_id": req.checkpoint_id}
+        options["owner"] = owner()
+        if not storage.claim_sprint_resume(sprint_id, options):
+            raise HTTPException(409, "任务状态已变化，请刷新后重试")
+        runtime_state.running = True
+        try:
+            activate(sprint, snapshot.values, options)
+            runtime_state.sprint_task = asyncio.create_task(run_sprint(
+                sprint["requirement"], fast=bool(options.get("fast")),
+                task_kind=options.get("task_kind", "auto"), resume=True))
+        except Exception:
+            runtime_state.running = False
+            sprint_meta.update(status="interrupted", stage="续跑准备失败，未启动模型调用")
+            storage.update_sprint(sprint_id, status="interrupted", stage=sprint_meta["stage"], finished_at=time.time())
+            forge.set_explicit_save_dir("")
+            raise HTTPException(503, "续跑准备失败，未启动模型调用；请检查文件权限并重启后端后重试") from None
+        return {"ok": True, "sprint_id": sprint_id, "reused": False, "next_steps": preview["next_steps"]}
+
+
 @router.post("/api/demo/start")
 async def start_demo():
     """零成本演示模式：脚本化回放一场完整 Sprint，不消耗任何 API 额度。"""
@@ -193,12 +285,19 @@ async def start_demo():
 
 @router.post("/api/sprint/stop")
 async def stop_sprint():
-    """手动结束当前 Sprint：取消工作流，全员转空闲。"""
+    """手动结束当前 Sprint：取消工作流，全员转空闲，并清掉本轮驻留状态。"""
     if not runtime_state.running or not runtime_state.sprint_task or runtime_state.sprint_task.done():
         raise HTTPException(status_code=409, detail="当前没有进行中的任务")
     bus.set_paused(False)
     runtime_state.sprint_task.cancel()
     bus.emit({"type": "sprint_stopped", "message": "任务已手动结束"})
+    try:
+        await runtime_state.sprint_task
+    except BaseException:  # CancelledError 及工作流收尾异常都不影响清理
+        pass
+    # 手动结束的轮次不再驻留内存：对话与状态快照恢复干净，历史仍可在 storage 中查询
+    tasks_store.clear()
+    sprint_meta.update(id="", requirement="", status="idle", stage="", finished_at=time.time())
     return {"ok": True}
 
 
@@ -248,6 +347,8 @@ async def cancel_task(task_id: str):
             status_code=400, detail=f"任务当前状态为「{task.get('status')}」，不能取消"
         )
     task["status"] = "已取消"
+    storage.add_event(sprint_meta.get("id", ""), {"type": "task_control", "ts": time.time(),
+                      "action": "cancel", "task_id": task_id})
     bus.emit({"type": "task_update", "task": task})
     return {"ok": True, "task": task}
 
@@ -263,5 +364,7 @@ async def reassign_task(task_id: str, req: ReassignRequest):
             status_code=400, detail=f"任务当前状态为「{task.get('status')}」，不能改派"
         )
     task["assignee_roster"] = req.roster
+    storage.add_event(sprint_meta.get("id", ""), {"type": "task_control", "ts": time.time(),
+                      "action": "reassign", "task_id": task_id, "roster": req.roster})
     bus.emit({"type": "task_update", "task": task})
     return {"ok": True, "task": task}

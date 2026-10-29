@@ -283,7 +283,6 @@ export function OfficeRightPanel() {
   const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
   const meta = useSyncExternalStore(subscribeSprintData, getSprintMetaSnapshot)
   const viewedSprint = useSyncExternalStore(subscribeView, getViewedSprint)
-  const showCurrent = running && !viewedSprint
   const activeWorkspace = useSyncExternalStore(
     subscribeView,
     getActiveWorkspace,
@@ -293,6 +292,10 @@ export function OfficeRightPanel() {
   const filteredTasks = tasks.filter((task) =>
     workspaceMatches(task.assignee_roster),
   )
+  // 「当前任务」只展示进行中的轮次：任何结束的轮次（完成/手动结束/失败/预算）
+  // 一律归档到「任务」视图与历史记录，绝不在当前面板残留
+  const roundEnded = !running && !viewedSprint && tasks.length > 0
+  const visibleTasks = running || viewedSprint ? filteredTasks : []
   const workspaceLabel = WORKSPACES[activeWorkspace]?.label ?? ''
 
   return (
@@ -302,10 +305,10 @@ export function OfficeRightPanel() {
           <h2>
             {viewedSprint
               ? '历史任务 · 只读'
-              : `当前任务${showCurrent ? ' · 进行中' : tasks.length ? ' · 本轮结果' : ''}`}
+              : `当前任务${running ? ' · 进行中' : ''}`}
             {activeWorkspace > 0 ? ` · ${workspaceLabel}` : ''}
           </h2>
-          {meta.id ? (
+          {meta.id && running ? (
             <span className="panel-cost" title="本轮 Sprint 累计花费（按 tokens 估算）">
               ¥{meta.cost.toFixed(3)}
               {meta.budget > 0 ? ` / ¥${meta.budget.toFixed(2)}` : ''}
@@ -313,23 +316,25 @@ export function OfficeRightPanel() {
           ) : null}
         </div>
         <div className="task-list">
-          {filteredTasks.length === 0 ? (
+          {visibleTasks.length === 0 ? (
             <div className="task-idle-state">
               <p>
                 {viewedSprint
                   ? '正在查看历史记录。'
-                  : tasks.length === 0
-                    ? '当前没有进行中的任务。'
-                    : '当前筛选条件下没有任务，可切换到「全部」查看。'}
+                  : roundEnded
+                    ? '上一轮已结束，结果与产物已归档。'
+                    : tasks.length === 0
+                      ? '当前没有进行中的任务。'
+                      : '当前筛选条件下没有任务，可切换到「全部」查看。'}
               </p>
-              {tasks.length > 0 ? (
+              {roundEnded ? (
                 <button type="button" onClick={() => setActiveView('tasks')}>
                   查看任务记录
                 </button>
               ) : null}
             </div>
           ) : (
-            filteredTasks.map((task) => (
+            visibleTasks.map((task) => (
               <TaskCard key={task.id} task={task} onOpen={() => setDetailTask(task)} />
             ))
           )}

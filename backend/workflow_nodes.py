@@ -25,6 +25,7 @@ import verification
 import review_decision
 import candidate_revision
 import artifact_quality
+import user_preferences
 from agile import plan_fields
 from requirement_contract import build_contract
 from artifacts import add_artifact, artifacts_store
@@ -56,7 +57,9 @@ from task_planner import (
 if TYPE_CHECKING:
     from graph import SprintState
 
-MAX_REWORK = 2
+# 返工不硬限轮数（数值上仍保留一个远端上限）：产物不合格就一直打回重修，
+# 真正的停止条件是用户设置的花费上限（pause() 内的 check_budget）或缺陷修复完成。
+MAX_REWORK = 99
 
 
 # ---------- LangGraph 节点 ----------
@@ -758,7 +761,7 @@ async def fix(state: SprintState) -> dict:
                     "Word/PPT 必须给精确旧文本；Excel 给精确单元格；代码只给一个既有文件的完整新内容。"
                     "若 Word 中整段是需求未提供的占位字段，可用 operation=delete，old_text 填完整段落原文。"
                     "不删除测试、功能或无关内容。无法定位则返回空 JSON。"
-                ),
+                ) + user_preferences.prompt_block(),
                 user=json.dumps({"kind": kind, "issue": issue, "candidate_sha256": state.get("candidate_sha256"),
                                  "actual_content": preview, "requirement": state["requirement"]}, ensure_ascii=False),
                 fallback={}, roster=owner, meta=meta, max_tokens=6500, timeout=180,

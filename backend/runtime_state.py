@@ -20,12 +20,16 @@ FAST_SCENE_PACE = 0.12
 
 # Sprint 是否正在运行（用于路由层判定能否发起新任务/修订等）
 running: bool = False
+shutting_down: bool = False
 
 # 当前 Sprint 对应的 asyncio.Task，用于手动取消
 sprint_task: asyncio.Task | None = None
 
 # 工作流图实例（LangGraph），全局复用
 graph = build_sprint_graph()
+persistent_ready: bool = False
+requires_restart: bool = False
+recovery_lock = asyncio.Lock()
 
 # 系统资源统计缓存（网络字节数与时间戳，用于计算速率）
 net_last: dict[str, float] = {"ts": time.time(), "bytes": 0}

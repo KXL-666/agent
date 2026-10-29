@@ -10,6 +10,8 @@ import io
 import os
 import shutil
 import zipfile
+import sqlite3
+import tempfile
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -32,10 +34,11 @@ async def backup_export():
     zip_path = forge.output_path(zip_name)
 
     def _pack() -> None:
-        with storage._lock:
+        with tempfile.TemporaryDirectory(prefix="office-db-backup-") as directory:
+            snapshot = os.path.join(directory, "office.db")
+            storage.snapshot_database(snapshot)
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                if os.path.isfile(storage.DB_PATH):
-                    zf.write(storage.DB_PATH, "office.db")
+                zf.write(snapshot, "office.db")
                 for name in BACKUP_DB_ITEMS:
                     path = os.path.join(backend_dir, name)
                     if os.path.isfile(path):
@@ -72,12 +75,18 @@ async def backup_import(file: UploadFile):
     restored: list[str] = []
     with archive:
         names = set(archive.namelist())
+        if "office.db" in names:
+            runtime_state.requires_restart = True
 
         def _restore() -> None:
             with storage._lock:
                 if "office.db" in names:
-                    with archive.open("office.db") as src, open(storage.DB_PATH, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                    with tempfile.TemporaryDirectory(prefix="office-db-restore-") as directory:
+                        snapshot = os.path.join(directory, "office.db")
+                        with archive.open("office.db") as src, open(snapshot, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        with sqlite3.connect(snapshot) as source, sqlite3.connect(storage.DB_PATH) as destination:
+                            source.backup(destination)
                     restored.append("office.db")
                 for name in BACKUP_DB_ITEMS:
                     if name in names:

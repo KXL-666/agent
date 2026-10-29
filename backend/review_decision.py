@@ -9,6 +9,7 @@ import artifact_quality
 import forge
 import llm
 import project_agent
+import user_preferences
 from roles import DEV_BE, LEAD
 
 
@@ -84,7 +85,8 @@ def decide(candidate: dict, contract: dict, qa_report: dict, handoff_records: li
         "issues 只列当前候选违反需求或缺失必需证据的阻断问题；非阻断建议写入 note。"
         "缺少实际内容、运行或视觉证据时写 unchecked；证据明确显示错误写 failed。"
         "字数判定只认 qa_report.metrics.counted_characters（唯一权威，统一口径=汉字+英文/数字词、剔除标题段），"
-        "禁止自行重新估算或改写该数值。『恰好/正好 N 字』须 actual==N 才算通过；『约 N 字』允许 ±20%。",
+        "禁止自行重新估算或改写该数值。『恰好/正好 N 字』须 actual==N 才算通过；『约 N 字』允许 ±20%。"
+        + user_preferences.prompt_block(),
         json.dumps({"raw_requirement": contract.get("raw_requirement"),
                     "source_material": source_material(contract),
                     "clauses": contract.get("requirements", []), "candidate_sha256": expected_sha256,

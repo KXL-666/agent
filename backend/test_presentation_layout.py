@@ -32,6 +32,7 @@ class PresentationLayoutTest(unittest.TestCase):
                     {"requirement_id": "R1", "status": "passed", "evidence": "逐页", "location": "全稿"}]}
             with (patch.object(artifact_quality, "report_directory", return_value=Path(directory)),
                   patch.object(artifact_quality, "save_report"),
+                  patch("llm.llm_available", return_value=True),
                   patch("llm.chat_json", side_effect=fake_review)):
                 reviewed = artifact_quality.model_review(
                     report, Path(directory) / "deck.pptx", directory, 4,

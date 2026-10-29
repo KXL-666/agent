@@ -6,15 +6,27 @@
 
 import json
 import os
+import threading
+from functools import wraps
 
 import secretbox
 from roles import ROSTER
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "agent_config.json")
+CONFIG_PATH = os.getenv("OFFICE_AGENT_CONFIG_PATH") or os.path.join(BASE_DIR, "agent_config.json")
+_config_lock = threading.RLock()
 
 
-def _load() -> dict:
+def _serialized(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        with _config_lock:
+            return function(*args, **kwargs)
+    return call
+
+
+@_serialized
+def _load(*, preserve_locked: bool = False) -> dict:
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -27,24 +39,56 @@ def _load() -> dict:
         for section in ("llm", "llm_backup"):
             llm = entry.get(section)
             if llm and secretbox.is_encrypted(llm.get("api_key", "")):
-                llm["api_key"] = secretbox.decrypt_value(llm["api_key"])
+                protected = llm["api_key"]
+                llm["api_key"] = secretbox.decrypt_value(protected)
+                if preserve_locked and not llm["api_key"]:
+                    llm["api_key"] = protected
     return data
 
 
+@_serialized
 def _save(data: dict) -> None:
-    # 写前加密：落盘副本里 API Key 全部走 DPAPI 密文，传入的内存字典保持明文
+    # Reuse unchanged references. New keyring entries are committed only by an
+    # atomic config replacement; failed saves clean up their new entries.
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as source:
+            previous = json.load(source)
+    except (OSError, json.JSONDecodeError):
+        previous = {}
     disk = json.loads(json.dumps(data, ensure_ascii=False))
-    for entry in disk.values():
-        if not isinstance(entry, dict):
-            continue
-        for section in ("llm", "llm_backup"):
-            llm = entry.get(section)
-            if llm and llm.get("api_key"):
-                llm["api_key"] = secretbox.encrypt_value(llm["api_key"])
     tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(disk, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG_PATH)
+    created = []
+    def references(values):
+        return {section.get("api_key", "") for entry in values.values() if isinstance(entry, dict)
+                for section in (entry.get("llm"), entry.get("llm_backup")) if isinstance(section, dict)}
+    try:
+        for roster, entry in disk.items():
+            if not isinstance(entry, dict):
+                continue
+            for section in ("llm", "llm_backup"):
+                llm = entry.get(section)
+                if not llm or not llm.get("api_key"):
+                    continue
+                old = (previous.get(roster, {}).get(section) or {}).get("api_key", "")
+                if secretbox.is_encrypted(old) and secretbox.decrypt_value(old) == llm["api_key"]:
+                    llm["api_key"] = old
+                else:
+                    llm["api_key"] = secretbox.encrypt_value(llm["api_key"])
+                    if llm["api_key"] not in references(previous):
+                        created.append(llm["api_key"])
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(disk, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        for value in created:
+            secretbox.delete_value(value)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    for value in references(previous) - references(disk):
+        secretbox.delete_value(value)
 
 
 def _migrate_plaintext_keys() -> None:
@@ -62,14 +106,13 @@ def _migrate_plaintext_keys() -> None:
             llm = entry.get(section)
             key = llm.get("api_key", "") if llm else ""
             if key and not secretbox.is_encrypted(key):
-                llm["api_key"] = secretbox.encrypt_value(key)
                 changed = True
     if changed:
-        _save(raw)
-        print("[AgentConfig] 已将本机明文 API Key 加密存储（Windows DPAPI）")
-
-
-_migrate_plaintext_keys()
+        try:
+            _save(raw)
+            print("[AgentConfig] 历史明文 API Key 已迁入系统安全存储")
+        except ValueError:
+            print("[AgentConfig] 历史密钥迁移未完成：系统安全存储不可用，原配置保留；新保存不会回退明文。")
 
 
 def _llm_view(entry: dict, section: str) -> dict:
@@ -105,6 +148,8 @@ def _merge_llm(cur: dict, patch: dict) -> None:
             if value == "__CLEAR__":
                 cur[field] = ""
                 continue
+            if secretbox.is_encrypted(value):
+                raise ValueError("请填写真实 API Key，不能输入密文或系统密钥引用。")
         cur[field] = value
 
 
@@ -115,6 +160,7 @@ VALID_SKINS = {
 }
 
 
+@_serialized
 def update_agent_config(
     roster: int,
     name: str | None = None,
@@ -125,13 +171,11 @@ def update_agent_config(
 ) -> dict:
     """合并更新成员配置。llm 里 api_key 为空字符串表示「不修改旧值」；
     传 api_key="__CLEAR__" 表示清除专属 key 回退全局。"""
-    data = _load()
+    data = _load(preserve_locked=True)
     entry = data.setdefault(str(roster), {})
     if name is not None and name.strip():
         entry["name"] = name.strip()[:20]
         # 同步名册：对话气泡、任务分派等文案立即使用新名字
-        if roster in ROSTER:
-            ROSTER[roster]["name"] = entry["name"]
     if avatar is not None:
         entry["avatar"] = avatar.strip()[:8]
     if skin is not None:
@@ -144,6 +188,8 @@ def update_agent_config(
     if llm_backup is not None:
         _merge_llm(entry.setdefault("llm_backup", {}), llm_backup)
     _save(data)
+    if name is not None and name.strip() and roster in ROSTER:
+        ROSTER[roster]["name"] = entry["name"]
     return get_agent_config(roster)
 
 

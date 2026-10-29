@@ -6,6 +6,7 @@
 
 import asyncio
 
+import user_preferences
 from llm import chat_json
 from roles import DEV_BE, DEV_FE, PO, QA
 
@@ -65,7 +66,7 @@ async def decompose_plan(requirement: str, uploads_text: str = "",
     )
     plan = await asyncio.to_thread(
         chat_json,
-        system=PLAN_SYSTEM_PROMPT,
+        system=PLAN_SYSTEM_PROMPT + user_preferences.prompt_block(),
         user=f"需求：{requirement}{attachments_note}{instructions}",
         fallback=mock_plan,
         max_tokens=4500,

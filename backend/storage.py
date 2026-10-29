@@ -19,6 +19,10 @@ DB_PATH = os.getenv("OFFICE_DB_PATH") or os.path.join(
 _lock = threading.Lock()
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS sprint_resume_requests (
+  sprint_id TEXT NOT NULL, request_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+  created_at REAL NOT NULL, PRIMARY KEY(sprint_id, request_id)
+);
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL DEFAULT '{}'
@@ -134,6 +138,22 @@ def init() -> None:
         _ensure_columns(conn)
 
 
+def recover_interrupted_sprints() -> list[str]:
+    """Called only after acquiring the exclusive backend lease; never replay paid work."""
+    with _lock, _conn() as conn:
+        rows = conn.execute("SELECT id FROM sprints WHERE status IN ('running', 'paused')").fetchall()
+        ids = [row["id"] for row in rows]
+        now = time.time()
+        for sprint_id in ids:
+            conn.execute("UPDATE sprints SET status='interrupted', stage=?, finished_at=? WHERE id=?",
+                         ("后端重启，执行已中断；历史文件保留，未自动重试模型调用", now, sprint_id))
+            payload = {"type": "sprint_end", "ts": now, "sprint_id": sprint_id,
+                       "status": "interrupted", "reason": "backend_restart"}
+            conn.execute("INSERT INTO events(sprint_id,ts,type,payload) VALUES(?,?,?,?)",
+                         (sprint_id, now, "sprint_end", json.dumps(payload, ensure_ascii=False)))
+    return ids
+
+
 def get_chat_session(session_id: str) -> dict:
     with _lock, _conn() as conn:
         row = conn.execute("SELECT state FROM chat_sessions WHERE id=?", (session_id,)).fetchone()
@@ -158,6 +178,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         ("execution_style", "TEXT NOT NULL DEFAULT 'legacy_unknown'"),
         ("budget", "REAL NOT NULL DEFAULT 0"),
         ("execution_mode", "TEXT NOT NULL DEFAULT 'cloud'"),
+        ("run_options_json", "TEXT NOT NULL DEFAULT '{}'"),
     ):
         if name not in existing:
             conn.execute(f"ALTER TABLE sprints ADD COLUMN {name} {decl}")
@@ -183,6 +204,8 @@ def _row(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
     data = dict(row)
+    if "run_options_json" in data:
+        data["run_options"] = json.loads(data.pop("run_options_json") or "{}")
     if "contract_json" in data:
         try:
             data["contract"] = json.loads(data.pop("contract_json") or "{}")
@@ -386,6 +409,7 @@ def update_sprint(sprint_id: str, **fields) -> None:
         "execution_style",
         "budget",
         "execution_mode",
+        "run_options_json",
     }
     pairs = [(k, v) for k, v in fields.items() if k in allowed]
     if not pairs:
@@ -399,6 +423,33 @@ def get_sprint(sprint_id: str) -> dict | None:
     with _lock, _conn() as conn:
         row = conn.execute("SELECT * FROM sprints WHERE id=?", (sprint_id,)).fetchone()
     return _row(row)
+
+
+def increment_sprint_usage(sprint_id: str, tokens: int, cost: float) -> None:
+    """Persist every acknowledged model response independently of workflow checkpoints."""
+    with _lock, _conn() as conn:
+        changed = conn.execute("UPDATE sprints SET usage_calls=usage_calls+1, usage_tokens=usage_tokens+?, "
+                               "usage_cost=usage_cost+? WHERE id=?", (tokens, cost, sprint_id)).rowcount
+        if not changed:
+            raise RuntimeError("Sprint 用量记录不存在")
+
+
+def claim_sprint_resume(sprint_id: str, options: dict) -> bool:
+    with _lock, _conn() as conn:
+        claimed = bool(conn.execute("UPDATE sprints SET status='running', finished_at=0, run_options_json=? "
+                                 "WHERE id=? AND status IN ('interrupted','failed')",
+                                 (json.dumps(options, ensure_ascii=False), sprint_id)).rowcount)
+        if claimed:
+            request = options["last_resume_request"]
+            conn.execute("INSERT INTO sprint_resume_requests(sprint_id,request_id,checkpoint_id,created_at) VALUES(?,?,?,?)",
+                         (sprint_id, request["id"], request["checkpoint_id"], time.time()))
+        return claimed
+
+
+def get_resume_request(sprint_id: str, request_id: str) -> dict | None:
+    with _lock, _conn() as conn:
+        row = conn.execute("SELECT * FROM sprint_resume_requests WHERE sprint_id=? AND request_id=?", (sprint_id, request_id)).fetchone()
+    return dict(row) if row else None
 
 
 def save_contract(sprint_id: str, contract: dict) -> None:
@@ -639,6 +690,7 @@ EVENT_PERSIST_TYPES = {
     "task_update", "artifact_new", "artifact_update", "plan_fallback", "requirement_contract", "handoff", "integration_issue", "repair_attempt",
     "desk_visit", "budget_exceeded", "sprint_paused", "sprint_resumed",
     "instruction_added",
+    "task_control",
 }
 
 
@@ -675,6 +727,26 @@ def list_events(sprint_id: str, limit: int = 300) -> list[dict]:
     return items
 
 
+def instructions_since(sprint_id: str, since: float) -> list[str]:
+    with _lock, _conn() as conn:
+        rows = conn.execute("SELECT payload FROM events WHERE sprint_id=? AND type='instruction_added' "
+                            "AND ts>? ORDER BY ts", (sprint_id, since)).fetchall()
+    return [str(json.loads(row["payload"]).get("text") or "") for row in rows]
+
+
+def task_controls_since(sprint_id: str, since: float) -> list[dict]:
+    with _lock, _conn() as conn:
+        rows = conn.execute("SELECT payload FROM events WHERE sprint_id=? AND type='task_control' "
+                            "AND ts>? ORDER BY ts", (sprint_id, since)).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+def snapshot_database(destination: str) -> None:
+    """SQLite backup includes committed WAL pages and durable graph checkpoints."""
+    with _lock, sqlite3.connect(DB_PATH, timeout=10) as source, sqlite3.connect(destination) as target:
+        source.backup(target)
+
+
 def delete_sprint(sprint_id: str) -> list[str]:
     """删除一条 Sprint 的全部数据，返回其产物文件名列表（供调用方清理磁盘）"""
     with _lock, _conn() as conn:
@@ -687,6 +759,7 @@ def delete_sprint(sprint_id: str) -> list[str]:
         conn.execute("DELETE FROM tasks WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM events WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM handoffs WHERE sprint_id=?", (sprint_id,))
+        conn.execute("DELETE FROM sprint_resume_requests WHERE sprint_id=?", (sprint_id,))
         conn.execute("DELETE FROM sprints WHERE id=?", (sprint_id,))
     return files
 

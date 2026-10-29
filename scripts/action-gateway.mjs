@@ -1,4 +1,5 @@
 import { createServer } from 'node:http'
+import { isLoopbackOrigin } from './browser-origin.mjs'
 
 const port = Number(process.env.OFFICE_ACTION_GATEWAY_PORT ?? 8765)
 const actions = []
@@ -6,7 +7,6 @@ const actions = []
 function sendJson(res, status, data) {
   const body = JSON.stringify(data)
   res.writeHead(status, {
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type,Accept',
     'Content-Type': 'application/json; charset=utf-8',
@@ -38,6 +38,13 @@ function normalizeActions(payload) {
 }
 
 const server = createServer(async (req, res) => {
+  const origin = req.headers.origin
+  res.setHeader('Vary', 'Origin')
+  if (origin !== undefined && !isLoopbackOrigin(origin)) {
+    sendJson(res, 403, { error: 'Browser origin is not allowed' })
+    return
+  }
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin)
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
 
   if (req.method === 'OPTIONS') {
@@ -80,7 +87,7 @@ const server = createServer(async (req, res) => {
 })
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`[OfficeActionGateway] listening on http://localhost:${port}`)
+  console.log(`[OfficeActionGateway] listening on http://localhost:${server.address().port}`)
   console.log('[OfficeActionGateway] POST /actions to enqueue, GET /actions to drain')
 })
 

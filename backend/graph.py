@@ -1,7 +1,7 @@
 """多 Agent 敏捷开发工作流（LangGraph）：状态结构、流程图与路由判定。
 
 流程：需求拆解 → 任务分派 → 并行开发 → 测试 → 评审 ─┬→ 通过 → 复盘收尾
-                                              └→ 打回 → 缺陷修复 → 测试（最多 2 轮）
+                                              └→ 打回 → 缺陷修复 → 测试（不硬限轮数，花费上限兜底）
 
 节点实现见 workflow_nodes，事件推送见 event_broadcaster，需求拆解见 task_planner。
 本模块保留 SprintState / 路由判定 / build_sprint_graph，并继续转发节点与事件辅助，
@@ -30,6 +30,11 @@ class SprintState(TypedDict):
     task_kind: str  # 用户在执行计划中明确选择的任务路线
     uploads_text: str  # 用户上传附件提取出的文本素材（可为空）
     uploads_images: list  # 图片附件的 data URL（视觉模型多模态输入，可为空）
+    resume_files: list  # immutable artifact references captured at node boundaries
+    resume_sources: list
+    resume_projects: list
+    pending_instructions: list
+    instruction_cutoff: float
 
 
 # ---------- 事件辅助（实现见 event_broadcaster） ----------
@@ -98,17 +103,15 @@ def route_fix(state: SprintState) -> str:
     return "blocked" if state.get("repair_blocked") else "retest"
 
 
-def build_sprint_graph():
+def build_sprint_graph(checkpointer=None, *, durable: bool = False):
     graph = StateGraph(SprintState)
-    graph.add_node("kickoff", kickoff)
-    graph.add_node("assign", assign)
-    graph.add_node("develop", develop)
-    graph.add_node("candidate", candidate)
-    graph.add_node("test", test)
-    graph.add_node("review", review)
-    graph.add_node("fix", fix)
-    graph.add_node("publish", publish)
-    graph.add_node("wrapup", wrapup)
+    for name, function in (("kickoff", kickoff), ("assign", assign), ("develop", develop),
+                           ("candidate", candidate), ("test", test), ("review", review),
+                           ("fix", fix), ("publish", publish), ("wrapup", wrapup)):
+        if durable:
+            from sprint_recovery import durable_node
+            function = durable_node(function)
+        graph.add_node(name, function)
 
     graph.add_edge(START, "kickoff")
     graph.add_edge("kickoff", "assign")
@@ -124,7 +127,4 @@ def build_sprint_graph():
     graph.add_conditional_edges("fix", route_fix, {"retest": "test", "blocked": "publish"})
     graph.add_edge("publish", "wrapup")
     graph.add_edge("wrapup", END)
-    # 每个节点执行后落一份内存快照，按 thread_id（sprint_id）隔离：
-    # 运行中途异常时已完成的节点状态得以保留（便于排查或续跑），
-    # 收尾时由 sprint_runner 删除该线程，避免长期运行进程堆积。
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile(checkpointer=checkpointer if checkpointer is not None else MemorySaver())

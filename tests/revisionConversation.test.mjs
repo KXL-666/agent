@@ -32,7 +32,7 @@ test('修订请求响应丢失后复用同一请求与原始版本，切换会�
   const server = await createServer({ configFile: false,
     root: fileURLToPath(new URL('..', import.meta.url)),
     resolve: { alias: { '@': fileURLToPath(new URL('../src', import.meta.url)) } },
-    server: { middlewareMode: true, hmr: false, watch: null }, appType: 'custom',
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null }, appType: 'custom',
   })
   try {
     const store = await server.ssrLoadModule('/src/store/revisionStore.ts')

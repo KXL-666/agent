@@ -9,7 +9,7 @@ test('成员对话可并行、独立中断，交错回复不会串入其他线�
   globalThis.window = { setTimeout }
   const server = await createServer({
     configFile: false, root: fileURLToPath(new URL('..', import.meta.url)),
-    server: { middlewareMode: true, hmr: false, watch: null }, appType: 'custom',
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null }, appType: 'custom',
   })
   try {
     const chat = await server.ssrLoadModule('/src/store/officeChatStore.ts')

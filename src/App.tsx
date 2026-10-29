@@ -1,6 +1,5 @@
-import { useEffect, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useEffect, useSyncExternalStore } from 'react'
 import { OfficeActionConnector } from '@/components/OfficeActionConnector'
-import { OfficeCanvas } from '@/components/OfficeCanvas'
 import {
   OfficeBottomToolbar,
   OfficeHeaderStats,
@@ -15,6 +14,8 @@ import { initTheme } from '@/store/officeThemeStore'
 import { getActiveView, subscribeView } from '@/store/officeViewStore'
 import { primeAudio } from '@/services/officeSound'
 import './App.css'
+
+const OfficeCanvas = lazy(() => import('@/components/OfficeCanvas').then(module => ({ default: module.OfficeCanvas })))
 
 function App() {
   const view = useSyncExternalStore(subscribeView, getActiveView)
@@ -47,7 +48,9 @@ function App() {
       <div className="office-center">
         <OfficeHeaderStats />
         <main className="office-main">
-          {view === 'home' ? <OfficeCanvas /> : <OfficeViewPanel view={view} />}
+          <Suspense fallback={<div role="status" aria-live="polite">正在加载…</div>}>
+            {view === 'home' ? <OfficeCanvas /> : <OfficeViewPanel view={view} />}
+          </Suspense>
           <OfficeBottomToolbar />
         </main>
       </div>

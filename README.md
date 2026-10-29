@@ -1,6 +1,6 @@
 # 🤖 AI 敏捷开发办公室 · AI Agile Office
 
-> 🎓 **毕业设计项目** · 可视化多智能体协作 Sprint 系统
+> 🎓 **毕业设计项目** · 基于多智能体协同的敏捷开发任务管理系统的设计与实现
 
 > 📦 本项目基于开源项目 [PixOffice](https://github.com/teejoo/PixOffice)（作者 teejoo，MIT 许可证）二次开发，在此感谢原作者。
 
@@ -90,7 +90,7 @@ Windows 新环境可运行 `powershell -File scripts/setup-artifact-runtime.ps1`
 |---|---|
 | 前端 | React 19 · TypeScript 6 · Vite 8 |
 | 渲染 | PixiJS 8 · Spine 动画 |
-| 状态 | Zustand (轻量 store) |
+| 状态 | 自建订阅式 store + React useSyncExternalStore |
 | 后端 | FastAPI · Uvicorn · WebSocket |
 | 工作流 | LangGraph (LangChain) |
 | LLM 调用 | httpx + OpenAI 兼容协议 |
@@ -102,6 +102,8 @@ Windows 新环境可运行 `powershell -File scripts/setup-artifact-runtime.ps1`
 ## 🚀 快速开始
 
 ### 1. 安装依赖
+
+建议 Node.js 24 LTS、Python 3.10+。Office 渲染、公式重算与代码运行测试另需对应外部环境。
 ```powershell
 # 前端
 npm install
@@ -109,6 +111,11 @@ npm install
 # 后端
 python -m pip install -r backend/requirements.txt
 ```
+
+安装后运行 `npm run doctor`，检查 Python 模块、Node.js、LibreOffice、中文字体文件与 Docker 服务。
+也可使用 `python scripts/check-runtime.py --json`，或查询 `GET /api/runtime`。
+模型连接保持“未验证”，诊断不调用模型。Docker 仅有命令行但服务未启动时会报告不可用。
+`python scripts/check-runtime.py --require office docker cjk_font` 可要求这些可选能力全部就绪，否则返回非零退出码。
 
 ### 2. 一键启动
 ```powershell
@@ -140,7 +147,7 @@ npm run mobile
 
 > 不配置 API 也能体验演示回放：首页点「内置演示」即可。
 
-API Key 不入库：仓库里只有空白模板 [backend/agent_config.example.json](backend/agent_config.example.json)，需要时复制为 `backend/agent_config.json` 再填入你自己的 Key（或直接在界面里配，界面保存时会用 Windows DPAPI 加密落盘，换台机器无法解密，所以也不需要共享）。
+API Key 不提交到 Git：仓库里只有空白模板 [backend/agent_config.example.json](backend/agent_config.example.json)，建议直接在界面配置。Windows 用 DPAPI 加密落盘；macOS/Linux 使用原生系统密钥存储，JSON 仅保存引用。安全存储不可用时会拒绝保存，不回退明文。复制模板后填写的历史明文会尝试自动迁移，迁移失败会保留原文件并提示。跨机器或账户迁移时需重新输入密钥。
 
 ### 4. 配置成员技能
 
@@ -203,6 +210,24 @@ scripts/           一键启动 / action-gateway 脚本
 
 ## 🧪 测试
 
+推荐使用隔离入口，避免读取真实成员 API 配置或把测试用量写入实际用量文件：
+
+```powershell
+npm test
+npm run lint
+npm run build
+python scripts/test-backend.py
+# 已配置可正常转换文件的 LibreOffice 时，另外执行真实渲染集成测试：
+python scripts/test-backend.py --with-office
+```
+
+默认后端测试模拟 Office 引擎不可用，验证缺失能力时保持“未验证”；真实渲染用例明确跳过。
+`--with-office` 不允许在未发现 LibreOffice 时静默跳过。完整测试仍不调用真实模型。
+GitHub Actions 会执行前端检查、Windows/Linux 离线后端测试，并在 Linux 安装 LibreOffice 与中文字体执行真实渲染测试。
+尚未运行的 CI 不能作为已通过证据。
+
+协作质量实验及汇总方法见 [运行与质量验证](docs/runtime-and-quality.md)。
+
 ### 产物对话修改
 
 从「单飞」或「最终交付」点击「对话生成与修改」进入同一会话，先生成首版，再持续修改、新增配套产物、转换类型或仅讨论。也可从已有产物点击「对话修改」。
@@ -248,10 +273,17 @@ npx tsc --noEmit -p tsconfig.app.json
 
 ## 🔒 数据与隐私
 
+- 当前后端只支持每个数据库一个进程、一个活跃 Sprint。启动时使用操作系统文件锁阻止同库第二个进程，请不要使用多 worker 部署。
+- 启动时把遗留的运行中 Sprint 标为 `interrupted`，保留任务、文件和事件；不会自动重试模型调用。新建协作任务采用 SQLite 持久化检查点，可在任务中心“中断任务续跑”查看并确认后继续，沿用原预算、附件上下文和保存位置。已保存节点不重跑，尚未完成的节点可能重新执行并产生费用；旧版及快速模式任务不支持。详见[续跑说明](docs/runtime-and-quality.md#重启后续跑)。
+- HTTP 与 WebSocket 拒绝外部浏览器 Origin；动作网关也不再开放通配 CORS。无 Origin 的本机脚本仍可访问，这些规则不等于用户认证。
+- 手机入口校验原始浏览器来源与密码后代理到本机。后端仍应只监听回环地址。
+- 预算按已返回的用量估算，并发在途请求可能产生超额；不是服务商的硬扣费上限。
+
 - **历史数据库**：`backend/office.db`（首次启动自动创建）
 - **生成文件**：`backend/deliverables/`
 - **成员配置**：`backend/agent_config.json`（含 API Key，**已纳入 .gitignore，不会入库**）
 - 接口**不会把真实 API Key 回传给前端**，只返回掩码
+- 密钥保护失败会拒绝保存并保留旧配置；macOS/Linux 需要安装依赖并解锁原生 Keychain、Secret Service 或 KWallet。备份不包含非 Windows 的系统密钥存储。
 - CORS 收紧至本地域名，不允许跨域无鉴权访问
 - 本项目仅建议在本机自用；代码产物启动前会做危险调用拦截，但**不是完整安全沙箱，请勿直接用于生产环境**
 

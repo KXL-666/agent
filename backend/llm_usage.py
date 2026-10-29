@@ -11,7 +11,7 @@ import json
 import os
 import threading
 
-USAGE_FILE = os.path.join(os.path.dirname(__file__), "usage.json")
+USAGE_FILE = os.getenv("OFFICE_USAGE_PATH") or os.path.join(os.path.dirname(__file__), "usage.json")
 
 # 价格表：元 / 百万 tokens（输入价, 输出价），为公开刊例的约值，仅供估算
 PRICE_TABLE: dict[str, tuple[float, float]] = {
@@ -130,6 +130,8 @@ def record_usage(roster: int, model: str, usage: dict) -> None:
     completion_tokens = int(usage.get("completion_tokens") or 0)
     if not (prompt_tokens or completion_tokens):
         return
+    import sprint_accounting
+    sprint_accounting.record(prompt_tokens + completion_tokens, estimate_cost(model, prompt_tokens, completion_tokens))
     with _usage_lock:
         entry = _usage.setdefault(
             str(roster), {"model": model, "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,

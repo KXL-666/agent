@@ -1,16 +1,16 @@
-import { type ReactNode } from 'react'
-import { OfficeChatView } from '@/components/OfficeChatView'
+import { lazy, type ReactNode } from 'react'
 import { setActiveView, type OfficeView } from '@/store/officeViewStore'
-import { AgentsView } from './views/AgentsView'
-import { ArtifactsView } from './views/ArtifactsView'
-import { BrowserView } from './views/BrowserView'
-import { CalendarView } from './views/CalendarView'
-import { FilesView } from './views/FilesView'
-import { KnowledgeView } from './views/KnowledgeView'
-import { NotificationsView } from './views/NotificationsView'
-import { SkillsView } from './views/SkillsView'
-import { TalkView } from './views/TalkView'
-import { TaskCenterView } from './views/TaskCenterView'
+const AgentsView = lazy(() => import('./views/AgentsView').then(module => ({ default: module.AgentsView })))
+const ArtifactsView = lazy(() => import('./views/ArtifactsView').then(module => ({ default: module.ArtifactsView })))
+const BrowserView = lazy(() => import('./views/BrowserView').then(module => ({ default: module.BrowserView })))
+const CalendarView = lazy(() => import('./views/CalendarView').then(module => ({ default: module.CalendarView })))
+const FilesView = lazy(() => import('./views/FilesView').then(module => ({ default: module.FilesView })))
+const KnowledgeView = lazy(() => import('./views/KnowledgeView').then(module => ({ default: module.KnowledgeView })))
+const NotificationsView = lazy(() => import('./views/NotificationsView').then(module => ({ default: module.NotificationsView })))
+const SkillsView = lazy(() => import('./views/SkillsView').then(module => ({ default: module.SkillsView })))
+const TalkView = lazy(() => import('./views/TalkView').then(module => ({ default: module.TalkView })))
+const TaskCenterView = lazy(() => import('./views/TaskCenterView').then(module => ({ default: module.TaskCenterView })))
+const OfficeChatView = lazy(() => import('./OfficeChatView').then(module => ({ default: module.OfficeChatView })))
 
 /* ------------------------------ 视图切换器 ------------------------------ */
 

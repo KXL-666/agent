@@ -16,6 +16,19 @@ import {
   subscribeToast,
 } from '@/store/officeUiStore'
 import {
+  createConversation,
+  deleteConversation,
+  getSidebarConversations,
+  openConversation,
+  setSelectedRoster,
+  subscribeChat,
+} from '@/store/officeChatStore'
+import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
+import {
+  getAgentConfigsSnapshot,
+  subscribeAgentConfigs,
+} from '@/store/officeAgentConfigStore'
+import {
   getActiveView,
   getViewedSprint,
   setActiveView,
@@ -62,6 +75,11 @@ export function OfficeSidebar() {
   const unread = useSyncExternalStore(subscribeNotifications, getUnreadSnapshot)
   const activeView = useSyncExternalStore(subscribeView, getActiveView)
   const pulseAt = useSyncExternalStore(subscribeToast, getArtifactPulseAt)
+  // 历史对话列表：团队对话 + 六位成员的单飞对话
+  const sidebarConvos = useSyncExternalStore(subscribeChat, getSidebarConversations)
+  const agentConfigs = useSyncExternalStore(subscribeAgentConfigs, getAgentConfigsSnapshot)
+  const displayNameOf = (rosterNo: number) =>
+    agentConfigs[rosterNo]?.name || AGENT_ROSTER[rosterNo - 1]?.name || `#${rosterNo}`
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const [importing, setImporting] = useState(false)
   // 产物落地后「交付」闪一下「新」徽标；6 秒自动熄灭，点开「交付」立即熄灭
@@ -118,6 +136,26 @@ export function OfficeSidebar() {
     setActiveView(item.view)
   }
 
+  function handleOpenConversation(roster: number, convId: string) {
+    openConversation(roster, convId)
+    if (roster === 0) {
+      setActiveView('talk')
+    } else {
+      setSelectedRoster(roster)
+      setActiveView('chat')
+    }
+  }
+
+  function handleDeleteConversation(roster: number, convId: string, title: string) {
+    if (!window.confirm(`删除对话「${title}」？此操作不可恢复`)) return
+    deleteConversation(roster, convId)
+  }
+
+  function handleNewConversation() {
+    createConversation(0)
+    setActiveView('talk')
+  }
+
   return (
     <aside className="office-sidebar">
       <div className="sidebar-brand">
@@ -167,6 +205,47 @@ export function OfficeSidebar() {
           </button>
         ))}
       </nav>
+
+      <div className="sidebar-convos">
+        <div className="sidebar-convos-head">
+          <span>历史对话</span>
+          <button
+            type="button"
+            className="sidebar-convos-add"
+            onClick={handleNewConversation}
+            title="新建对话"
+            aria-label="新建对话"
+          >
+            ＋
+          </button>
+        </div>
+        <ul className="sidebar-convos-list">
+          {sidebarConvos.map((item) => (
+            <li key={item.conv.id} className="sidebar-convo-row">
+              <button
+                type="button"
+                className={`sidebar-convo ${item.active ? 'active' : ''}`}
+                onClick={() => handleOpenConversation(item.roster, item.conv.id)}
+                title={`进入对话：${item.conv.title}`}
+              >
+                <span className="sidebar-convo-title">{item.conv.title}</span>
+                {item.roster > 0 ? (
+                  <span className="sidebar-convo-agent">{displayNameOf(item.roster)}</span>
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className="sidebar-convo-del"
+                onClick={() => handleDeleteConversation(item.roster, item.conv.id, item.conv.title)}
+                title="删除该对话"
+                aria-label={`删除对话：${item.conv.title}`}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
 
       <div className="sidebar-footer">
         <div className="sidebar-utility-row">

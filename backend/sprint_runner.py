@@ -132,10 +132,17 @@ def _manual_call_guard(sprint_id: str):
     remaining_budget = max(0.0, budget - spent) if budget else 0.0
 
     def guard():
+        import sprint_accounting
+        sprint_accounting.check()
+        scoped = sprint_accounting.current.get()
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError('修订任务已结束，停止后续模型调用')
         if sprint.get("execution_mode") == "local" and not _local_model_ready():
             raise RuntimeError("本地模式模型配置已变更，已阻止修订调用")
+        if scoped and scoped.sprint_id == sprint_id:
+            if budget and float((storage.get_sprint(sprint_id) or {}).get("usage_cost") or 0) >= budget:
+                raise BudgetExceeded("修订操作已达到 Sprint 剩余预算")
+            return
         current_delta = max(0.0, llm.usage_total_cost() - baseline_cost)
         if budget and (spent >= budget or current_delta >= remaining_budget):
             raise BudgetExceeded("修订操作已达到 Sprint 剩余预算")
@@ -148,6 +155,10 @@ def _usage_snapshot() -> tuple[int, int, float]:
 
 
 def _persist_manual_usage_delta(sprint_id: str, before: tuple[int, int, float]) -> None:
+    import sprint_accounting
+    scope = sprint_accounting.current.get()
+    if scope and scope.sprint_id == sprint_id:
+        return
     current = _usage_snapshot()
     sprint = storage.get_sprint(sprint_id) or {}
     storage.update_sprint(
@@ -561,6 +572,7 @@ async def run_sprint(
     direct_artifact: bool = False,
     upload_ids: list[str] | None = None,
     task_kind: str = "auto",
+    resume: bool = False,
 ) -> None:
     """驱动一轮 Sprint：直生成品或走多节点工作流，收尾时落库用量与状态。"""
     import file_knowledge
@@ -569,16 +581,21 @@ async def run_sprint(
     stop_calls = threading.Event()
     budget = float(sprint_meta.get("budget") or 0)
     baseline = float(sprint_meta.get("usage_baseline") or 0)
+    import sprint_accounting
+    durable = runtime_state.persistent_ready and not direct_artifact
+    usage_token = sprint_accounting.current.set(sprint_accounting.Scope(sprint_id)) if durable else None
 
     from route_helpers import _local_model_ready
 
     def guard_call():
+        sprint_accounting.check()
         while True:
             if sprint_meta.get("execution_mode") == "local" and not _local_model_ready():
                 raise RuntimeError("本地模式的模型配置已变更，已阻止后续模型调用")
             if stop_calls.is_set():
                 raise RuntimeError("本轮迭代已结束，停止后续模型调用")
-            if budget and max(0.0, llm.usage_total_cost() - baseline) >= budget:
+            cost = float((sprint_accounting.totals() or {}).get("usage_cost") or 0) if durable else max(0.0, llm.usage_total_cost() - baseline)
+            if budget and cost >= budget:
                 raise BudgetExceeded("已达到本轮预算，停止后续模型调用")
             if not bus.is_paused():
                 return
@@ -590,9 +607,7 @@ async def run_sprint(
         try:
             while True:
                 await asyncio.sleep(8)
-                cur_cost = max(0.0, round(
-                    llm.usage_total_cost() - sprint_meta["usage_baseline"], 4
-                ))
+                cur_cost = workflow_graph.spent_cost()
                 sprint_meta["cost"] = cur_cost
                 bus.emit(
                     {
@@ -607,7 +622,13 @@ async def run_sprint(
     ticker_task: asyncio.Task | None = None
     try:
         llm.SCENE_PACE = runtime_state.FAST_SCENE_PACE if fast else runtime_state.BASE_SCENE_PACE
-        bus.emit({"type": "sprint_start", "requirement": requirement, "sprint_id": sprint_id})
+        if resume:
+            bus.emit({"type": "sprint_resumed", "message": "从持久化检查点续跑", "sprint_id": sprint_id})
+            bus.emit({"type": "hello", "running": True, "paused": False,
+                      "tasks": tasks_store, "artifacts": artifacts_store,
+                      "sprint": dict(sprint_meta), "events": list(bus.event_log[-80:])})
+        else:
+            bus.emit({"type": "sprint_start", "requirement": requirement, "sprint_id": sprint_id})
         ticker_task = asyncio.create_task(cost_ticker())
         if direct_artifact:
             deliver_kind = _detect_file_kind(requirement)
@@ -627,8 +648,7 @@ async def run_sprint(
             bus.emit({"type": "sprint_done", "tasks": [], "accepted": accepted, "pending_checks": pending_checks})
             bus.emit({"type": "stage", "stage": completion_stage, "started_at": sprint_meta["started_at"], "stage_started": time.time()})
             return
-        result = await runtime_state.graph.ainvoke(
-            {
+        initial = {
                 "requirement": requirement,
                 "requirement_contract": storage.get_sprint(sprint_id).get("contract", {}),
                 "tasks": [],
@@ -638,9 +658,14 @@ async def run_sprint(
                 "task_kind": task_kind,
                 "uploads_text": uploads_text,
                 "uploads_images": uploads_images or [],
-            },
+                "pending_instructions": [], "instruction_cutoff": time.time(),
+            }
+        result = await runtime_state.graph.ainvoke(
+            None if resume else initial,
             config={"configurable": {"thread_id": sprint_id}},
+            **({"durability": "sync"} if durable else {}),
         )
+        sprint_accounting.check()
         deliver_kind = result.get("deliver_kind", "") if isinstance(result, dict) else ""
         sprint_meta["deliver_kind"] = deliver_kind or sprint_meta.get("deliver_kind", "")
         final_items = [a for a in artifacts_store if a.get("kind") == "final"]
@@ -686,8 +711,10 @@ async def run_sprint(
             }
         )
     except asyncio.CancelledError:
-        sprint_meta["status"] = "stopped"
-        storage.update_sprint(sprint_id, status="stopped", stage="已手动结束", finished_at=time.time())
+        status = "interrupted" if runtime_state.shutting_down else "stopped"
+        stage = "后端关闭，执行已中断；历史文件保留" if runtime_state.shutting_down else "已手动结束"
+        sprint_meta.update(status=status, stage=stage)
+        storage.update_sprint(sprint_id, status=status, stage=stage, finished_at=time.time())
         raise
     except Exception as error:  # noqa: BLE001 —— 图内异常不能拖垮服务
         print(f"[Sprint] 执行异常：{error}")
@@ -696,12 +723,18 @@ async def run_sprint(
         bus.emit({"type": "sprint_error", "message": str(error)})
     finally:
         stop_calls.set()
+        scope = sprint_accounting.current.get()
+        if scope:
+            scope.stopped.set()
         llm.reset_call_guard(call_token)
         if ticker_task:
             ticker_task.cancel()
+            await asyncio.gather(ticker_task, return_exceptions=True)
         runtime_state.running = False
-        # 本轮状态已由 storage 落库，工作流的内存快照不再需要
-        runtime_state.graph.checkpointer.delete_thread(sprint_id)
+        # Durable checkpoints remain available after interruption and are only
+        # removed with their Sprint. Tests using memory retain legacy cleanup.
+        if not durable:
+            runtime_state.graph.checkpointer.delete_thread(sprint_id)
         sprint_meta["finished_at"] = sprint_meta["finished_at"] or time.time()
         llm.SCENE_PACE = runtime_state.BASE_SCENE_PACE
         forge.set_explicit_save_dir("")
@@ -709,12 +742,13 @@ async def run_sprint(
         sprint_tokens = max(0, llm.usage_total_tokens() - sprint_meta.get("usage_baseline_tokens", 0))
         sprint_cost = round(llm.usage_total_cost() - sprint_meta["usage_baseline"], 4)
         sprint_meta["cost"] = max(0.0, sprint_cost)
-        storage.update_sprint(
-            sprint_id,
-            usage_calls=sprint_calls,
-            usage_tokens=sprint_tokens,
-            usage_cost=max(0.0, sprint_cost),
-        )
+        if durable:
+            usage = storage.get_sprint(sprint_id) or {}
+            sprint_cost = float(usage.get("usage_cost") or 0)
+            sprint_meta["cost"] = sprint_cost
+        else:
+            storage.update_sprint(sprint_id, usage_calls=sprint_calls,
+                                  usage_tokens=sprint_tokens, usage_cost=max(0.0, sprint_cost))
         bus.emit(
             {
                 "type": "sprint_usage",
@@ -732,6 +766,8 @@ async def run_sprint(
                 "stage": sprint_meta.get("stage", ""),
             }
         )
+        if usage_token is not None:
+            sprint_accounting.current.reset(usage_token)
 
 
 async def _run_demo() -> None:

@@ -11,6 +11,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "node --test tests/*.test.mjs",
+    "test:backend": "python scripts/test-backend.py",
+    "doctor": "python scripts/check-runtime.py",
     "preview": "vite preview",
     "mobile": "node scripts/mobile-server.mjs"
   },

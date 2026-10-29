@@ -5,6 +5,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isSameOriginRequest } from './browser-origin.mjs'
 
 const root = resolve(fileURLToPath(new URL('../dist/', import.meta.url)))
 const password = process.env.OFFICE_MOBILE_PASSWORD ?? ''
@@ -39,6 +40,11 @@ function backendPort(path) {
 }
 
 const server = createServer(async (req, res) => {
+  if (!isSameOriginRequest(req)) {
+    res.writeHead(403)
+    res.end('不允许跨站访问')
+    return
+  }
   if (!authenticated(req)) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="AI Office mobile"' })
     res.end('需要访问密码')
@@ -51,6 +57,7 @@ const server = createServer(async (req, res) => {
   const targetPort = backendPort(path)
   if (targetPort) {
     const headers = { ...req.headers, host: `127.0.0.1:${targetPort}` }
+    if (headers.origin) headers.origin = `http://127.0.0.1:${targetPort}`
     delete headers.authorization
     delete headers.cookie
     const proxy = httpRequest({ hostname: '127.0.0.1', port: targetPort, path: path + parsed.search, method: req.method, headers }, upstream => {
@@ -75,13 +82,14 @@ const server = createServer(async (req, res) => {
 })
 
 server.on('upgrade', (req, socket, head) => {
-  if (!authenticated(req) || new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws/office') {
+  if (!isSameOriginRequest(req) || !authenticated(req) || new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws/office') {
     socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
     return
   }
   const upstream = connect(8000, '127.0.0.1')
   upstream.on('connect', () => {
     const headers = { ...req.headers, host: '127.0.0.1:8000' }
+    if (headers.origin) headers.origin = 'http://127.0.0.1:8000'
     delete headers.authorization
     delete headers.cookie
     const lines = [`${req.method} ${req.url} HTTP/1.1`, ...Object.entries(headers).map(([key, value]) => `${key}: ${value}`), '', '']

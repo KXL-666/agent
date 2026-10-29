@@ -241,13 +241,26 @@ class ContentParseTest(unittest.TestCase):
 
 
 class SecretBoxTest(unittest.TestCase):
+    def setUp(self):
+        # Linux CI has no unlocked desktop keyring. Exercise the real reference
+        # protocol with an isolated backend, without requiring or altering one.
+        if os.name != "nt":
+            from unittest.mock import patch
+            from test_secret_storage import MemoryKeyring
+            self.backend = MemoryKeyring()
+            self.keyring_patch = patch.object(secretbox, "_keyring_backend", return_value=self.backend)
+            self.keyring_patch.start()
+            self.addCleanup(self.keyring_patch.stop)
+
     def test_roundtrip(self):
         cipher = secretbox.encrypt_value("test-api-key-123456")
         if os.name == "nt":
             self.assertTrue(secretbox.is_encrypted(cipher))
             self.assertEqual(secretbox.decrypt_value(cipher), "test-api-key-123456")
         else:
-            self.assertEqual(cipher, "test-api-key-123456")
+            self.assertTrue(cipher.startswith("keyring:"))
+            self.assertEqual(secretbox.decrypt_value(cipher), "test-api-key-123456")
+            secretbox.delete_value(cipher)
 
     def test_decrypt_plain_passthrough(self):
         self.assertEqual(secretbox.decrypt_value("sk-plain"), "sk-plain")
@@ -268,9 +281,8 @@ class SecretBoxTest(unittest.TestCase):
 
                 raw = json.load(f)
             on_disk = raw[str(roster)]["llm"]["api_key"]
-            if os.name == "nt":
-                self.assertTrue(secretbox.is_encrypted(on_disk))
-                self.assertNotIn("test-api-key-secret-abc", on_disk)
+            self.assertTrue(secretbox.is_encrypted(on_disk))
+            self.assertNotIn("test-api-key-secret-abc", on_disk)
             resolved = agent_config.resolve_llm(roster)
             self.assertEqual(resolved["api_key"], "test-api-key-secret-abc")
         finally:

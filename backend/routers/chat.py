@@ -38,6 +38,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     upload_ids: list[str] = []
+    sprint_id: str = ""  # 发起本轮 Sprint 的对话标识：只给对应对话注入 Sprint 快照
 
 
 class IntentRequest(BaseModel):
@@ -132,10 +133,10 @@ async def chat_intent(req: IntentRequest):
     return {"intent": _heuristic_intent(text) or "chat", "via": "fallback"}
 
 
-def _chat_system(roster: int) -> str:
+def _chat_system(roster: int, sprint_id: str = "") -> str:
     cfg = agent_config.get_agent_config(roster)
     entry = {**ROSTER[roster], "name": cfg.get("name") or ROSTER[roster]["name"]}
-    return build_chat_system(entry, roster, sprint_meta, tasks_store, artifacts_store)
+    return build_chat_system(entry, roster, sprint_meta, tasks_store, artifacts_store, sprint_id)
 
 
 @router.post("")
@@ -147,7 +148,7 @@ async def chat(req: ChatRequest):
     if not text:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
-    system = _chat_system(req.roster)
+    system = _chat_system(req.roster, req.sprint_id)
     local_reply = clock_reply(text)
     if local_reply:
         return {"reply": local_reply, "llm": False, "model": "系统时钟", "roster": req.roster, "degraded": False}
@@ -198,7 +199,7 @@ async def chat_stream(req: ChatRequest):
     history.append({"role": "user", "content": text})
     fallback = unavailable_reply(text)
     meta: dict = {}
-    system = _chat_system(req.roster)
+    system = _chat_system(req.roster, req.sprint_id)
     local_reply = clock_reply(text)
     images = uploads.extract_images(req.upload_ids)
     if images:

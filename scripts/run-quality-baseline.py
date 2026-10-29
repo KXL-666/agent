@@ -98,12 +98,10 @@ def run_case(client: httpx.Client, case_id: str, output: Path, timeout_s: int,
         response = client.post("/api/uploads", files={"files": (case["attachment_name"], case["attachment"].encode("utf-8"), "text/plain")})
         response.raise_for_status()
         attachment_ids = [item["id"] for item in response.json()["uploads"]]
-    # The current auto route skips the team on single-file requests. Freeze the
-    # collaboration instruction as part of this test input, before any code change.
-    requirement = case["requirement"] + (
-        " 请由团队协作完成。"
-        if execution_style == "collaborative" and case_id != "C1" else ""
-    )
+    # Execution style is explicit in the API. Keep user text identical between
+    # quick and collaborative runs so comparisons do not change both factors.
+    requirement = case["requirement"]
+    fingerprint = hashlib.sha256(json.dumps(case, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     request = {"requirement": requirement, "upload_ids": attachment_ids,
                "fast": True, "task_kind": "auto", "budget": max(0.0, budget_yuan),
                "execution_style": execution_style}
@@ -131,6 +129,7 @@ def run_case(client: httpx.Client, case_id: str, output: Path, timeout_s: int,
     reported_status = "failed" if runner_interrupted else sprint.get("status")
     artifacts = [artifact_summary(client, item) for item in detail["artifacts"]]
     output_data = {"case": case_id, "sprint_id": sprint_id, "route": planned_route,
+                   "input_sha256": fingerprint,
                    "execution_style": execution_style,
                    "timed_out": timed_out, "runner_interrupted": runner_interrupted,
                    "failure_reason": ("后台执行器已停止，但持久化状态仍为 running；按中断失败记录。"
@@ -155,7 +154,7 @@ def run_case(client: httpx.Client, case_id: str, output: Path, timeout_s: int,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--case", nargs="+", choices=CASES)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--timeout-s", type=int, default=1800)
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
@@ -164,6 +163,10 @@ def main() -> None:
                         help="Per-Sprint estimated-cost ceiling in yuan; 0 means unlimited")
     parser.add_argument("--refresh", type=Path, help="Refresh file hashes and stored Sprint usage in an existing result JSON")
     args = parser.parse_args()
+    if args.case is None:
+        args.case = [key for key in CASES if args.execution_style != "quick" or key != "C1"]
+    if not args.refresh and args.execution_style == "quick" and "C1" in args.case:
+        parser.error("C1 是代码任务，不支持 quick；请使用 collaborative")
     if args.refresh:
         with httpx.Client(base_url=args.base_url, timeout=45, trust_env=False) as client:
             data = json.loads(args.refresh.read_text(encoding="utf-8"))

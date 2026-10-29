@@ -32,7 +32,8 @@ if (-not $SkipOffice -and $taskHasOffice -ne "1") {
 
 Push-Location -LiteralPath $taskBackend
 try {
-    & $Python -c "import json, office_runtime; print(json.dumps(office_runtime.capabilities(), ensure_ascii=True))"
+    & $Python (Join-Path $taskRoot "scripts\check-runtime.py")
+    if ($LASTEXITCODE -ne 0) { throw "基础运行环境检查未通过，请按诊断结果补齐依赖" }
 } finally {
     Pop-Location
 }

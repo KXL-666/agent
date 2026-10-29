@@ -12,7 +12,7 @@ import {
   type OfficeArtifact,
 } from '@/store/officeArtifactStore'
 import { clearNotifications, recordNotification, restoreNotifications } from '@/store/officeEventStore'
-import { appendAssistantMessage, updateTaskMessage } from '@/store/officeChatStore'
+import { appendAssistantMessage, appendHintMessage, appendHintToConversation, findConversationBySprint, getActiveConversationId, markConversationSprint, updateTaskMessage } from '@/store/officeChatStore'
 import { getOfficeAgents } from '@/store/officeStore'
 import { addThought, clearThoughts } from '@/store/officeThoughtStore'
 import { pulseArtifacts, showToast } from '@/store/officeUiStore'
@@ -25,6 +25,7 @@ import {
 import {
   applySprintMeta,
   applyTaskSnapshot,
+  clearActivities,
   getSprintMetaSnapshot,
   getTasksSnapshot,
   isSprintRunning,
@@ -116,6 +117,25 @@ function finalQualityDetail(): string {
     artifact.file_name ? `文件：${artifact.file_name}` : '文件：未生成，当前为文字摘要',
     artifact.degraded_reason ? `问题原因：${artifact.degraded_reason}` : '',
   ].filter(Boolean).join('\n')).join('\n\n')
+}
+
+/** 手动结束后的界面清理（幂等）：在发起对话里留文字记录，再清掉本轮界面残留 */
+function finalizeManualStop() {
+  const metaBeforeReset = getSprintMetaSnapshot()
+  if (!metaBeforeReset.id) return
+  const endedTasks = getTasksSnapshot()
+  const doneCount = endedTasks.filter((task) => task.status === '通过').length
+  const artifactCount = getArtifactsSnapshot().length
+  const recordText = `本轮任务已手动结束：通过验收 ${doneCount}/${endedTasks.length} 项，产出 ${artifactCount} 件产物，累计花费 ¥${metaBeforeReset.cost.toFixed(3)}。历史可在「任务」视图中回看。`
+  const ownerConv = findConversationBySprint(0, metaBeforeReset.id)
+  if (ownerConv) {
+    appendHintToConversation(0, ownerConv, recordText)
+  } else {
+    appendHintMessage(0, recordText)
+  }
+  applyTaskSnapshot([])
+  clearActivities()
+  resetSprintMeta()
 }
 
 function restoredEventDetail(event: Record<string, unknown>): { title?: string; detail?: string } {
@@ -268,6 +288,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
 
   switch (message.type) {
     case 'desk_visit': {
+      // Sprint 已结束：取消瞬间仍在飞行的 speak 线程会迟到补发拜访事件，直接丢弃
+      if (sprintTerminal) return
       submitVisitAction({
         type: 'desk_visit',
         visitor: message.visitor,
@@ -284,6 +306,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       return
     }
     case 'thought': {
+      if (sprintTerminal) return
       // 成员决策依据：入思考流 store + 场景头顶思考泡 + 通知中心可回溯全文
       const rosterNo = Number(message.rosterNo ?? 0)
       const text = String(message.thought ?? '').trim()
@@ -302,6 +325,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       return
     }
     case 'handoff': {
+      if (sprintTerminal) return
       // 交接叙事：仅阶段级交接（无 task_id）进通知中心，任务级交接由气泡与任务卡覆盖
       const handoff = (message as { handoff?: Record<string, unknown> }).handoff
       if (!handoff || handoff.task_id) return
@@ -328,6 +352,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       return
     }
     case 'desk_visit_tour': {
+      if (sprintTerminal) return
       submitVisitAction({
         type: 'desk_visit_tour',
         visitor: message.visitor,
@@ -357,6 +382,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       return
     }
     case 'emote': {
+      if (sprintTerminal) return
       const agentId = resolveAgentId(message)
       if (!agentId) {
         console.warn('[OfficeWS] emote: agent not found', message)
@@ -478,6 +504,8 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
         finishedAt: 0,
       })
       const startText = `Sprint 开始：${String(requirement ?? '')}`
+      // 把本轮 Sprint 归属到发起它的对话：新建对话后是干净窗口，老对话里仍能回看本轮卡片
+      if (sprintId) markConversationSprint(0, getActiveConversationId(0), String(sprintId))
       pushActivity(startText)
       recordNotification(startText, 'sprint_start', {
         title: '本轮工作内容', detail: `需求：${String(requirement ?? '未填写')}\n状态：进行中\n阶段：准备开工`,
@@ -538,11 +566,12 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       sprintTerminal = true
       setSprintRunning(false)
       idleAllAgents()
+      // 终态防残留：实时动态只展示进行中的轮次，结束后清空，结果走通知中心/历史记录
+      clearActivities()
       if (message.pending_checks === true) {
         applySprintMeta({ status: 'completed', stage: '交付待验证' })
         playTaskSound()
         pulseArtifacts()
-        pushActivity('文件已生成，部分验收尚未执行，请查看验收详情')
         recordNotification('文件已生成，部分验收尚未执行', 'sprint_done', {
           title: '本轮验收状态', detail: finalQualityDetail(),
         })
@@ -553,7 +582,6 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
         applySprintMeta({ status: 'failed', stage: '交付待修正' })
         playDoneSound()
         pulseArtifacts()
-        pushActivity('迭代已结束，交付未通过验收，请查看产物失败原因')
         recordNotification('交付待修正，请查看产物质检结果与复盘', 'sprint_error', {
           title: '验收失败详情', detail: finalQualityDetail(),
         })
@@ -564,7 +592,6 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       applySprintMeta({ status: 'completed', stage: '已完成' })
       playDoneSound()
       pulseArtifacts()
-      pushActivity('Sprint 完成，团队进入空闲')
       recordNotification('Sprint 完成，团队进入空闲', 'sprint_done', {
         title: '本轮交付结果', detail: finalQualityDetail(),
       })
@@ -577,14 +604,14 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
     case 'sprint_stopped': {
       sprintTerminal = true
       setSprintRunning(false)
-      applySprintMeta({ status: 'stopped', stage: '已手动结束' })
       idleAllAgents()
       playTaskSound()
       pulseArtifacts()
-      pushActivity('任务已手动结束')
+      finalizeManualStop()
       recordNotification('任务已手动结束', 'sprint_done', {
         title: '结束时的交付状态', detail: finalQualityDetail(),
       })
+      void refreshSprintHistory()
       showToast('任务已结束，团队进入空闲')
       return
     }
@@ -596,7 +623,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       const errorText = `Sprint 异常：${String(errorMessage ?? '未知错误')}`
       applySprintMeta({ status: 'failed' })
       playDoneSound()
-      pushActivity(errorText)
+      clearActivities()
       recordNotification(errorText, 'sprint_error', {
         title: '错误详情', detail: String(errorMessage ?? '未知错误'),
       })
@@ -612,6 +639,12 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       const wasRunning = isSprintRunning()
       setSprintRunning(false)
       idleAllAgents()
+      // 手动结束的轮次以 sprint_stopped 的清理为准：不再回写 meta，仅做幂等兜底清理
+      if (String(endPayload.status ?? '') === 'stopped') {
+        finalizeManualStop()
+        if (wasRunning) void refreshSprintHistory()
+        return
+      }
       // 只采纳与当前轮次匹配的 meta，忽略可能迟到的旧轮次信号
       if (!endPayload.sprint_id || String(endPayload.sprint_id) === getSprintMetaSnapshot().id) {
         applySprintMeta({
@@ -640,7 +673,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       idleAllAgents()
       applySprintMeta({ status: 'completed', stage: '已达预算上限' })
       playDoneSound()
-      pushActivity(text)
+      clearActivities()
       recordNotification(text, 'budget_exceeded', {
         title: '预算限制详情', detail: `当前需求：${getSprintMetaSnapshot().requirement || '未记录'}\n${text}`,
       })
@@ -698,7 +731,9 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
         paused?: boolean
         events?: Array<Record<string, unknown>>
       }
-      if (Array.isArray(snapshot.tasks) && !getViewedSprint()) {
+      // 后端停止后仍保留旧任务/花费快照：手动结束的轮次不回填界面残留，历史走「任务」视图
+      const snapshotStopped = !snapshot.running && snapshot.sprint?.status === 'stopped'
+      if (Array.isArray(snapshot.tasks) && !getViewedSprint() && !snapshotStopped) {
         applyTaskSnapshot(snapshot.tasks as SprintTask[])
       }
       if (Array.isArray(snapshot.artifacts) && !getViewedSprint()) {
@@ -706,7 +741,7 @@ export function dispatchOfficeAction(message: OfficeActionMessage) {
       }
       // 正在浏览历史 Sprint：重连后重新拉取历史数据，避免被实时快照覆盖
       if (getViewedSprint()) void reloadViewedSprint()
-      if (snapshot.sprint) {
+      if (snapshot.sprint && !snapshotStopped) {
         applySprintMeta({
           id: snapshot.sprint.id ?? '',
           requirement: snapshot.sprint.requirement ?? '',

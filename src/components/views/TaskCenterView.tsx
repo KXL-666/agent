@@ -21,6 +21,7 @@ import {
   workspaceMatches,
 } from '@/store/officeViewStore'
 import { STATUS_ORDER } from './officeViewUtils'
+import { SprintRecoveryPanel } from '../SprintRecoveryPanel'
 
 function WideTaskCard({ task, onOpen }: { task: SprintTask; onOpen?: () => void }) {
   const running = useSyncExternalStore(subscribeSprintData, isSprintRunning)
@@ -108,6 +109,7 @@ export function TaskCenterView() {
         </div>
       ) : null}
 
+      <SprintRecoveryPanel />
       <div className="task-filter" role="group" aria-label="按负责人筛选任务">
         <span>负责人</span>
         {WORKSPACES.map((option, index) => (

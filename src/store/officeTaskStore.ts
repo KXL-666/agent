@@ -158,6 +158,11 @@ export function getActivitiesSnapshot(): SprintActivity[] {
   return activities
 }
 
+export function clearActivities() {
+  activities = []
+  notify()
+}
+
 export function isSprintRunning(): boolean {
   return sprintRunning
 }

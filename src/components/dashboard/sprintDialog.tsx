@@ -237,6 +237,7 @@ export function SprintDialog() {
         ) : null}
         <details className="sprint-advanced">
           <summary>更多设置 <span>任务类型、模型、保存位置与预算</span></summary>
+          <p>预算按已返回的模型用量估算；并行请求和服务商实际计费可能使最终费用超出设置值。</p>
         <label className="sprint-fast-toggle"><span>任务类型：</span><select value={taskKind} onChange={event => {
           const nextKind = event.target.value as 'auto' | 'file' | 'software'
           setTaskKind(nextKind)

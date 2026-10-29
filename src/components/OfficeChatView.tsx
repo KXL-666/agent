@@ -11,7 +11,7 @@ import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
 import {
   appendHintMessage,
   appendUserMessage,
-  clearThread,
+  createConversation,
   getSelectedRoster,
   getThreadSnapshot,
   setSelectedRoster,
@@ -43,9 +43,15 @@ import {
 
 import { runConversationTurn } from '@/services/conversationActions'
 import { ConversationArtifact } from '@/components/ConversationArtifact'
+import { ImagePreviewOverlay } from '@/components/ImagePreviewOverlay'
 
 function hexColor(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
+}
+
+/** 图片附件在附件条上直接渲染缩略图，直观看到待发送内容 */
+function uploadThumbUrl(id: string): string {
+  return `${OFFICE_API_BASE}/api/uploads/${id}/raw`
 }
 
 /** 后端视觉输入上限 2MB / 单条消息最多 4 张图片 */
@@ -67,6 +73,7 @@ export function OfficeChatView() {
   const setImages = (value: OfficeUpload[] | ((previous: OfficeUpload[]) => OfficeUpload[])) =>
     setImageThreads((prev) => ({ ...prev, [roster]: typeof value === 'function' ? value(prev[roster] ?? []) : value }))
   const [uploading, setUploading] = useState(false)
+  const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
   const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(roster))
   const listRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
@@ -92,10 +99,8 @@ export function OfficeChatView() {
     if (el) el.scrollTop = el.scrollHeight
   }, [thread, roster])
 
-  /** 选择图片：>2MB 直接提示并跳过（后端视觉输入上限），合计最多 4 张 */
-  async function handlePickImages(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? [])
-    event.target.value = '' // 允许重复选同一文件
+  /** 添加图片：>2MB 直接提示并跳过（后端视觉输入上限），合计最多 4 张 */
+  async function addImages(files: File[]) {
     if (files.length === 0) return
     const room = MAX_IMAGES - images.length
     if (room <= 0) {
@@ -131,6 +136,27 @@ export function OfficeChatView() {
     }
   }
 
+  async function handlePickImages(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = '' // 允许重复选同一文件
+    await addImages(files)
+  }
+
+  /** 粘贴图片：截图/复制的图片直接入列，无需先存盘再选择 */
+  function handlePaste(event: React.ClipboardEvent<HTMLInputElement>) {
+    const pasted = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+      file.type.startsWith('image/'),
+    )
+    if (pasted.length === 0) return // 纯文本粘贴走默认行为
+    event.preventDefault()
+    const stamp = Date.now()
+    const renamed = pasted.map((file, index) => {
+      const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+      return new File([file], `粘贴图片-${stamp}${pasted.length > 1 ? `-${index + 1}` : ''}.${ext}`, { type: file.type })
+    })
+    void addImages(renamed)
+  }
+
   function handleRemoveImage(id: string) {
     setImages((prev) => prev.filter((item) => item.id !== id))
     void removeUpload(id)
@@ -138,7 +164,8 @@ export function OfficeChatView() {
 
   async function handleSend() {
     const text = input.trim()
-    if (!text || pending) return
+    if ((!text && images.length === 0) || pending) return
+    const message = text || '请查看这张图片'
     const controller = beginChat(roster)
     if (!controller) return
 
@@ -148,7 +175,7 @@ export function OfficeChatView() {
       content: m.content,
     }))
     const uploadIds = images.map((item) => item.id)
-    appendUserMessage(roster, text)
+    appendUserMessage(roster, message, uploadIds)
     setInput('')
     setImages([])
 
@@ -166,7 +193,7 @@ export function OfficeChatView() {
     let backupUsed = false
     let executingAction = true
     try {
-      const result = await runConversationTurn({ thread: roster, message: text, history: previousMessages, uploadIds, signal: controller.signal })
+      const result = await runConversationTurn({ thread: roster, message, history: previousMessages, uploadIds, signal: controller.signal })
       executingAction = false
       if (result.handled) {
         appendConversationResult(roster, result.reply || '本轮操作已完成', result.artifacts)
@@ -179,7 +206,7 @@ export function OfficeChatView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           roster,
-          message: text,
+          message,
           history,
           upload_ids: uploadIds,
         }),
@@ -321,11 +348,11 @@ export function OfficeChatView() {
               className="view-ghost-btn"
               disabled={pending}
               onClick={() => {
-                clearThread(roster)
-                showToast('聊天记录已清空')
+                createConversation(roster)
+                showToast('已开启新对话，历史对话在左侧菜单栏')
               }}
             >
-              清空记录
+              ＋ 新建对话
             </button>
           </header>
 
@@ -343,7 +370,7 @@ export function OfficeChatView() {
                 ) : message.role === 'task' ? (
                   <TaskCard key={message.taskId ?? i} message={message} />
                 ) : (
-                  <ChatBubble key={i} message={message} roster={roster} />
+                  <ChatBubble key={i} message={message} roster={roster} onPreview={(src) => setPreviewImage({ src, alt: '附件图片' })} />
                 ),
               )
             )}
@@ -355,7 +382,14 @@ export function OfficeChatView() {
           {images.length > 0 ? (
             <ul className="chat-image-chips">
               {images.map((item) => (
-                <li key={item.id} className="chat-image-chip">
+                <li key={item.id} className="chat-image-chip has-thumb">
+                  <img
+                    className="attachment-thumb"
+                    src={uploadThumbUrl(item.id)}
+                    alt={item.name}
+                    title="点击放大查看"
+                    onClick={() => setPreviewImage({ src: uploadThumbUrl(item.id), alt: item.name })}
+                  />
                   <span className="chat-image-name" title={item.name}>
                     {item.name}
                   </span>
@@ -392,7 +426,8 @@ export function OfficeChatView() {
             </button>
             <input
               value={input}
-              placeholder={`给 ${displayNameOf(roster)} 发消息…`}
+              placeholder={`给 ${displayNameOf(roster)} 发消息…（可直接粘贴截图）`}
+              onPaste={handlePaste}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') handleSend()
@@ -410,7 +445,7 @@ export function OfficeChatView() {
             <button
               type="button"
               className="view-primary-btn"
-              disabled={pending || !input.trim()}
+              disabled={pending || (!input.trim() && images.length === 0)}
               onClick={handleSend}
             >
               发送
@@ -418,16 +453,32 @@ export function OfficeChatView() {
           </footer>
         </section>
       </div>
+
+      {previewImage ? (
+        <ImagePreviewOverlay
+          src={previewImage.src}
+          alt={previewImage.alt}
+          onClose={() => setPreviewImage(null)}
+        />
+      ) : null}
     </div>
   )
 }
 
-function ChatBubble({ message, roster }: { message: ChatMessage; roster: number }) {
+function ChatBubble({ message, roster, onPreview }: { message: ChatMessage; roster: number; onPreview?: (src: string) => void }) {
   const isUser = message.role === 'user'
   return (
     <div className={`chat-bubble-row ${isUser ? 'mine' : ''}`}>
       <div className="chat-bubble">
         <p>{message.content}</p>
+        {message.images?.length ? (
+          <span className="talk-msg-images">
+            {message.images.map(id => (
+              <img key={id} src={uploadThumbUrl(id)} alt="附件图片"
+                onClick={() => onPreview?.(uploadThumbUrl(id))} />
+            ))}
+          </span>
+        ) : null}
         {message.artifacts?.map(artifact => <ConversationArtifact key={artifact.id} artifact={artifact} thread={roster} />)}
         <span className="chat-meta">
           {message.time}

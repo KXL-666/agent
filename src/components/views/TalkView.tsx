@@ -47,7 +47,8 @@ import { requestNotifyPermission } from '@/services/officeNotify'
 
 import { runConversationTurn } from '@/services/conversationActions'
 import { ConversationArtifact } from '@/components/ConversationArtifact'
-import { appendUserMessage, appendConversationResult, getThreadSnapshot, subscribeChat, updateLastAssistantMessage, getArtifactTarget, setArtifactTarget, beginChat, finishChat, getPendingRosters } from '@/store/officeChatStore'
+import { ImagePreviewOverlay } from '@/components/ImagePreviewOverlay'
+import { appendUserMessage, appendConversationResult, getThreadSnapshot, subscribeChat, updateLastAssistantMessage, getArtifactTarget, setArtifactTarget, beginChat, finishChat, getPendingRosters, createConversation, getConversationsSnapshot, getActiveConversationId, getRecordedArtifactIds } from '@/store/officeChatStore'
 
 function hexColor(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
@@ -68,6 +69,15 @@ function downloadDataUrl(dataUrl: string, filename: string) {
   anchor.click()
 }
 
+/** 按扩展名判断附件是否为图片，图片附件在附件条上直接渲染缩略图 */
+function isImageUpload(name: string): boolean {
+  return /\.(png|jpe?g|gif|bmp|webp|tiff)$/i.test(name)
+}
+
+function uploadThumbUrl(id: string): string {
+  return `${OFFICE_API_BASE}/api/uploads/${id}/raw`
+}
+
 /** 对话指挥中心：按模板重设计——头部 + 消息流（调度记录/交接卡/产物卡）+ 底部输入区 */
 export function TalkView() {
   const { running, paused, busy, togglePause } = useSprintPause()
@@ -83,11 +93,15 @@ export function TalkView() {
   const [sending, setSending] = useState(false)
   /** 唯一团队对话线程；与六个单飞线程分别持久化。 */
   const chatMessages = useSyncExternalStore(subscribeChat, () => getThreadSnapshot(0))
+  const conversations = useSyncExternalStore(subscribeChat, () => getConversationsSnapshot(0))
+  const activeConvId = useSyncExternalStore(subscribeChat, () => getActiveConversationId(0))
+  const activeConvTitle = conversations.find((c) => c.id === activeConvId)?.title ?? ''
   const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(0))
   const pendingRosters = useSyncExternalStore(subscribeChat, getPendingRosters)
   const [listening, setListening] = useState(false)
   const [attachments, setAttachments] = useState<OfficeUpload[]>([])
   const [uploading, setUploading] = useState(false)
+  const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const dirInputRef = useRef<HTMLInputElement | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -118,11 +132,15 @@ export function TalkView() {
   const sprintStatus = viewedMeta?.status ?? meta.status
   const stage = viewedMeta?.stage ?? meta.stage
   const cost = viewedMeta?.cost ?? meta.cost
+  // Sprint 卡片块归属发起它的对话：新建对话是干净窗口；查看历史记录（viewedSprintId）时仍展示
+  const activeConvSprintId = conversations.find((c) => c.id === activeConvId)?.sprintId ?? ''
   const hasSprint = Boolean(requirement)
+    && (Boolean(viewedSprintId) || (Boolean(meta.id) && activeConvSprintId === meta.id))
   useEffect(() => {
     if (running || !hasSprint || !sprintKey) return
     const delivered = artifacts.filter(a => a.sprint_id === sprintKey && (a.kind === 'final' || a.kind === 'custom'))
-    const recorded = new Set(getThreadSnapshot(0).flatMap(m => m.artifacts?.map(a => a.id) ?? []))
+    // 跨全部历史对话查重：切换对话后不会把已推送过的产物卡再推一遍
+    const recorded = getRecordedArtifactIds(0)
     const fresh = delivered.filter(a => !recorded.has(a.id))
     if (fresh.length) appendConversationResult(0, '本轮产物已保存，可以直接继续提出修改要求。', fresh)
   }, [running, hasSprint, sprintKey, artifacts])
@@ -167,10 +185,8 @@ export function TalkView() {
     }
   }
 
-  /** 附件选择：上传到后端暂存，发送时随需求一起提交 */
-  async function handlePickAttachments(event: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? [])
-    event.target.value = '' // 允许重复选同一文件
+  /** 附件上传：上传到后端暂存，发送时随需求一起提交 */
+  async function addAttachmentFiles(files: File[]) {
     if (files.length === 0) return
     setUploading(true)
     try {
@@ -184,6 +200,30 @@ export function TalkView() {
     } finally {
       setUploading(false)
     }
+  }
+
+  async function handlePickAttachments(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = '' // 允许重复选同一文件
+    await addAttachmentFiles(files)
+  }
+
+  /** 粘贴图片：截图/复制的图片直接作为附件上传，无需先存盘再选择 */
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const pasted = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+      file.type.startsWith('image/'),
+    )
+    if (pasted.length === 0) return // 纯文本粘贴走默认行为
+    event.preventDefault()
+    const stamp = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const renamed = pasted.map((file, index) => {
+      const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+      const name = `粘贴图片-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}${pasted.length > 1 ? `-${index + 1}` : ''}.${ext}`
+      return new File([file], name, { type: file.type })
+    })
+    showToast(`已粘贴 ${renamed.length} 张图片，将作为附件发送`)
+    void addAttachmentFiles(renamed)
   }
 
   async function handleRemoveAttachment(id: string) {
@@ -296,7 +336,7 @@ export function TalkView() {
       const res = await fetch(`${OFFICE_API_BASE}/api/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roster: 1, message, history }),
+        body: JSON.stringify({ roster: 1, message, history, upload_ids: attachments.map(item => item.id), sprint_id: activeConvSprintId }),
       })
       if (!res.ok || !res.body) throw new Error('连接失败，请确认后端已启动')
       let acc = ''
@@ -331,15 +371,21 @@ export function TalkView() {
     }
   }
 
-  /** 发送：运行中下达指示；空闲时自动识别意图——闲聊产品经理回复，需求直接开工 */
+  /** 发送：运行中下达指示；空闲时自动识别意图——闲聊产品经理回复，需求直接开工。允许纯图片发送 */
   async function handleSend() {
     const raw = text.trim()
-    if (!raw || sending || pendingRosters.includes(0)) return
-    const payload = manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${raw}` : raw
+    const hasImages = attachments.length > 0
+    if ((!raw && !hasImages) || sending || pendingRosters.includes(0)) return
+    const message = raw || '请查看这张图片'
+    const payload = manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${message}` : message
     if (running) {
+      if (!raw) {
+        showToast('任务运行中请先输入文字说明，图片可在任务结束后再发')
+        return
+      }
       const ok = await sendInstruct(payload)
       if (ok) {
-        appendUserMessage(0, raw)
+        appendUserMessage(0, message)
         setText('')
       }
       return
@@ -348,19 +394,22 @@ export function TalkView() {
     if (!controller) return
     setSending(true)
     const previousMessages = getThreadSnapshot(0)
-    appendUserMessage(0, raw)
+    appendUserMessage(0, message, attachments.filter(item => isImageUpload(item.name)).map(item => item.id))
     setText('')
+    // 发送即清空附件条：图片已随消息提交，不能残留在输入区
+    setAttachments([])
     try {
-      const result = await runConversationTurn({ thread: 0, message: raw, history: previousMessages,
-        uploadIds: attachments.map(item => item.id), sprintId: sprintKey || '', signal: controller.signal })
+      const result = await runConversationTurn({ thread: 0, message, history: previousMessages,
+        uploadIds: attachments.map(item => item.id), sprintId: activeConvSprintId, signal: controller.signal })
       if (result.handled) {
         appendConversationResult(0, result.reply || '本轮操作已完成', result.artifacts)
         if (result.artifacts?.length) setArtifactTarget(0, '')
         setAttachments([])
       } else if (result.intent === 'requirement') {
-        await beginSprint(manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${result.requirement || raw}` : result.requirement || payload)
+        await beginSprint(manualTarget ? `请${displayNameOf(manualTarget)}重点负责：${result.requirement || message}` : result.requirement || payload)
       } else {
-        await replyAsChat(raw, result.context)
+        await replyAsChat(message, result.context)
+        setAttachments([])
       }
     } catch (error) {
       appendConversationResult(0, `本轮未完成：${(error as Error).message}。请重新发送。`)
@@ -379,8 +428,20 @@ export function TalkView() {
           </div>
           <div className="talk-titles">
             <div className="t">与产品经理的对话</div>
+            {activeConvTitle ? <div className="s">{activeConvTitle}</div> : null}
           </div>
           <div className="spacer" />
+          <button
+            type="button"
+            className="talk-new-btn"
+            onClick={() => {
+              createConversation(0)
+              showToast('已开启新对话，历史对话可在左侧菜单栏进入')
+            }}
+            title="新建对话（老对话保留在左侧菜单栏）"
+          >
+            ＋ 新建对话
+          </button>
           <button type="button" className="talk-office-btn" onClick={() => setSheetOpen(true)}>
             <span className="dot" />
             办公室员工
@@ -438,6 +499,8 @@ export function TalkView() {
                         {`团队正在推进：当前阶段「${stage || '进行中'}」，任务通过 ${done}/${total}，累计花费 ¥${cost.toFixed(2)}。可继续补充指示，或用下方按钮暂停/结束。`}
                         <span className="talk-caret" />
                       </>
+                    ) : sprintStatus === 'stopped' ? (
+                      `本轮任务已手动结束：通过验收 ${done}/${total} 项，产出 ${artifacts.length} 件产物，累计花费 ¥${cost.toFixed(2)}。未完成任务已清空，点「＋ 新建对话」开始下一轮。`
                     ) : (
                       `本轮任务已结束：${done}/${total} 项任务通过验收，共产出 ${artifacts.length} 件产物，累计花费 ¥${cost.toFixed(2)}。可在下方产物卡中预览、下载，或继续发消息修改。`
                     )}
@@ -461,6 +524,14 @@ export function TalkView() {
               </div>
               <div className="talk-msg-body">
                 <div className="talk-bubble">{m.content}</div>
+                {m.images?.length ? (
+                  <div className="talk-msg-images">
+                    {m.images.map(id => (
+                      <img key={id} src={uploadThumbUrl(id)} alt="附件图片"
+                        onClick={() => setPreviewImage({ src: uploadThumbUrl(id), alt: '附件图片' })} />
+                    ))}
+                  </div>
+                ) : null}
                 {m.artifacts?.map(artifact => <ConversationArtifact key={artifact.id} artifact={artifact} thread={0} />)}
               </div>
             </div>
@@ -474,7 +545,16 @@ export function TalkView() {
           {attachments.length > 0 || uploading ? (
             <ul className="attachment-chips talk-attach-chips">
               {attachments.map((item) => (
-                <li key={item.id} className="attachment-chip">
+                <li key={item.id} className={`attachment-chip ${isImageUpload(item.name) ? 'has-thumb' : ''}`}>
+                  {isImageUpload(item.name) ? (
+                    <img
+                      className="attachment-thumb"
+                      src={uploadThumbUrl(item.id)}
+                      alt={item.name}
+                      title="点击放大查看"
+                      onClick={() => setPreviewImage({ src: uploadThumbUrl(item.id), alt: item.name })}
+                    />
+                  ) : null}
                   <span className="attachment-name" title={item.name}>
                     {item.name}
                   </span>
@@ -539,9 +619,10 @@ export function TalkView() {
               placeholder={
                 running
                   ? '补充指示，例如：周报里加上本周风险…'
-                  : '和团队聊聊，或描述想完成的任务（自动识别，无需确认）…'
+                  : '和团队聊聊，或描述想完成的任务（自动识别，无需确认），可直接粘贴截图…'
               }
               disabled={sending || pendingRosters.includes(0)}
+              onPaste={handlePaste}
               onChange={(event) => {
                 setText(event.target.value)
                 const el = event.target
@@ -570,7 +651,7 @@ export function TalkView() {
               className={`talk-send ${running && !text.trim() ? 'stop' : ''}`}
               title={running && !text.trim() ? '结束任务' : running ? '下达指示' : '发送（自动识别闲聊/需求）'}
               aria-label={running && !text.trim() ? '结束任务' : running ? '下达指示' : '发送'}
-              disabled={running && !text.trim() ? false : sending || !text.trim()}
+              disabled={running && !text.trim() ? false : sending || (!text.trim() && attachments.length === 0)}
               onClick={() => (running && !text.trim() ? handleStop() : void handleSend())}
             >
               {running && !text.trim() ? '◼' : '↑'}
@@ -646,6 +727,14 @@ export function TalkView() {
           </div>
         </div>
       </div>
+
+      {previewImage ? (
+        <ImagePreviewOverlay
+          src={previewImage.src}
+          alt={previewImage.alt}
+          onClose={() => setPreviewImage(null)}
+        />
+      ) : null}
     </div>
   )
 }

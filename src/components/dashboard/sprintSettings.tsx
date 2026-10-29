@@ -8,6 +8,7 @@ import {
 } from '@/store/officeSprintSettings'
 
 type LocationItem = { name: string; path: string }
+type PrefItem = { id: string; text: string }
 
 /** 侧栏底部齿轮：任务默认设置（原新建弹窗「更多设置」项），对话页直接发送时生效 */
 export function SprintSettingsButton() {
@@ -15,6 +16,33 @@ export function SprintSettingsButton() {
   const [open, setOpen] = useState(false)
   const [locations, setLocations] = useState<LocationItem[]>([])
   const [localReady, setLocalReady] = useState(false)
+  const [prefs, setPrefs] = useState<PrefItem[]>([])
+  const [prefDraft, setPrefDraft] = useState('')
+
+  const addPref = () => {
+    const text = prefDraft.trim()
+    if (!text) return
+    fetch(`${OFFICE_API_BASE}/api/preferences`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((item: PrefItem | null) => {
+        if (!item?.id) return
+        setPrefs((prev) => (prev.some((p) => p.id === item.id) ? prev : [...prev, item]))
+        setPrefDraft('')
+      })
+      .catch(() => undefined)
+  }
+
+  const removePref = (id: string) => {
+    fetch(`${OFFICE_API_BASE}/api/preferences/${id}`, { method: 'DELETE' })
+      .then((res) => {
+        if (res.ok) setPrefs((prev) => prev.filter((p) => p.id !== id))
+      })
+      .catch(() => undefined)
+  }
 
   // 打开面板时拉取真实系统目录与本机模型可用性
   useEffect(() => {
@@ -27,6 +55,10 @@ export function SprintSettingsButton() {
       .then((res) => (res.ok ? res.json() : null))
       .then((payload: { local_model_ready?: boolean } | null) => setLocalReady(Boolean(payload?.local_model_ready)))
       .catch(() => setLocalReady(false))
+    fetch(`${OFFICE_API_BASE}/api/preferences`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { preferences?: PrefItem[] } | null) => setPrefs(payload?.preferences ?? []))
+      .catch(() => undefined)
   }, [open])
 
   return (
@@ -147,6 +179,41 @@ export function SprintSettingsButton() {
                   />
                   <span className="sprint-dialog-tip">超过上限自动收尾，不再继续调用模型</span>
                 </label>
+                <div className="pref-section">
+                  <span className="pref-title">偏好档案</span>
+                  <p className="sprint-dialog-tip">
+                    写一次长期生效：需求拆解、返工修复与验收评审都会遵循这些偏好（最多 30 条）。
+                  </p>
+                  {prefs.length > 0 ? (
+                    <ul className="pref-list">
+                      {prefs.map((pref) => (
+                        <li key={pref.id} className="pref-item">
+                          <span>{pref.text}</span>
+                          <button type="button" aria-label="删除该偏好" onClick={() => removePref(pref.id)}>
+                            ×
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="sprint-dialog-tip">还没有偏好，例如「报告用正式书面语」「数据必须给出来源」。</p>
+                  )}
+                  <div className="pref-add-row">
+                    <input
+                      type="text"
+                      maxLength={200}
+                      placeholder="添加一条偏好，回车确认"
+                      value={prefDraft}
+                      onChange={(event) => setPrefDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') addPref()
+                      }}
+                    />
+                    <button type="button" disabled={!prefDraft.trim()} onClick={addPref}>
+                      添加
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>,
             document.body,

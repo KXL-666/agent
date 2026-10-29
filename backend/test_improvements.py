@@ -22,6 +22,7 @@ import forge
 import graph
 import workflow_nodes
 import main
+import office_runtime
 import storage
 
 
@@ -171,14 +172,22 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
         # approved 是图中的结束返工路由；publish 仍会阻止未通过任务发布。
 
     def test_chat_context_contains_actual_progress_and_does_not_limit_to_80_chars(self):
+        sprint = {"id": "S1", "requirement": "图书系统", "stage": "测试验证"}
         context = chat_context.build_chat_system({"name": "测试员", "role": "测试工程师"}, 4,
-                {"requirement": "图书系统", "stage": "测试验证"},
-                [{"id": "T1", "title": "借阅接口", "status": "打回"}], [])
+                sprint, [{"id": "T1", "title": "借阅接口", "status": "打回"}], [],
+                sprint_id="S1")
         self.assertIn('"status": "打回"', context)
         self.assertIn("北京时间", context)
         self.assertNotIn("不超过 80 字", context)
+        # 未绑定该 Sprint 的对话（新对话）不应看到上一轮的进展
+        other = chat_context.build_chat_system({"name": "测试员", "role": "测试工程师"}, 4,
+                sprint, [{"id": "T1", "title": "借阅接口", "status": "打回"}], [])
+        self.assertNotIn('"status": "打回"', other)
+        self.assertIn("本对话没有发起迭代", other)
 
     def test_real_office_renderers_produce_readable_files(self):
+        if not office_runtime.find_office():
+            self.skipTest("需要 LibreOffice：设置 OFFICE_SOFFICE 后运行真实 Office 渲染测试")
         document = "# 系统设计说明\n\n" + "\n\n".join(
             f"## 第{i}章 设计与验收\n\n" + (f"本章{i}的借阅系统需要检查库存与用户权限，异常时返回明确原因，并记录操作结果。" * 8)
             + "\n\n" + (f"本章{i}的验收覆盖正常借阅、库存不足与重复请求，分别核对预期结果。" * 6)
@@ -195,6 +204,15 @@ class ImprovementsTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(forge.self_check(name, kind)["ok"])
                 final = forge.publish_file(name, self.sid)
                 self.assertIsNotNone(forge.safe_deliverable_path(final))
+
+    def test_missing_office_engine_keeps_document_unverified(self):
+        with (patch.object(office_runtime, "find_office", return_value=None),
+              patch.object(deliverable_generator, "_gen_docx", return_value="# 系统说明\n\n检查库存与权限。")):
+            name = forge.forge_file("docx", "系统说明", "未验证.docx")
+            result = forge.self_check(name, "docx")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unchecked")
+        self.assertTrue(any(check["ok"] is None for check in result["checks"]))
 
 
 if __name__ == "__main__":

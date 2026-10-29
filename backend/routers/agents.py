@@ -100,7 +100,8 @@ async def update_agent(roster: int, patch: AgentConfigPatch):
         if v is not None
     }
     try:
-        agent_config.update_agent_config(
+        await asyncio.to_thread(
+            agent_config.update_agent_config,
             roster,
             name=patch.name,
             llm=llm_patch or None,

@@ -115,6 +115,14 @@ def update_task(task: dict) -> None:
 _pending_instructions: list[str] = []
 
 
+def snapshot_instructions() -> list[str]:
+    return list(_pending_instructions)
+
+
+def restore_instructions(items: list[str]) -> None:
+    _pending_instructions[:] = items
+
+
 def add_instruction(text: str) -> None:
     """缓存一条老板补充指示，等工作流走到下一个 LLM 调用点时注入提示词"""
     text = (text or "").strip()[:300]
@@ -138,6 +146,10 @@ class BudgetExceeded(RuntimeError):
 
 
 def spent_cost() -> float:
+    import sprint_accounting
+    usage = sprint_accounting.totals()
+    if usage is not None:
+        return max(0.0, float(usage.get("usage_cost") or 0))
     return max(
         0.0,
         round(llm.usage_total_cost() - float(sprint_meta.get("usage_baseline") or 0), 4),

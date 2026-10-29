@@ -18,14 +18,24 @@ def clock_reply(message: str) -> str | None:
     return None
 
 
-def build_chat_system(entry: dict, roster: int, sprint: dict, tasks: list, artifacts: list) -> str:
-    context = {
-        "需求": sprint.get("requirement") or "尚未启动迭代",
-        "状态": sprint.get("status", "idle"),
-        "阶段": sprint.get("stage", ""),
-        "任务": [{k: t.get(k) for k in ("id", "title", "status", "assignee_roster", "summary", "acceptance_criteria")} for t in tasks[:30]],
-        "产物": [{k: a.get(k) for k in ("title", "kind", "source", "quality_status", "degraded", "degraded_reason")} for a in artifacts[-12:]],
-    }
+def build_chat_system(entry: dict, roster: int, sprint: dict, tasks: list, artifacts: list,
+                      sprint_id: str = "") -> str:
+    active_id = str(sprint.get("id") or "")
+    # Sprint 快照只提供给发起本轮的对话；新对话不应看到上一轮的进展
+    if sprint_id and sprint_id == active_id:
+        context = {
+            "需求": sprint.get("requirement") or "尚未启动迭代",
+            "状态": sprint.get("status", "idle"),
+            "阶段": sprint.get("stage", ""),
+            "任务": [{k: t.get(k) for k in ("id", "title", "status", "assignee_roster", "summary", "acceptance_criteria")} for t in tasks[:30]],
+            "产物": [{k: a.get(k) for k in ("title", "kind", "source", "quality_status", "degraded", "degraded_reason")} for a in artifacts[-12:]],
+        }
+    else:
+        context = {
+            "需求": "本对话没有发起迭代",
+            "状态": "idle",
+            "说明": "当前对话与任何 Sprint 无关。不要提及或引用其他对话的迭代进展；用户问起历史时，引导其到任务中心、文件中心或原对话查看。",
+        }
     return (
         f"你是 AI 敏捷开发办公室的{entry['role']}「{entry['name']}」，工位 {roster}。\n"
         "先理解并直接回答用户当前问题，结合历史继续讨论；按问题复杂程度决定篇幅，必要时给步骤和例子。"

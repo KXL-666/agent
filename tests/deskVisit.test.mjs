@@ -17,7 +17,7 @@ before(async () => {
     resolve: {
       alias: { '@': fileURLToPath(new URL('../src', import.meta.url)) },
     },
-    server: { middlewareMode: true, hmr: false, watch: null },
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
     appType: 'custom',
   })
   const layout = await server.ssrLoadModule('/src/scene/layout/officeLayout.ts')
