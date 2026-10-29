@@ -39,6 +39,8 @@ let messagesByConv: Record<string, ChatMessage[]> = {}
 /** 每个对话对应的后端会话 ID（切回老对话时恢复上下文） */
 let backendConvByConv: Record<string, string> = {}
 let artifactTargets: Record<string, string> = {}
+/** 定点修改产物的可读标题（与 artifactTargets 同键），仅用于界面展示，接口仍用 ID */
+let artifactTargetLabels: Record<string, string> = {}
 let selectedRoster = 1
 let initialized = false
 
@@ -119,6 +121,7 @@ function restore() {
       messagesByConv?: Record<string, ChatMessage[]>
       backendConvByConv?: Record<string, string>
       artifactTargets?: Record<string, string>
+      artifactTargetLabels?: Record<string, string>
       selectedRoster?: number
       // 旧版字段
       threads?: Record<number, ChatMessage[]>
@@ -130,6 +133,7 @@ function restore() {
       messagesByConv = parsed.messagesByConv ?? {}
       backendConvByConv = parsed.backendConvByConv ?? {}
       artifactTargets = (parsed.artifactTargets ?? {}) as Record<string, string>
+      artifactTargetLabels = (parsed.artifactTargetLabels ?? {}) as Record<string, string>
     } else {
       migrateLegacy(parsed)
     }
@@ -152,6 +156,7 @@ function persist() {
         messagesByConv,
         backendConvByConv,
         artifactTargets,
+        artifactTargetLabels,
         selectedRoster,
       }),
     )
@@ -269,6 +274,7 @@ export function deleteConversation(roster: number, convId: string) {
   messagesByConv = Object.fromEntries(Object.entries(messagesByConv).filter(([id]) => id !== convId))
   backendConvByConv = Object.fromEntries(Object.entries(backendConvByConv).filter(([id]) => id !== convId))
   artifactTargets = Object.fromEntries(Object.entries(artifactTargets).filter(([id]) => id !== convId))
+  artifactTargetLabels = Object.fromEntries(Object.entries(artifactTargetLabels).filter(([id]) => id !== convId))
   if (activeConvIds[roster] === convId) {
     const next = { ...activeConvIds }
     if (remaining.length) next[roster] = remaining[remaining.length - 1].id
@@ -290,19 +296,17 @@ export type SidebarConversation = {
 let sidebarCache: SidebarConversation[] = []
 let sidebarDirty = true
 
-/** 侧边栏「历史对话」聚合：团队 + 六位成员，按创建时间倒序；空且非进行中的对话不列出 */
+/** 侧边栏「历史对话」只列总对话（roster 0），按创建时间倒序；空且非进行中的对话不列出。
+ *  成员单飞对话不进侧边栏，避免刷屏；仍在对应成员的对话页中继续。 */
 export function getSidebarConversations(): SidebarConversation[] {
   restore()
   if (!sidebarDirty) return sidebarCache
   sidebarDirty = false
   const items: SidebarConversation[] = []
-  for (const [rosterKey, metas] of Object.entries(conversations)) {
-    const roster = Number(rosterKey)
-    for (const conv of metas) {
-      const active = activeConvIds[roster] === conv.id
-      if (!active && (messagesByConv[conv.id] ?? []).length === 0) continue
-      items.push({ roster, conv, active })
-    }
+  for (const conv of conversations[0] ?? []) {
+    const active = activeConvIds[0] === conv.id
+    if (!active && (messagesByConv[conv.id] ?? []).length === 0) continue
+    items.push({ roster: 0, conv, active })
   }
   items.sort((a, b) => b.conv.createdAt - a.conv.createdAt)
   sidebarCache = items
@@ -382,11 +386,21 @@ export function getArtifactTarget(roster: number): string {
   return artifactTargets[ensureActiveConvId(roster)] ?? ''
 }
 
-export function setArtifactTarget(roster: number, id: string) {
+export function setArtifactTarget(roster: number, id: string, label?: string) {
   const convId = ensureActiveConvId(roster)
   artifactTargets = { ...artifactTargets, [convId]: id }
+  const labels = { ...artifactTargetLabels }
+  if (id && label) labels[convId] = label
+  else delete labels[convId]
+  artifactTargetLabels = labels
   persist()
   notify()
+}
+
+/** 定点修改产物的可读标题；无记录时返回空串，调用方回退展示 ID */
+export function getArtifactTargetLabel(roster: number): string {
+  restore()
+  return artifactTargetLabels[activeConvIds[roster] ?? ''] ?? ''
 }
 
 export function appendConversationResult(roster: number, content: string, artifacts: OfficeArtifact[] = []) {

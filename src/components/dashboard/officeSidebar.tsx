@@ -23,11 +23,6 @@ import {
   setSelectedRoster,
   subscribeChat,
 } from '@/store/officeChatStore'
-import { AGENT_ROSTER } from '@/scene/layout/officeLayout'
-import {
-  getAgentConfigsSnapshot,
-  subscribeAgentConfigs,
-} from '@/store/officeAgentConfigStore'
 import {
   getActiveView,
   getViewedSprint,
@@ -75,11 +70,8 @@ export function OfficeSidebar() {
   const unread = useSyncExternalStore(subscribeNotifications, getUnreadSnapshot)
   const activeView = useSyncExternalStore(subscribeView, getActiveView)
   const pulseAt = useSyncExternalStore(subscribeToast, getArtifactPulseAt)
-  // 历史对话列表：团队对话 + 六位成员的单飞对话
+  // 历史对话列表：仅总对话（与产品经理的团队对话），成员单飞对话不在此列出
   const sidebarConvos = useSyncExternalStore(subscribeChat, getSidebarConversations)
-  const agentConfigs = useSyncExternalStore(subscribeAgentConfigs, getAgentConfigsSnapshot)
-  const displayNameOf = (rosterNo: number) =>
-    agentConfigs[rosterNo]?.name || AGENT_ROSTER[rosterNo - 1]?.name || `#${rosterNo}`
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const [importing, setImporting] = useState(false)
   // 产物落地后「交付」闪一下「新」徽标；6 秒自动熄灭，点开「交付」立即熄灭
@@ -229,9 +221,6 @@ export function OfficeSidebar() {
                 title={`进入对话：${item.conv.title}`}
               >
                 <span className="sidebar-convo-title">{item.conv.title}</span>
-                {item.roster > 0 ? (
-                  <span className="sidebar-convo-agent">{displayNameOf(item.roster)}</span>
-                ) : null}
               </button>
               <button
                 type="button"

@@ -24,6 +24,7 @@ import {
   getPendingRosters,
   appendConversationResult,
   getArtifactTarget,
+  getArtifactTargetLabel,
   setArtifactTarget,
   type ChatMessage,
 } from '@/store/officeChatStore'
@@ -75,6 +76,7 @@ export function OfficeChatView() {
   const [uploading, setUploading] = useState(false)
   const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
   const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(roster))
+  const targetLabel = useSyncExternalStore(subscribeChat, () => getArtifactTargetLabel(roster))
   const listRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
 
@@ -349,7 +351,7 @@ export function OfficeChatView() {
               disabled={pending}
               onClick={() => {
                 createConversation(roster)
-                showToast('已开启新对话，历史对话在左侧菜单栏')
+                showToast('已开启新对话')
               }}
             >
               ＋ 新建对话
@@ -405,7 +407,7 @@ export function OfficeChatView() {
             </ul>
           ) : null}
 
-          {target ? <p className="chat-hint">正在基于 {target} 修改 <button type="button" onClick={() => setArtifactTarget(roster, '')}>取消指定</button></p> : null}
+          {target ? <p className="chat-hint" title={`产物 ID：${target}`}>正在基于「{targetLabel || target}」修改 <button type="button" onClick={() => setArtifactTarget(roster, '')}>取消指定</button></p> : null}
           <footer className="chat-input-row">
             <input
               ref={imageInputRef}

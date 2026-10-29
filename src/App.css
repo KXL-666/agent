@@ -5950,6 +5950,8 @@ button.sidebar-search:hover {
 [data-theme="dark"] .artifact-quality-panel { border-color: #41434b; }
 
 .conversation-artifact { margin-top: 12px; padding: 14px; border: 1px solid var(--border, #d9e0d5); border-radius: 12px; background: var(--surface, #fff); }
+[data-theme="dark"] .conversation-artifact { background: #23262b; border-color: #3a3f47; color: #e3e5e1; }
+[data-theme="dark"] .conversation-artifact small { color: #9aa0a8; opacity: 1; }
 .conversation-artifact strong, .conversation-artifact small { display: block; overflow-wrap: anywhere; }
 .conversation-artifact small { margin-top: 6px; opacity: .7; }
 .conversation-artifact-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }

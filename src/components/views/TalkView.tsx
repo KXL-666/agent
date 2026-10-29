@@ -48,7 +48,7 @@ import { requestNotifyPermission } from '@/services/officeNotify'
 import { runConversationTurn } from '@/services/conversationActions'
 import { ConversationArtifact } from '@/components/ConversationArtifact'
 import { ImagePreviewOverlay } from '@/components/ImagePreviewOverlay'
-import { appendUserMessage, appendConversationResult, getThreadSnapshot, subscribeChat, updateLastAssistantMessage, getArtifactTarget, setArtifactTarget, beginChat, finishChat, getPendingRosters, createConversation, getConversationsSnapshot, getActiveConversationId, getRecordedArtifactIds } from '@/store/officeChatStore'
+import { appendUserMessage, appendConversationResult, getThreadSnapshot, subscribeChat, updateLastAssistantMessage, getArtifactTarget, getArtifactTargetLabel, setArtifactTarget, beginChat, finishChat, getPendingRosters, createConversation, getConversationsSnapshot, getActiveConversationId, getRecordedArtifactIds } from '@/store/officeChatStore'
 
 function hexColor(color: number): string {
   return `#${color.toString(16).padStart(6, '0')}`
@@ -97,6 +97,7 @@ export function TalkView() {
   const activeConvId = useSyncExternalStore(subscribeChat, () => getActiveConversationId(0))
   const activeConvTitle = conversations.find((c) => c.id === activeConvId)?.title ?? ''
   const target = useSyncExternalStore(subscribeChat, () => getArtifactTarget(0))
+  const targetLabel = useSyncExternalStore(subscribeChat, () => getArtifactTargetLabel(0))
   const pendingRosters = useSyncExternalStore(subscribeChat, getPendingRosters)
   const [listening, setListening] = useState(false)
   const [attachments, setAttachments] = useState<OfficeUpload[]>([])
@@ -540,7 +541,7 @@ export function TalkView() {
         </main>
 
         <footer className="talk-foot">
-          {target ? <p className="chat-hint">正在基于 {target} 修改 <button type="button" onClick={() => setArtifactTarget(0, '')}>取消指定</button></p> : null}
+          {target ? <p className="chat-hint" title={`产物 ID：${target}`}>正在基于「{targetLabel || target}」修改 <button type="button" onClick={() => setArtifactTarget(0, '')}>取消指定</button></p> : null}
           {sending || pendingRosters.includes(0) ? <p role="status">正在处理本轮需求…</p> : null}
           {attachments.length > 0 || uploading ? (
             <ul className="attachment-chips talk-attach-chips">
